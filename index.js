@@ -449,103 +449,111 @@ async function sendBlockchainAlert(signature) {
     const transactions = await response.json();
 
     if (!transactions.length) {
-      console.log(
-        "ℹ️ Transaction Helius non décodée"
-      );
+      console.log("ℹ️ Transaction non décodée");
       return;
     }
 
     const tx = transactions[0];
 
-    console.log("🔎 ===== TRANSACTION =====");
+    console.log("🔎 TRANSACTION ANALYSÉE");
     console.log("Type :", tx.type);
     console.log("Description :", tx.description);
-    console.log("Fee :", tx.fee);
-    console.log(
-      "SOL transfers :",
-      JSON.stringify(tx.nativeTransfers)
-    );
-    console.log(
-      "Token transfers :",
-      JSON.stringify(tx.tokenTransfers)
-    );
-    console.log("==========================");
 
-    let message =
-      "⛓️ <b>Transaction analysée</b>\n\n" +
-      "🪙 Token :\n" +
-      "<code>" +
-      watchedMint +
-      "</code>\n\n";
+    /*
+     * Pour le moment :
+     * on analyse la transaction mais on ne l'envoie
+     * PAS automatiquement sur Telegram.
+     */
 
-    if (tx.type) {
-      message +=
-        "📌 Type : <b>" +
-        tx.type +
-        "</b>\n";
-    }
+    if (tx.type === "SWAP") {
+      console.log("🔄 SWAP détecté");
 
-    if (tx.description) {
-      message +=
-        "📝 " +
-        tx.description +
-        "\n";
-    }
+      if (tx.nativeTransfers?.length) {
+        for (const transfer of tx.nativeTransfers) {
+          const sol =
+            transfer.amount / 1000000000;
 
-    if (
-      tx.nativeTransfers &&
-      tx.nativeTransfers.length
-    ) {
-      message +=
-        "\n💰 <b>Mouvements SOL :</b>\n";
+          console.log(
+            "💰 Mouvement SOL :",
+            sol.toFixed(4),
+            "SOL"
+          );
+        }
+      }
 
-      for (
-        const transfer of tx.nativeTransfers.slice(0, 5)
-      ) {
-        const sol =
-          transfer.amount / 1000000000;
-
-        message +=
-          "• " +
-          sol.toFixed(4) +
-          " SOL\n";
+      if (tx.tokenTransfers?.length) {
+        for (const transfer of tx.tokenTransfers) {
+          console.log(
+            "🪙 Mouvement token :",
+            transfer.tokenAmount
+          );
+        }
       }
     }
 
-    if (
-      tx.tokenTransfers &&
-      tx.tokenTransfers.length
-    ) {
-      message +=
-        "\n🪙 <b>Mouvements tokens :</b>\n";
+    /*
+     * On alerte seulement si la transaction
+     * semble importante.
+     */
 
-      for (
-        const transfer of tx.tokenTransfers.slice(0, 5)
-      ) {
-        message +=
-          "• " +
-          (transfer.tokenAmount ?? "inconnu") +
-          "\n";
+    let totalSol = 0;
+
+    if (tx.nativeTransfers?.length) {
+      for (const transfer of tx.nativeTransfers) {
+        totalSol +=
+          Math.abs(transfer.amount) / 1000000000;
       }
     }
 
-    message +=
-      "\n🔗 Transaction :\n" +
-      "<code>" +
-      signature +
-      "</code>";
-
-    await bot.telegram.sendMessage(
-      chatId,
-      message,
-      {
-        parse_mode: "HTML"
-      }
-    );
-
     console.log(
-      "🟢 Transaction analysée et envoyée"
+      "💰 Total SOL déplacé :",
+      totalSol.toFixed(4),
+      "SOL"
     );
+
+    /*
+     * Seuil provisoire :
+     * 5 SOL de mouvements cumulés.
+     *
+     * Ce n'est PAS encore un signal de retrait
+     * de liquidité. C'est seulement un filtre
+     * pour éviter le spam.
+     */
+
+    if (totalSol >= 5) {
+      const message =
+        "🚨 <b>Gros mouvement détecté</b>\n\n" +
+        "🪙 Token :\n" +
+        "<code>" +
+        watchedMint +
+        "</code>\n\n" +
+        "💰 SOL déplacés : <b>" +
+        totalSol.toFixed(2) +
+        " SOL</b>\n\n" +
+        "📌 Type : " +
+        (tx.type || "Inconnu") +
+        "\n\n" +
+        "🔗 Transaction :\n" +
+        "<code>" +
+        signature +
+        "</code>";
+
+      await bot.telegram.sendMessage(
+        chatId,
+        message,
+        {
+          parse_mode: "HTML"
+        }
+      );
+
+      console.log(
+        "🚨 Alerte gros mouvement envoyée"
+      );
+    } else {
+      console.log(
+        "🟢 Mouvement normal, aucune alerte Telegram"
+      );
+    }
 
   } catch (error) {
     console.error(
