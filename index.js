@@ -16,10 +16,7 @@ if (!bitqueryToken) {
 const bot = new Telegraf(botToken);
 
 bot.start((ctx) => {
-  ctx.reply(
-    "🤖 Pump Alert Bot est en ligne !\n\n" +
-    "🔗 Connexion Bitquery : test en cours..."
-  );
+  ctx.reply("🤖 Pump Alert Bot est en ligne !");
 });
 
 bot.command("status", async (ctx) => {
@@ -32,19 +29,11 @@ bot.command("status", async (ctx) => {
       },
       body: JSON.stringify({
         query: `
-          {
+          query {
             Solana {
               DEXTrades(limit: {count: 1}) {
                 Block {
                   Time
-                }
-                Trade {
-                  Buy {
-                    Price
-                  }
-                }
-                Dex {
-                  ProtocolName
                 }
               }
             }
@@ -53,18 +42,25 @@ bot.command("status", async (ctx) => {
       })
     });
 
-    const data = await response.json();
+    const text = await response.text();
 
-    if (data.errors) {
-      console.error("Erreur Bitquery :", data.errors);
-      await ctx.reply("🔴 Bitquery : erreur de connexion");
+    console.log("Bitquery HTTP :", response.status);
+    console.log("Bitquery réponse :", text);
+
+    if (!response.ok) {
+      await ctx.reply(
+        `🔴 Bitquery erreur HTTP ${response.status}\n\n${text.slice(0, 500)}`
+      );
       return;
     }
 
-    await ctx.reply("🟢 Bot opérationnel !\n🟢 Bitquery connecté !");
+    await ctx.reply("🟢 Bot opérationnel !\n🟢 Bitquery répond !");
   } catch (error) {
-    console.error(error);
-    await ctx.reply("🔴 Bitquery inaccessible");
+    console.error("Erreur Bitquery :", error);
+
+    await ctx.reply(
+      `🔴 Erreur de connexion Bitquery\n\n${error.message}`
+    );
   }
 });
 
