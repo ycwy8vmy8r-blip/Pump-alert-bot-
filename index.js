@@ -1,35 +1,25 @@
 const { Telegraf } = require("telegraf");
-const { WebSocket } = require("ws");
 
 const botToken = process.env.BOT_TOKEN;
 const anaxerApiKey = process.env.ANAXER_API_KEY;
 const chatId = process.env.CHAT_ID;
 
-if (!botToken) {
-  console.error("BOT_TOKEN manquant");
-  process.exit(1);
-}
-
-if (!anaxerApiKey) {
-  console.error("ANAXER_API_KEY manquante");
-  process.exit(1);
-}
-
-if (!chatId) {
-  console.error("CHAT_ID manquant");
+if (!botToken || !anaxerApiKey || !chatId) {
+  console.error("❌ Variable manquante dans Railway");
   process.exit(1);
 }
 
 const bot = new Telegraf(botToken);
 
 let watchedMint = null;
-let tradeWs = null;
+let lastTradeId = null;
+let watchInterval = null;
 
 bot.start((ctx) => {
   ctx.reply(
     "🤖 Pump Alert Bot est en ligne !\n\n" +
-    "Utilise /watch MINT pour surveiller un token.\n" +
-    "Utilise /unwatch pour arrêter la surveillance."
+    "👁️ /watch MINT = surveiller un token\n" +
+    "🛑 /unwatch = arrêter"
   );
 });
 
@@ -41,10 +31,7 @@ bot.command("status", (ctx) => {
       watchedMint
     );
   } else {
-    ctx.reply(
-      "🟢 Bot opérationnel !\n\n" +
-      "👁️ Aucun token surveillé."
-    );
+    ctx.reply("🟢 Bot opérationnel !\n\n👁️ Aucun token surveillé.");
   }
 });
 
@@ -55,22 +42,16 @@ bot.command("watch", async (ctx) => {
   if (!mint) {
     await ctx.reply(
       "❌ Il manque l'adresse du token.\n\n" +
-      "Exemple :\n" +
-      "/watch ADRESSE_DU_MINT"
+      "Exemple :\n/watch ADRESSE_DU_MINT"
     );
     return;
   }
 
   watchedMint = mint;
+  lastTradeId = null;
 
-  if (tradeWs) {
-    try {
-      tradeWs.close();
-    } catch (error) {
-      console.error("Erreur fermeture ancien stream :", error.message);
-    }
-
-    tradeWs = null;
+  if (watchInterval) {
+    clearInterval(watchInterval);
   }
 
   await ctx.reply(
@@ -78,23 +59,21 @@ bot.command("watch", async (ctx) => {
     "🪙 Token :\n" +
     mint +
     "\n\n" +
-    "📊 Je surveille maintenant ses trades."
+    "📊 Vérification des nouveaux trades toutes les 45 secondes."
   );
 
-  startTradeStream(mint);
+  checkTrades();
+
+  watchInterval = setInterval(checkTrades, 45000);
 });
 
 bot.command("unwatch", async (ctx) => {
   watchedMint = null;
+  lastTradeId = null;
 
-  if (tradeWs) {
-    try {
-      tradeWs.close();
-    } catch (error) {
-      console.error("Erreur fermeture stream :", error.message);
-    }
-
-    tradeWs = null;
+  if (watchInterval) {
+    clearInterval(watchInterval);
+    watchInterval = null;
   }
 
   await ctx.reply(
@@ -103,107 +82,165 @@ bot.command("unwatch", async (ctx) => {
   );
 });
 
-function startTradeStream(mint) {
-  console.log("🔎 Démarrage surveillance :", mint);
+async function checkTrades() {
+  if (!watchedMint) {
+    return;
+  }
 
-  const ws = new WebSocket(
-    `wss://api.anaxer.com/v1/stream?apiKey=${anaxerApiKey}`
-  );
+  try {
+    const url =
+      `https://api.anaxer.com/v1/tokens/${watchedMint}/trades`;
 
-  tradeWs = ws;
+    const response = await fetch(url, {
+      headers: {
+        "X-API-Key": anaxerApiKey
+      }
+    });
 
-  ws.on("open", () => {
-    console.log("🟢 Connecté à Anaxer pour les trades");
+    if (!response.ok) {
+      const text = await response.text();
 
-    ws.send(
-      JSON.stringify({
-        type: "subscribe",
-        id: "trades",
-        channel: "trades",
-        filters: {
-          sources: ["pump_fun"],
-          mints: [mint],
-          solOnly: true
-        }
-      })
+      console.error(
+        "🔴 Anaxer REST :",
+        response.status,
+        text
+      );
+
+      return;
+    }
+
+    const result = await response.json();
+
+    const trades =
+      Array.isArray(result)
+        ? result
+        : result.data || result.trades || [];
+
+    if (!trades.length) {
+      console.log("ℹ️ Aucun trade trouvé");
+      return;
+    }
+
+    console.log(
+      `📊 ${trades.length} trade(s) récupéré(s)`
     );
 
-    console.log("🟢 Surveillance des trades activée");
-  });
+    /*
+     * Premier passage :
+     * on mémorise le dernier trade sans envoyer
+     * toutes les anciennes transactions.
+     */
+    if (!lastTradeId) {
+      const newestTrade = trades[0];
 
-  ws.on("message", async (data) => {
-    try {
-      const envelope = JSON.parse(data.toString());
+      lastTradeId =
+        newestTrade.id ||
+        newestTrade.signature ||
+        newestTrade.txHash ||
+        newestTrade.slot ||
+        newestTrade.timestamp;
 
-      if (envelope.type === "subscribed") {
-        console.log("🟢 Abonnement trades confirmé");
-        return;
-      }
-
-      if (envelope.channel !== "trades") {
-        return;
-      }
-
-      if (mint !== watchedMint) {
-        return;
-      }
-
-      const trade = envelope.data;
-
-      if (!trade) {
-        return;
-      }
-
-      console.log("📊 TRADE DÉTECTÉ");
-      console.log(JSON.stringify(trade, null, 2));
-
-      await sendTradeAlert(trade, mint);
-
-    } catch (error) {
-      console.error(
-        "🔴 Erreur traitement trade :",
-        error.message
-      );
+      console.log("🧠 Dernier trade mémorisé");
+      return;
     }
-  });
 
-  ws.on("close", () => {
-    console.log("🟠 Stream trades fermé");
+    const newTrades = [];
 
-    if (watchedMint === mint) {
-      console.log(
-        "🔄 Reconnexion du stream dans 5 secondes..."
-      );
+    for (const trade of trades) {
+      const id =
+        trade.id ||
+        trade.signature ||
+        trade.txHash ||
+        trade.slot ||
+        trade.timestamp;
 
-      setTimeout(() => {
-        if (watchedMint === mint) {
-          startTradeStream(mint);
-        }
-      }, 5000);
+      if (id === lastTradeId) {
+        break;
+      }
+
+      newTrades.push(trade);
     }
-  });
 
-  ws.on("error", (error) => {
+    if (!newTrades.length) {
+      console.log("⏳ Aucun nouveau trade");
+      return;
+    }
+
+    /*
+     * On met à jour le dernier trade connu.
+     */
+    const newestTrade = newTrades[0];
+
+    lastTradeId =
+      newestTrade.id ||
+      newestTrade.signature ||
+      newestTrade.txHash ||
+      newestTrade.slot ||
+      newestTrade.timestamp;
+
+    console.log(
+      `🆕 ${newTrades.length} nouveau(x) trade(s)`
+    );
+
+    /*
+     * Pour commencer, on alerte seulement sur
+     * les nouveaux trades importants.
+     */
+    for (const trade of newTrades.reverse()) {
+      await sendTradeAlert(trade);
+    }
+
+  } catch (error) {
     console.error(
-      "🔴 WebSocket Anaxer :",
+      "🔴 Erreur récupération trades :",
       error.message
     );
-  });
+  }
 }
 
-async function sendTradeAlert(trade, mint) {
+async function sendTradeAlert(trade) {
   try {
-    const message =
-      "📊 Trade détecté\n\n" +
-      "🪙 Token :\n" +
-      mint +
-      "\n\n" +
-      "📦 Données reçues :\n" +
-      JSON.stringify(trade, null, 2).slice(0, 3000);
+    const volume =
+      trade.volumeUsd ??
+      trade.volume_usd ??
+      trade.usdVolume ??
+      null;
 
-    await bot.telegram.sendMessage(chatId, message);
+    const signature =
+      trade.signature ??
+      trade.txHash ??
+      trade.transaction ??
+      "Inconnue";
 
-    console.log("🟢 Alerte trade envoyée à Telegram");
+    const wallet =
+      trade.wallet ??
+      trade.trader ??
+      trade.user ??
+      "Inconnu";
+
+    let message =
+      "📊 <b>Nouveau trade détecté</b>\n\n" +
+      "🪙 <code>" +
+      watchedMint +
+      "</code>\n\n";
+
+    if (volume !== null) {
+      message += "💵 Volume : $" + volume + "\n";
+    }
+
+    message +=
+      "👛 Wallet : <code>" +
+      wallet +
+      "</code>\n" +
+      "🔗 Transaction : <code>" +
+      signature +
+      "</code>";
+
+    await bot.telegram.sendMessage(chatId, message, {
+      parse_mode: "HTML"
+    });
+
+    console.log("🟢 Alerte trade envoyée");
   } catch (error) {
     console.error(
       "🔴 Erreur Telegram :",
