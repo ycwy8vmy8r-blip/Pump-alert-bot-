@@ -421,13 +421,116 @@ function stopHeliusMonitoring() {
 
 async function sendBlockchainAlert(signature) {
   try {
-    const message =
-      "⛓️ <b>Activité blockchain détectée</b>\n\n" +
+    const url =
+      `https://api.helius.xyz/v0/transactions/?api-key=${heliusApiKey}`;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        transactions: [signature]
+      })
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+
+      console.error(
+        "🔴 Helius transaction :",
+        response.status,
+        text
+      );
+
+      return;
+    }
+
+    const transactions = await response.json();
+
+    if (!transactions.length) {
+      console.log(
+        "ℹ️ Transaction Helius non décodée"
+      );
+      return;
+    }
+
+    const tx = transactions[0];
+
+    console.log("🔎 ===== TRANSACTION =====");
+    console.log("Type :", tx.type);
+    console.log("Description :", tx.description);
+    console.log("Fee :", tx.fee);
+    console.log(
+      "SOL transfers :",
+      JSON.stringify(tx.nativeTransfers)
+    );
+    console.log(
+      "Token transfers :",
+      JSON.stringify(tx.tokenTransfers)
+    );
+    console.log("==========================");
+
+    let message =
+      "⛓️ <b>Transaction analysée</b>\n\n" +
       "🪙 Token :\n" +
       "<code>" +
       watchedMint +
-      "</code>\n\n" +
-      "🔗 Transaction :\n" +
+      "</code>\n\n";
+
+    if (tx.type) {
+      message +=
+        "📌 Type : <b>" +
+        tx.type +
+        "</b>\n";
+    }
+
+    if (tx.description) {
+      message +=
+        "📝 " +
+        tx.description +
+        "\n";
+    }
+
+    if (
+      tx.nativeTransfers &&
+      tx.nativeTransfers.length
+    ) {
+      message +=
+        "\n💰 <b>Mouvements SOL :</b>\n";
+
+      for (
+        const transfer of tx.nativeTransfers.slice(0, 5)
+      ) {
+        const sol =
+          transfer.amount / 1000000000;
+
+        message +=
+          "• " +
+          sol.toFixed(4) +
+          " SOL\n";
+      }
+    }
+
+    if (
+      tx.tokenTransfers &&
+      tx.tokenTransfers.length
+    ) {
+      message +=
+        "\n🪙 <b>Mouvements tokens :</b>\n";
+
+      for (
+        const transfer of tx.tokenTransfers.slice(0, 5)
+      ) {
+        message +=
+          "• " +
+          (transfer.tokenAmount ?? "inconnu") +
+          "\n";
+      }
+    }
+
+    message +=
+      "\n🔗 Transaction :\n" +
       "<code>" +
       signature +
       "</code>";
@@ -441,12 +544,12 @@ async function sendBlockchainAlert(signature) {
     );
 
     console.log(
-      "🟢 Alerte blockchain envoyée"
+      "🟢 Transaction analysée et envoyée"
     );
 
   } catch (error) {
     console.error(
-      "🔴 Erreur Telegram blockchain :",
+      "🔴 Erreur analyse transaction :",
       error.message
     );
   }
