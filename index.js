@@ -1,10 +1,12 @@
 const { Telegraf } = require("telegraf");
+const { WebSocket } = require("ws");
 
 const botToken = process.env.BOT_TOKEN;
 const anaxerApiKey = process.env.ANAXER_API_KEY;
+const heliusApiKey = process.env.HELIUS_API_KEY;
 const chatId = process.env.CHAT_ID;
 
-if (!botToken || !anaxerApiKey || !chatId) {
+if (!botToken || !anaxerApiKey || !heliusApiKey || !chatId) {
   console.error("❌ Variable manquante dans Railway");
   process.exit(1);
 }
@@ -14,12 +16,19 @@ const bot = new Telegraf(botToken);
 let watchedMint = null;
 let lastTradeId = null;
 let watchInterval = null;
+let heliusWs = null;
+let heliusSubscriptionId = null;
+
+/* =========================
+   COMMANDES TELEGRAM
+========================= */
 
 bot.start((ctx) => {
   ctx.reply(
     "🤖 Pump Alert Bot est en ligne !\n\n" +
     "👁️ /watch MINT = surveiller un token\n" +
-    "🛑 /unwatch = arrêter"
+    "🛑 /unwatch = arrêter\n" +
+    "📊 Trades Anaxer + activité blockchain Helius"
   );
 });
 
@@ -28,12 +37,22 @@ bot.command("status", (ctx) => {
     ctx.reply(
       "🟢 Bot opérationnel !\n\n" +
       "👁️ Token surveillé :\n" +
-      watchedMint
+      watchedMint +
+      "\n\n" +
+      "📊 Trades : Anaxer\n" +
+      "⛓️ Blockchain : Helius"
     );
   } else {
-    ctx.reply("🟢 Bot opérationnel !\n\n👁️ Aucun token surveillé.");
+    ctx.reply(
+      "🟢 Bot opérationnel !\n\n" +
+      "👁️ Aucun token surveillé."
+    );
   }
 });
+
+/* =========================
+   WATCH
+========================= */
 
 bot.command("watch", async (ctx) => {
   const parts = ctx.message.text.trim().split(/\s+/);
@@ -54,18 +73,26 @@ bot.command("watch", async (ctx) => {
     clearInterval(watchInterval);
   }
 
+  stopHeliusMonitoring();
+
   await ctx.reply(
     "👁️ Surveillance activée !\n\n" +
     "🪙 Token :\n" +
     mint +
     "\n\n" +
-    "📊 Vérification des nouveaux trades toutes les 45 secondes."
+    "📊 Trades vérifiés toutes les 45 secondes.\n" +
+    "⛓️ Surveillance blockchain Helius activée."
   );
 
   checkTrades();
-
   watchInterval = setInterval(checkTrades, 45000);
+
+  startHeliusMonitoring();
 });
+
+/* =========================
+   UNWATCH
+========================= */
 
 bot.command("unwatch", async (ctx) => {
   watchedMint = null;
@@ -76,11 +103,17 @@ bot.command("unwatch", async (ctx) => {
     watchInterval = null;
   }
 
+  stopHeliusMonitoring();
+
   await ctx.reply(
     "🛑 Surveillance arrêtée.\n\n" +
     "Aucun token n'est actuellement surveillé."
   );
 });
+
+/* =========================
+   ANAXER : TRADES
+========================= */
 
 async function checkTrades() {
   if (!watchedMint) {
@@ -125,11 +158,6 @@ async function checkTrades() {
       `📊 ${trades.length} trade(s) récupéré(s)`
     );
 
-    /*
-     * Premier passage :
-     * on mémorise le dernier trade sans envoyer
-     * toutes les anciennes transactions.
-     */
     if (!lastTradeId) {
       const newestTrade = trades[0];
 
@@ -166,9 +194,6 @@ async function checkTrades() {
       return;
     }
 
-    /*
-     * On met à jour le dernier trade connu.
-     */
     const newestTrade = newTrades[0];
 
     lastTradeId =
@@ -182,10 +207,6 @@ async function checkTrades() {
       `🆕 ${newTrades.length} nouveau(x) trade(s)`
     );
 
-    /*
-     * Pour commencer, on alerte seulement sur
-     * les nouveaux trades importants.
-     */
     for (const trade of newTrades.reverse()) {
       await sendTradeAlert(trade);
     }
@@ -197,6 +218,10 @@ async function checkTrades() {
     );
   }
 }
+
+/* =========================
+   TELEGRAM : TRADE
+========================= */
 
 async function sendTradeAlert(trade) {
   try {
@@ -241,6 +266,7 @@ async function sendTradeAlert(trade) {
     });
 
     console.log("🟢 Alerte trade envoyée");
+
   } catch (error) {
     console.error(
       "🔴 Erreur Telegram :",
@@ -249,6 +275,199 @@ async function sendTradeAlert(trade) {
   }
 }
 
+/* =========================
+   HELIUS : BLOCKCHAIN
+========================= */
+
+function startHeliusMonitoring() {
+  if (!watchedMint) {
+    return;
+  }
+
+  try {
+    const url =
+      `wss://mainnet.helius-rpc.com/?api-key=${heliusApiKey}`;
+
+    heliusWs = new WebSocket(url);
+
+    heliusWs.on("open", () => {
+      console.log("🟢 Connecté à Helius");
+
+      heliusWs.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "logsSubscribe",
+          params: [
+            {
+              mentions: [watchedMint]
+            },
+            {
+              commitment: "confirmed"
+            }
+          ]
+        })
+      );
+
+      console.log(
+        "⛓️ Surveillance blockchain activée pour le token"
+      );
+    });
+
+    heliusWs.on("message", async (data) => {
+      try {
+        const message = JSON.parse(data.toString());
+
+        if (
+          message.result &&
+          typeof message.result === "number"
+        ) {
+          heliusSubscriptionId = message.result;
+
+          console.log(
+            "🟢 Abonnement Helius confirmé :",
+            heliusSubscriptionId
+          );
+
+          return;
+        }
+
+        if (
+          message.method !== "logsNotification"
+        ) {
+          return;
+        }
+
+        const value =
+          message.params?.result?.value;
+
+        const signature =
+          value?.signature;
+
+        if (!signature) {
+          return;
+        }
+
+        console.log(
+          "⛓️ Activité blockchain détectée :",
+          signature
+        );
+
+        await sendBlockchainAlert(signature);
+
+      } catch (error) {
+        console.error(
+          "🔴 Erreur traitement Helius :",
+          error.message
+        );
+      }
+    });
+
+    heliusWs.on("close", () => {
+      console.log(
+        "🟠 Helius déconnecté."
+      );
+
+      heliusWs = null;
+      heliusSubscriptionId = null;
+
+      if (watchedMint) {
+        setTimeout(() => {
+          if (watchedMint && !heliusWs) {
+            startHeliusMonitoring();
+          }
+        }, 5000);
+      }
+    });
+
+    heliusWs.on("error", (error) => {
+      console.error(
+        "🔴 WebSocket Helius :",
+        error.message
+      );
+    });
+
+  } catch (error) {
+    console.error(
+      "🔴 Erreur démarrage Helius :",
+      error.message
+    );
+  }
+}
+
+/* =========================
+   ARRÊT HELIUS
+========================= */
+
+function stopHeliusMonitoring() {
+  if (heliusWs) {
+    try {
+      heliusWs.close();
+    } catch (error) {
+      console.error(
+        "🔴 Erreur fermeture Helius :",
+        error.message
+      );
+    }
+  }
+
+  heliusWs = null;
+  heliusSubscriptionId = null;
+}
+
+/* =========================
+   ALERTE BLOCKCHAIN
+========================= */
+
+async function sendBlockchainAlert(signature) {
+  try {
+    const message =
+      "⛓️ <b>Activité blockchain détectée</b>\n\n" +
+      "🪙 Token :\n" +
+      "<code>" +
+      watchedMint +
+      "</code>\n\n" +
+      "🔗 Transaction :\n" +
+      "<code>" +
+      signature +
+      "</code>";
+
+    await bot.telegram.sendMessage(
+      chatId,
+      message,
+      {
+        parse_mode: "HTML"
+      }
+    );
+
+    console.log(
+      "🟢 Alerte blockchain envoyée"
+    );
+
+  } catch (error) {
+    console.error(
+      "🔴 Erreur Telegram blockchain :",
+      error.message
+    );
+  }
+}
+
+/* =========================
+   DÉMARRAGE
+========================= */
+
 bot.launch();
 
-console.log("🤖 Pump Alert Bot démarré");
+console.log(
+  "🤖 Pump Alert Bot démarré"
+);
+
+process.once("SIGINT", () => {
+  stopHeliusMonitoring();
+  bot.stop("SIGINT");
+});
+
+process.once("SIGTERM", () => {
+  stopHeliusMonitoring();
+  bot.stop("SIGTERM");
+});
