@@ -1,10 +1,6 @@
 const { Telegraf } = require("telegraf");
 const { PublicKey } = require("@solana/web3.js");
 
-/* =========================
-   VARIABLES
-========================= */
-
 const botToken = process.env.BOT_TOKEN;
 const anaxerApiKey = process.env.ANAXER_API_KEY;
 const chatId = process.env.CHAT_ID;
@@ -16,28 +12,49 @@ if (!botToken || !anaxerApiKey || !chatId) {
 
 const bot = new Telegraf(botToken);
 
-/* =========================
-   CONFIGURATION
-========================= */
+// ===============================
+// RÉGLAGES
+// ===============================
 
 const LIQUIDITY_INTERVAL = 10000;
 const TRADE_INTERVAL = 45000;
 
-const ALERT_LEVELS = [
-  { level: "🟠 PRÉ-ALERTE", usd: 80000 },
-  { level: "🔴 ALERTE", usd: 50000 },
+// Alertes de liquidité
+const LIQUIDITY_LEVELS = [
+  { level: "🟠 ALERTE", usd: 80000 },
+  { level: "🔴 DANGER", usd: 50000 },
   { level: "🚨 CRITIQUE", usd: 20000 },
   { level: "💀 EXTRÊME", usd: 5000 }
 ];
 
-const CRASH_PERCENT = 8;
-const CRASH_WINDOW_MS = 60000;
+// Pression vendeuse
+const PRESSURE_WINDOW_MS = 120000; // 2 minutes
 
+const PRESSURE_LEVELS = {
+  WATCH: {
+    sellRatio: 60,
+    minSellUsd: 1000
+  },
+  STRONG: {
+    sellRatio: 70,
+    minSellUsd: 2000
+  },
+  EXTREME: {
+    sellRatio: 75,
+    minSellUsd: 4000
+  }
+};
+
+// Chute rapide de liquidité
+const RAPID_DROP_PERCENT = 4;
+const RAPID_DROP_WINDOW_MS = 60000;
+
+// Anti-spam Telegram
 const TELEGRAM_MIN_INTERVAL = 10000;
 
-/* =========================
-   ÉTAT
-========================= */
+// ===============================
+// ÉTAT
+// ===============================
 
 let watchedMint = null;
 
@@ -45,97 +62,36 @@ let liquidityInterval = null;
 let tradeInterval = null;
 
 let currentLiquidity = null;
-let previousLiquidity = null;
-let previousLiquidityTime = null;
-
 let highestLiquidity = null;
 
-let lastAlertLevel = null;
+let liquidityHistory = [];
 
-let lastTradeId = null;
+let lastLiquidityAlert = null;
+let lastPressureAlert = null;
+
 let recentTrades = [];
 
 let lastTelegramMessageTime = 0;
 
-/* =========================
-   TELEGRAM
-========================= */
-
-async function safeTelegramSend(message) {
-
-  const now = Date.now();
-
-  const elapsed =
-    now - lastTelegramMessageTime;
-
-  if (elapsed < TELEGRAM_MIN_INTERVAL) {
-
-    const wait =
-      TELEGRAM_MIN_INTERVAL - elapsed;
-
-    await new Promise(resolve =>
-      setTimeout(resolve, wait)
-    );
-  }
-
-  try {
-
-    await bot.telegram.sendMessage(
-      chatId,
-      message,
-      {
-        parse_mode: "HTML"
-      }
-    );
-
-    lastTelegramMessageTime =
-      Date.now();
-
-    console.log("🟢 Telegram envoyé");
-
-  } catch (error) {
-
-    console.error(
-      "🔴 Telegram :",
-      error.message
-    );
-  }
-}
-
-/* =========================
-   OUTILS
-========================= */
+// ===============================
+// OUTILS
+// ===============================
 
 function formatUsd(value) {
+  if (!Number.isFinite(value)) return "N/A";
 
-  if (!Number.isFinite(value)) {
-    return "N/A";
-  }
-
-  return "$" +
-    value.toLocaleString(
-      "fr-FR",
-      {
-        maximumFractionDigits: 0
-      }
-    );
+  return "$" + value.toLocaleString("fr-FR", {
+    maximumFractionDigits: 0
+  });
 }
 
 function shortAddress(address) {
+  if (!address) return "Inconnu";
 
-  if (!address) {
-    return "Inconnu";
-  }
-
-  return (
-    address.slice(0, 6) +
-    "..." +
-    address.slice(-6)
-  );
+  return address.slice(0, 6) + "..." + address.slice(-6);
 }
 
 function tradeId(trade) {
-
   return (
     trade.signature ||
     trade.id ||
@@ -145,7 +101,6 @@ function tradeId(trade) {
 }
 
 function tradeVolume(trade) {
-
   return Number(
     trade.volumeUsd ??
     trade.volume_usd ??
@@ -154,31 +109,15 @@ function tradeVolume(trade) {
   );
 }
 
-function tradeWallet(trade) {
-
-  return (
-    trade.wallet ||
-    trade.trader ||
-    trade.user ||
-    "Inconnu"
-  );
-}
-
-/* =========================
-   DIRECTION BUY / SELL
-========================= */
+// ===============================
+// DIRECTION BUY / SELL
+// ===============================
 
 function getDirection(trade) {
+  const from = trade.swap?.from;
+  const to = trade.swap?.to;
 
-  const from =
-    trade.swap?.from;
-
-  const to =
-    trade.swap?.to;
-
-  if (!from || !to) {
-    return "UNKNOWN";
-  }
+  if (!from || !to) return "UNKNOWN";
 
   const fromMint =
     from.mint ||
@@ -193,22 +132,12 @@ function getDirection(trade) {
   const SOL =
     "So11111111111111111111111111111111111111112";
 
-  /*
-   * BUY
-   * SOL -> TOKEN
-   */
-
   if (
     fromMint === SOL &&
     toMint === watchedMint
   ) {
     return "BUY";
   }
-
-  /*
-   * SELL
-   * TOKEN -> SOL
-   */
 
   if (
     fromMint === watchedMint &&
@@ -220,15 +149,52 @@ function getDirection(trade) {
   return "UNKNOWN";
 }
 
-/* =========================
-   ANAXER
-========================= */
+// ===============================
+// TELEGRAM
+// ===============================
+
+async function safeTelegramSend(message) {
+  const now = Date.now();
+
+  const elapsed =
+    now - lastTelegramMessageTime;
+
+  if (elapsed < TELEGRAM_MIN_INTERVAL) {
+    const wait =
+      TELEGRAM_MIN_INTERVAL - elapsed;
+
+    await new Promise(resolve =>
+      setTimeout(resolve, wait)
+    );
+  }
+
+  try {
+    await bot.telegram.sendMessage(
+      chatId,
+      message,
+      {
+        parse_mode: "HTML"
+      }
+    );
+
+    lastTelegramMessageTime = Date.now();
+
+    console.log("🟢 Telegram envoyé");
+
+  } catch (error) {
+    console.error(
+      "🔴 Telegram :",
+      error.message
+    );
+  }
+}
+
+// ===============================
+// ANAXER
+// ===============================
 
 async function fetchTrades() {
-
-  if (!watchedMint) {
-    return [];
-  }
+  if (!watchedMint) return [];
 
   try {
 
@@ -238,14 +204,11 @@ async function fetchTrades() {
       "/trades?source=pump_amm&solOnly=true&limit=50";
 
     const response =
-      await fetch(
-        url,
-        {
-          headers: {
-            "x-api-key": anaxerApiKey
-          }
+      await fetch(url, {
+        headers: {
+          "x-api-key": anaxerApiKey
         }
-      );
+      });
 
     if (!response.ok) {
 
@@ -260,9 +223,11 @@ async function fetchTrades() {
     const result =
       await response.json();
 
-    return Array.isArray(result)
-      ? result
-      : result.data || [];
+    if (Array.isArray(result)) {
+      return result;
+    }
+
+    return result.data || [];
 
   } catch (error) {
 
@@ -275,15 +240,105 @@ async function fetchTrades() {
   }
 }
 
-/* =========================
-   ANALYSE TRADES
-========================= */
+// ===============================
+// ANALYSE PRESSION
+// ===============================
+
+function analyzePressure() {
+
+  const now = Date.now();
+
+  const recent = recentTrades.filter(
+    trade => {
+
+      const timestamp =
+        Number(trade.timestamp || 0);
+
+      return (
+        timestamp > 0 &&
+        now - timestamp <= PRESSURE_WINDOW_MS
+      );
+    }
+  );
+
+  let buyVolume = 0;
+  let sellVolume = 0;
+
+  let sellCount = 0;
+  let buyCount = 0;
+
+  let biggestSell = null;
+  let biggestSellVolume = 0;
+
+  for (const trade of recent) {
+
+    const volume =
+      tradeVolume(trade);
+
+    if (!Number.isFinite(volume) || volume <= 0) {
+      continue;
+    }
+
+    const direction =
+      getDirection(trade);
+
+    if (direction === "BUY") {
+
+      buyVolume += volume;
+      buyCount++;
+
+    }
+
+    if (direction === "SELL") {
+
+      sellVolume += volume;
+      sellCount++;
+
+      if (volume > biggestSellVolume) {
+
+        biggestSellVolume = volume;
+        biggestSell = trade;
+      }
+    }
+  }
+
+  const totalVolume =
+    buyVolume + sellVolume;
+
+  if (totalVolume <= 0) {
+
+    return {
+      recent,
+      buyVolume: 0,
+      sellVolume: 0,
+      sellRatio: 0,
+      buyCount: 0,
+      sellCount: 0,
+      biggestSell: null
+    };
+  }
+
+  const sellRatio =
+    (sellVolume / totalVolume) * 100;
+
+  return {
+    recent,
+    buyVolume,
+    sellVolume,
+    sellRatio,
+    buyCount,
+    sellCount,
+    biggestSell
+  };
+}
+
+// ===============================
+// CHECK TRADES
+// ===============================
 
 async function checkTrades() {
 
-  if (!watchedMint) {
-    return;
-  }
+  if (!watchedMint) return;
 
   const trades =
     await fetchTrades();
@@ -297,99 +352,145 @@ async function checkTrades() {
     return;
   }
 
+  recentTrades = trades;
+
+  const pressure =
+    analyzePressure();
+
   console.log(
-    `📊 ${trades.length} trades PumpSwap`
+    "📊 2 min | BUY",
+    formatUsd(pressure.buyVolume),
+    "| SELL",
+    formatUsd(pressure.sellVolume),
+    "| SELL %",
+    pressure.sellRatio.toFixed(1)
   );
 
-  /*
-   * Première initialisation.
-   */
+  // ==================================
+  // PRESSION VENDEUSE
+  // ==================================
 
-  if (!lastTradeId) {
+  let pressureLevel = null;
 
-    lastTradeId =
-      tradeId(trades[0]);
+  if (
+    pressure.sellRatio >=
+      PRESSURE_LEVELS.EXTREME.sellRatio &&
+    pressure.sellVolume >=
+      PRESSURE_LEVELS.EXTREME.minSellUsd
+  ) {
 
-    recentTrades =
-      trades;
+    pressureLevel = "EXTREME";
 
-    console.log(
-      "🧠 Historique trades mémorisé"
+  } else if (
+    pressure.sellRatio >=
+      PRESSURE_LEVELS.STRONG.sellRatio &&
+    pressure.sellVolume >=
+      PRESSURE_LEVELS.STRONG.minSellUsd
+  ) {
+
+    pressureLevel = "STRONG";
+
+  } else if (
+    pressure.sellRatio >=
+      PRESSURE_LEVELS.WATCH.sellRatio &&
+    pressure.sellVolume >=
+      PRESSURE_LEVELS.WATCH.minSellUsd
+  ) {
+
+    pressureLevel = "WATCH";
+  }
+
+  // ==================================
+  // ALERTE TELEGRAM
+  // ==================================
+
+  if (
+    pressureLevel &&
+    pressureLevel !== lastPressureAlert
+  ) {
+
+    lastPressureAlert =
+      pressureLevel;
+
+    let title =
+      "🟡 PRESSION VENDEUSE";
+
+    if (pressureLevel === "STRONG") {
+      title =
+        "🟠 FORTE PRESSION VENDEUSE";
+    }
+
+    if (pressureLevel === "EXTREME") {
+      title =
+        "🔴 PRESSION VENDEUSE EXTRÊME";
+    }
+
+    let sellInfo =
+      "❓ Aucun gros SELL identifié.";
+
+    if (pressure.biggestSell) {
+
+      sellInfo =
+        "🐋 Plus gros SELL : <b>" +
+        formatUsd(
+          tradeVolume(
+            pressure.biggestSell
+          )
+        ) +
+        "</b>";
+    }
+
+    await safeTelegramSend(
+
+      title +
+      "\n\n" +
+
+      "🪙 Token :\n" +
+      "<code>" +
+      watchedMint +
+      "</code>\n\n" +
+
+      "📊 Sur les 2 dernières minutes :\n" +
+
+      "🔴 SELL : <b>" +
+      formatUsd(
+        pressure.sellVolume
+      ) +
+      "</b>\n" +
+
+      "🟢 BUY : <b>" +
+      formatUsd(
+        pressure.buyVolume
+      ) +
+      "</b>\n\n" +
+
+      "📉 Part des SELL : <b>" +
+      pressure.sellRatio.toFixed(1) +
+      "%</b>\n\n" +
+
+      sellInfo +
+      "\n\n" +
+
+      "⚠️ La pression vendeuse augmente."
     );
-
-    return;
   }
 
-  /*
-   * Recherche des nouveaux trades.
-   */
+  // Retour à la normale
+  if (
+    pressure.sellRatio < 50
+  ) {
 
-  const newTrades = [];
-
-  for (const trade of trades) {
-
-    if (
-      tradeId(trade) ===
-      lastTradeId
-    ) {
-      break;
-    }
-
-    newTrades.push(trade);
+    lastPressureAlert = null;
   }
-
-  if (!newTrades.length) {
-    return;
-  }
-
-  lastTradeId =
-    tradeId(newTrades[0]);
-
-  recentTrades =
-    [
-      ...newTrades,
-      ...recentTrades
-    ].slice(0, 100);
-
-  let buyVolume = 0;
-  let sellVolume = 0;
-
-  for (const trade of newTrades) {
-
-    const direction =
-      getDirection(trade);
-
-    const volume =
-      tradeVolume(trade);
-
-    if (direction === "BUY") {
-      buyVolume += volume;
-    }
-
-    if (direction === "SELL") {
-      sellVolume += volume;
-    }
-  }
-
-  console.log(
-    "🆕 Nouveaux trades :",
-    newTrades.length,
-    "| BUY $",
-    buyVolume.toFixed(2),
-    "| SELL $",
-    sellVolume.toFixed(2)
-  );
 }
 
-/* =========================
-   DEXSCREENER
-========================= */
+// ===============================
+// DEXSCREENER
+// ===============================
 
 async function fetchPumpSwapPool() {
 
-  if (!watchedMint) {
-    return null;
-  }
+  if (!watchedMint) return null;
 
   try {
 
@@ -417,10 +518,6 @@ async function fetchPumpSwapPool() {
       return null;
     }
 
-    /*
-     * On cherche PumpSwap.
-     */
-
     const pumpSwapPairs =
       pairs.filter(pair => {
 
@@ -445,12 +542,6 @@ async function fetchPumpSwapPool() {
       return null;
     }
 
-    /*
-     * Si plusieurs pools existent,
-     * on prend celui avec la plus
-     * grosse liquidité.
-     */
-
     pumpSwapPairs.sort(
       (a, b) =>
         Number(
@@ -474,57 +565,28 @@ async function fetchPumpSwapPool() {
   }
 }
 
-/* =========================
-   DERNIER SELL IMPORTANT
-========================= */
-
-function getLatestImportantSell() {
-
-  for (
-    const trade of recentTrades
-  ) {
-
-    if (
-      getDirection(trade) !==
-      "SELL"
-    ) {
-      continue;
-    }
-
-    const volume =
-      tradeVolume(trade);
-
-    if (volume >= 500) {
-      return trade;
-    }
-  }
-
-  return null;
-}
-
-/* =========================
-   ALERTE LIQUIDITÉ
-========================= */
+// ===============================
+// LIQUIDITÉ
+// ===============================
 
 async function checkLiquidity() {
 
-  if (!watchedMint) {
-    return;
-  }
+  if (!watchedMint) return;
 
   const pair =
     await fetchPumpSwapPool();
 
-  if (!pair) {
-    return;
-  }
+  if (!pair) return;
 
   const liquidity =
     Number(
       pair.liquidity?.usd || 0
     );
 
-  if (!Number.isFinite(liquidity)) {
+  if (
+    !Number.isFinite(liquidity) ||
+    liquidity <= 0
+  ) {
     return;
   }
 
@@ -536,23 +598,21 @@ async function checkLiquidity() {
     formatUsd(liquidity)
   );
 
-  /*
-   * Première mesure.
-   */
-
+  // Première lecture
   if (currentLiquidity === null) {
 
     currentLiquidity =
       liquidity;
 
-    previousLiquidity =
-      liquidity;
-
-    previousLiquidityTime =
-      now;
-
     highestLiquidity =
       liquidity;
+
+    liquidityHistory = [
+      {
+        time: now,
+        liquidity
+      }
+    ];
 
     console.log(
       "🧠 Liquidité initiale :",
@@ -562,10 +622,7 @@ async function checkLiquidity() {
     return;
   }
 
-  /*
-   * Nouveau plus haut.
-   */
-
+  // Plus haut
   if (
     liquidity >
     highestLiquidity
@@ -574,150 +631,87 @@ async function checkLiquidity() {
     highestLiquidity =
       liquidity;
 
-    /*
-     * On réarme les niveaux
-     * si la liquidité remonte.
-     */
-
-    lastAlertLevel =
-      null;
-
     console.log(
       "📈 Nouveau plus haut :",
       formatUsd(liquidity)
     );
   }
 
-  /*
-   * Variation.
-   */
+  // Historique 2 minutes
+  liquidityHistory.push({
+    time: now,
+    liquidity
+  });
 
-  const variation =
-    liquidity -
-    currentLiquidity;
-
-  const variationPercent =
-    currentLiquidity > 0
-      ? (
-          variation /
-          currentLiquidity
-        ) * 100
-      : 0;
-
-  /*
-   * Forte chute rapide.
-   */
-
-  const rapidCrash =
-    variationPercent <=
-      -CRASH_PERCENT;
-
-  if (rapidCrash) {
-
-    console.log(
-      "🚨 CHUTE RAPIDE :",
-      variationPercent.toFixed(1),
-      "%"
+  liquidityHistory =
+    liquidityHistory.filter(
+      item =>
+        now - item.time <= 120000
     );
 
-    const sell =
-      getLatestImportantSell();
+  // ==================================
+  // CHUTE RAPIDE SUR 60 SECONDES
+  // ==================================
 
-    let sellInfo =
-      "❓ Aucun gros SELL identifié.";
+  const oneMinuteAgo =
+    liquidityHistory.find(
+      item =>
+        now - item.time >=
+        RAPID_DROP_WINDOW_MS
+    );
 
-    if (sell) {
+  if (oneMinuteAgo) {
 
-      sellInfo =
-        "🐋 <b>SELL important récent</b>\n" +
-        "💵 Volume : <b>" +
-        formatUsd(
-          tradeVolume(sell)
-        ) +
-        "</b>\n" +
-        "👛 Wallet : <code>" +
-        shortAddress(
-          tradeWallet(sell)
-        ) +
-        "</code>\n" +
-        "🔗 Tx : <code>" +
-        shortAddress(
-          sell.signature
-        ) +
-        "</code>";
+    const dropPercent =
+      (
+        (liquidity -
+          oneMinuteAgo.liquidity) /
+        oneMinuteAgo.liquidity
+      ) * 100;
+
+    if (
+      dropPercent <=
+      -RAPID_DROP_PERCENT
+    ) {
+
+      await safeTelegramSend(
+
+        "🚨 <b>CHUTE RAPIDE DE LIQUIDITÉ</b>\n\n" +
+
+        "🪙 Token :\n" +
+        "<code>" +
+        watchedMint +
+        "</code>\n\n" +
+
+        "💧 Liquidité : <b>" +
+        formatUsd(liquidity) +
+        "</b>\n\n" +
+
+        "📉 Variation 60s : <b>" +
+        dropPercent.toFixed(1) +
+        "%</b>\n\n" +
+
+        "⚠️ <b>Risque de sortie important.</b>"
+      );
     }
-
-    await safeTelegramSend(
-
-      "🚨 <b>CHUTE RAPIDE PUMPSWAP</b>\n\n" +
-
-      "🪙 Token :\n" +
-      "<code>" +
-      watchedMint +
-      "</code>\n\n" +
-
-      "💧 Liquidité : <b>" +
-      formatUsd(liquidity) +
-      "</b>\n" +
-
-      "📉 Variation : <b>" +
-      variationPercent.toFixed(1) +
-      "%</b>\n\n" +
-
-      sellInfo +
-
-      "\n\n⚠️ <b>Pression vendeuse à surveiller.</b>"
-    );
   }
 
-  /*
-   * Niveaux de sortie.
-   */
+  // ==================================
+  // SEUILS LIQUIDITÉ
+  // ==================================
 
   for (
-    const alert of ALERT_LEVELS
+    const alert of LIQUIDITY_LEVELS
   ) {
 
     if (
-      liquidity <=
-      alert.usd
+      liquidity <= alert.usd &&
+      lastLiquidityAlert !==
+        alert.usd
     ) {
 
-      /*
-       * Ne pas répéter le même niveau.
-       */
-
-      if (
-        lastAlertLevel ===
-        alert.usd
-      ) {
-        break;
-      }
-
-      lastAlertLevel =
+      lastLiquidityAlert =
         alert.usd;
-
-      const sell =
-        getLatestImportantSell();
-
-      let sellInfo =
-        "❓ Pas de gros SELL identifié.";
-
-      if (sell) {
-
-        sellInfo =
-          "🐋 SELL récent : <b>" +
-          formatUsd(
-            tradeVolume(sell)
-          ) +
-          "</b>\n" +
-
-          "👛 Wallet : <code>" +
-          shortAddress(
-            tradeWallet(sell)
-          ) +
-          "</code>";
-      }
 
       await safeTelegramSend(
 
@@ -729,49 +723,32 @@ async function checkLiquidity() {
         watchedMint +
         "</code>\n\n" +
 
-        "💧 Liquidité actuelle : <b>" +
+        "💧 Liquidité : <b>" +
         formatUsd(liquidity) +
         "</b>\n\n" +
 
-        "📌 Seuil atteint : <b>" +
+        "🎯 Seuil : <b>" +
         formatUsd(alert.usd) +
-        "</b>\n\n" +
-
-        sellInfo
+        "</b>"
       );
 
       break;
     }
   }
 
-  /*
-   * Si la liquidité revient
-   * nettement au-dessus du dernier
-   * niveau, on réarme progressivement.
-   */
+  // Reset si la liquidité remonte franchement
+  if (liquidity > 90000) {
 
-  if (
-    liquidity >
-    90000
-  ) {
-
-    lastAlertLevel =
-      null;
+    lastLiquidityAlert = null;
   }
-
-  previousLiquidity =
-    currentLiquidity;
-
-  previousLiquidityTime =
-    now;
 
   currentLiquidity =
     liquidity;
 }
 
-/* =========================
-   WATCH
-========================= */
+// ===============================
+// WATCH
+// ===============================
 
 bot.command(
   "watch",
@@ -807,47 +784,34 @@ bot.command(
       return;
     }
 
-    /*
-     * Reset complet.
-     */
-
     watchedMint =
       mint;
 
     currentLiquidity =
       null;
 
-    previousLiquidity =
-      null;
-
-    previousLiquidityTime =
-      null;
-
     highestLiquidity =
       null;
 
-    lastAlertLevel =
+    liquidityHistory =
+      [];
+
+    lastLiquidityAlert =
       null;
 
-    lastTradeId =
+    lastPressureAlert =
       null;
 
     recentTrades =
       [];
 
-    /*
-     * Stop anciennes boucles.
-     */
-
     if (liquidityInterval) {
-
       clearInterval(
         liquidityInterval
       );
     }
 
     if (tradeInterval) {
-
       clearInterval(
         tradeInterval
       );
@@ -855,7 +819,7 @@ bot.command(
 
     await ctx.reply(
 
-      "👁️ <b>PUMPSWAP ACTIVÉ</b>\n\n" +
+      "👁️ <b>RADAR PUMPSWAP ACTIVÉ</b>\n\n" +
 
       "🪙 Token :\n" +
       "<code>" +
@@ -863,27 +827,24 @@ bot.command(
       "</code>\n\n" +
 
       "💧 Liquidité : toutes les 10 secondes\n" +
-      "📊 Trades : Anaxer\n\n" +
 
-      "🎯 Seuils :\n" +
-      "🟠 $80K\n" +
-      "🔴 $50K\n" +
-      "🚨 $20K\n" +
-      "💀 $5K\n\n" +
+      "📊 Pression SELL : toutes les 45 secondes\n\n" +
 
-      "⚡ Chute rapide surveillée"
+      "🟡 Pression : SELL ≥ 60%\n" +
+      "🟠 Forte : SELL ≥ 70%\n" +
+      "🔴 Extrême : SELL ≥ 75%\n\n" +
+
+      "🚨 Chute rapide : -4% / 60s\n\n" +
+
+      "⚠️ Pas d'alerte à chaque trade.",
+
+      {
+        parse_mode: "HTML"
+      }
     );
 
-    /*
-     * Vérifications immédiates.
-     */
-
-    checkLiquidity();
-    checkTrades();
-
-    /*
-     * Boucles.
-     */
+    await checkLiquidity();
+    await checkTrades();
 
     liquidityInterval =
       setInterval(
@@ -899,9 +860,9 @@ bot.command(
   }
 );
 
-/* =========================
-   UNWATCH
-========================= */
+// ===============================
+// UNWATCH
+// ===============================
 
 bot.command(
   "unwatch",
@@ -913,20 +874,20 @@ bot.command(
     currentLiquidity =
       null;
 
-    previousLiquidity =
-      null;
-
     highestLiquidity =
       null;
 
-    lastAlertLevel =
-      null;
-
-    lastTradeId =
-      null;
+    liquidityHistory =
+      [];
 
     recentTrades =
       [];
+
+    lastLiquidityAlert =
+      null;
+
+    lastPressureAlert =
+      null;
 
     if (liquidityInterval) {
 
@@ -954,9 +915,9 @@ bot.command(
   }
 );
 
-/* =========================
-   STATUS
-========================= */
+// ===============================
+// STATUS
+// ===============================
 
 bot.command(
   "status",
@@ -972,9 +933,12 @@ bot.command(
       return;
     }
 
+    const pressure =
+      analyzePressure();
+
     await ctx.reply(
 
-      "🟢 <b>Bot opérationnel</b>\n\n" +
+      "🟢 <b>RADAR ACTIF</b>\n\n" +
 
       "🪙 Token :\n" +
       "<code>" +
@@ -984,9 +948,12 @@ bot.command(
       "💧 Liquidité : " +
       (
         currentLiquidity !== null
-          ? formatUsd(currentLiquidity)
+          ? "<b>" +
+            formatUsd(currentLiquidity) +
+            "</b>"
           : "lecture..."
       ) +
+
       "\n\n" +
 
       "📈 Plus haut : " +
@@ -994,19 +961,41 @@ bot.command(
         highestLiquidity !== null
           ? formatUsd(highestLiquidity)
           : "lecture..."
-      )
+      ) +
+
+      "\n\n" +
+
+      "🔴 SELL 2 min : <b>" +
+      formatUsd(
+        pressure.sellVolume
+      ) +
+      "</b>\n" +
+
+      "🟢 BUY 2 min : <b>" +
+      formatUsd(
+        pressure.buyVolume
+      ) +
+      "</b>\n\n" +
+
+      "📉 Pression SELL : <b>" +
+      pressure.sellRatio.toFixed(1) +
+      "%</b>",
+
+      {
+        parse_mode: "HTML"
+      }
     );
   }
 );
 
-/* =========================
-   DÉMARRAGE
-========================= */
+// ===============================
+// DÉMARRAGE
+// ===============================
 
 bot.launch();
 
 console.log(
-  "🤖 Pump Alert Bot PumpSwap démarré"
+  "🤖 Pump Alert Bot Radar PumpSwap démarré"
 );
 
 process.once(
