@@ -375,7 +375,10 @@ async function sendTradeAlert(trade) {
    HELIUS : LIQUIDITÉ
 ========================= */
 
-function startHeliusMonitoring() {
+let liquidityInterval = null;
+let lastLiquidityAlert = false;
+
+async function checkLiquidity() {
   if (!watchedMint) {
     return;
   }
@@ -398,229 +401,220 @@ function startHeliusMonitoring() {
         programId
       );
 
+    const response =
+      await fetch(
+        `https://mainnet.helius-rpc.com/?api-key=${heliusApiKey}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getAccountInfo",
+            params: [
+              bondingCurve.toBase58(),
+              {
+                encoding: "base64",
+                commitment: "confirmed"
+              }
+            ]
+          })
+        }
+      );
+
+    if (!response.ok) {
+      console.error(
+        "🔴 Helius HTTP :",
+        response.status
+      );
+      return;
+    }
+
+    const result =
+      await response.json();
+
+    const account =
+      result.result?.value;
+
+    if (!account) {
+      console.log(
+        "⚠️ Bonding curve introuvable"
+      );
+      return;
+    }
+
+    const encodedData =
+      account.data?.[0];
+
+    if (!encodedData) {
+      console.log(
+        "⚠️ Données bonding curve absentes"
+      );
+      return;
+    }
+
+    const buffer =
+      Buffer.from(
+        encodedData,
+        "base64"
+      );
+
+    if (buffer.length < 40) {
+      console.log(
+        "⚠️ Données bonding curve trop courtes :",
+        buffer.length
+      );
+      return;
+    }
+
+    const realSolReserves =
+      buffer.readBigUInt64LE(32);
+
+    const realSol =
+      Number(realSolReserves) /
+      1000000000;
+
     console.log(
-      "📈 Bonding curve :",
-      bondingCurve.toBase58()
+      "💧 Liquidité bonding curve :",
+      realSol.toFixed(4),
+      "SOL"
     );
 
-    const url =
-      `wss://mainnet.helius-rpc.com/?api-key=${heliusApiKey}`;
-
-    heliusWs =
-      new WebSocket(url);
-
-    heliusWs.on("open", () => {
-      console.log(
-        "🟢 Connecté à Helius"
-      );
-
-      heliusWs.send(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "accountSubscribe",
-          params: [
-            bondingCurve.toBase58(),
-            {
-              commitment: "confirmed",
-              encoding: "base64"
-            }
-          ]
-        })
-      );
+    /* Première valeur */
+    if (lastRealSolReserves === null) {
+      lastRealSolReserves =
+        realSolReserves;
 
       console.log(
-        "💧 Surveillance de la liquidité activée"
+        "🧠 Réserve initiale mémorisée :",
+        realSol.toFixed(4),
+        "SOL"
       );
-    });
 
-    heliusWs.on("message", (data) => {
-      try {
-        const message =
-          JSON.parse(data.toString());
+      return;
+    }
 
-        if (
-          message.result &&
-          typeof message.result ===
-            "number"
-        ) {
-          heliusSubscriptionId =
-            message.result;
+    const difference =
+      Number(
+        realSolReserves -
+        lastRealSolReserves
+      ) / 1000000000;
 
-          console.log(
-            "🟢 Abonnement liquidité confirmé :",
-            heliusSubscriptionId
-          );
-
-          return;
-        }
-
-        if (
-          message.method !==
-          "accountNotification"
-        ) {
-          return;
-        }
-
-        const account =
-          message.params?.result?.value;
-
-        const encodedData =
-          account?.data?.[0];
-
-        if (!encodedData) {
-          console.log(
-            "⚠️ Données bonding curve absentes"
-          );
-
-          return;
-        }
-
-        const buffer =
-          Buffer.from(
-            encodedData,
-            "base64"
-          );
-
-        if (buffer.length < 40) {
-          console.log(
-            "⚠️ Données bonding curve trop courtes"
-          );
-
-          return;
-        }
-
-        const realSolReserves =
-          buffer.readBigUInt64LE(32);
-
-        const realSol =
-          Number(
-            realSolReserves
-          ) / 1000000000;
-
-        console.log(
-          "💧 Liquidité bonding curve :",
-          realSol.toFixed(4),
-          "SOL"
-        );
-
-        if (
-          lastRealSolReserves ===
-          null
-        ) {
-          lastRealSolReserves =
-            realSolReserves;
-
-          console.log(
-            "🧠 Réserve initiale mémorisée"
-          );
-
-          return;
-        }
-
-        const difference =
-          Number(
-            realSolReserves -
-            lastRealSolReserves
-          );
-
-        const differenceSol =
-          difference / 1000000000;
-
-        if (
-          differenceSol < 0
-        ) {
-          console.log(
-            "📉 Liquidité en baisse :",
-            differenceSol.toFixed(4),
-            "SOL"
-          );
-        }
-
-        if (
-          differenceSol > 0
-        ) {
-          console.log(
-            "📈 Liquidité en hausse :",
-            differenceSol.toFixed(4),
-            "SOL"
-          );
-        }
-
-        /*
-         * Alerte uniquement
-         * pour une baisse importante.
-         */
-
-        if (
-          differenceSol <= -2
-        ) {
-          const message =
-            "🚨 <b>Forte baisse de liquidité</b>\n\n" +
-            "🪙 Token :\n" +
-            "<code>" +
-            watchedMint +
-            "</code>\n\n" +
-            "💧 Liquidité actuelle : <b>" +
-            realSol.toFixed(2) +
-            " SOL</b>\n\n" +
-            "📉 Variation : <b>" +
-            differenceSol.toFixed(2) +
-            " SOL</b>";
-
-          safeTelegramSend(
-            message,
-            {
-              parse_mode: "HTML"
-            }
-          );
-        }
-
-        lastRealSolReserves =
-          realSolReserves;
-
-      } catch (error) {
-        console.error(
-          "🔴 Erreur traitement liquidité :",
-          error.message
-        );
-      }
-    });
-
-    heliusWs.on("close", () => {
+    if (difference < 0) {
       console.log(
-        "🟠 Helius déconnecté"
+        "📉 Variation :",
+        difference.toFixed(4),
+        "SOL"
       );
+    }
 
-      heliusWs = null;
-      heliusSubscriptionId =
-        null;
-
-      if (watchedMint) {
-        setTimeout(() => {
-          if (
-            watchedMint &&
-            !heliusWs
-          ) {
-            startHeliusMonitoring();
-          }
-        }, 5000);
-      }
-    });
-
-    heliusWs.on("error", (error) => {
-      console.error(
-        "🔴 WebSocket Helius :",
-        error.message
+    if (difference > 0) {
+      console.log(
+        "📈 Variation :",
+        difference.toFixed(4),
+        "SOL"
       );
-    });
+    }
+
+    /*
+     * ALERTE LIQUIDITÉ À ZÉRO
+     */
+
+    if (
+      realSol <= 0.001 &&
+      !lastLiquidityAlert
+    ) {
+      lastLiquidityAlert = true;
+
+      await safeTelegramSend(
+        "🚨 <b>LIQUIDITÉ À ZÉRO</b>\n\n" +
+        "🪙 Token :\n" +
+        "<code>" +
+        watchedMint +
+        "</code>\n\n" +
+        "💧 Liquidité bonding curve : <b>0 SOL</b>\n\n" +
+        "⚠️ Surveillance immédiate recommandée.",
+        {
+          parse_mode: "HTML"
+        }
+      );
+    }
+
+    /*
+     * ALERTE FORTE BAISSE
+     */
+
+    if (
+      difference <= -2
+    ) {
+      await safeTelegramSend(
+        "🚨 <b>Forte baisse de liquidité</b>\n\n" +
+        "🪙 Token :\n" +
+        "<code>" +
+        watchedMint +
+        "</code>\n\n" +
+        "💧 Liquidité actuelle : <b>" +
+        realSol.toFixed(2) +
+        " SOL</b>\n\n" +
+        "📉 Variation : <b>" +
+        difference.toFixed(2) +
+        " SOL</b>",
+        {
+          parse_mode: "HTML"
+        }
+      );
+    }
+
+    /*
+     * Si la liquidité remonte,
+     * on autorise une nouvelle alerte zéro.
+     */
+
+    if (realSol > 0.001) {
+      lastLiquidityAlert = false;
+    }
+
+    lastRealSolReserves =
+      realSolReserves;
 
   } catch (error) {
     console.error(
-      "🔴 Erreur démarrage liquidité :",
+      "🔴 Erreur vérification liquidité :",
       error.message
     );
   }
+}
+
+/* =========================
+   DÉMARRAGE SURVEILLANCE
+========================= */
+
+function startHeliusMonitoring() {
+  if (!watchedMint) {
+    return;
+  }
+
+  if (liquidityInterval) {
+    clearInterval(liquidityInterval);
+    liquidityInterval = null;
+  }
+
+  lastRealSolReserves = null;
+  lastLiquidityAlert = false;
+
+  console.log(
+    "💧 Surveillance directe Helius activée"
+  );
+
+  checkLiquidity();
+
+  liquidityInterval =
+    setInterval(
+      checkLiquidity,
+      15000
+    );
 }
 
 /* =========================
@@ -628,20 +622,17 @@ function startHeliusMonitoring() {
 ========================= */
 
 function stopHeliusMonitoring() {
-  if (heliusWs) {
-    try {
-      heliusWs.close();
-    } catch (error) {
-      console.error(
-        "🔴 Erreur fermeture Helius :",
-        error.message
-      );
-    }
+  if (liquidityInterval) {
+    clearInterval(liquidityInterval);
+    liquidityInterval = null;
   }
 
-  heliusWs = null;
-  heliusSubscriptionId =
-    null;
+  lastRealSolReserves = null;
+  lastLiquidityAlert = false;
+
+  console.log(
+    "🛑 Surveillance liquidité arrêtée"
+  );
 }
 
 /* =========================
