@@ -1,5 +1,6 @@
 const { Telegraf } = require("telegraf");
 const { WebSocket } = require("ws");
+const { PublicKey } = require("@solana/web3.js");
 
 const botToken = process.env.BOT_TOKEN;
 const anaxerApiKey = process.env.ANAXER_API_KEY;
@@ -16,11 +17,13 @@ const bot = new Telegraf(botToken);
 let watchedMint = null;
 let lastTradeId = null;
 let watchInterval = null;
+
 let heliusWs = null;
 let heliusSubscriptionId = null;
+let lastRealSolReserves = null;
 
 /* =========================
-   COMMANDES TELEGRAM
+   TELEGRAM
 ========================= */
 
 bot.start((ctx) => {
@@ -28,7 +31,8 @@ bot.start((ctx) => {
     "🤖 Pump Alert Bot est en ligne !\n\n" +
     "👁️ /watch MINT = surveiller un token\n" +
     "🛑 /unwatch = arrêter\n" +
-    "📊 Trades Anaxer + activité blockchain Helius"
+    "📊 Trades Anaxer\n" +
+    "💧 Liquidité Helius"
   );
 });
 
@@ -36,11 +40,11 @@ bot.command("status", (ctx) => {
   if (watchedMint) {
     ctx.reply(
       "🟢 Bot opérationnel !\n\n" +
-      "👁️ Token surveillé :\n" +
+      "🪙 Token surveillé :\n" +
       watchedMint +
       "\n\n" +
       "📊 Trades : Anaxer\n" +
-      "⛓️ Blockchain : Helius"
+      "💧 Liquidité : Helius"
     );
   } else {
     ctx.reply(
@@ -66,8 +70,18 @@ bot.command("watch", async (ctx) => {
     return;
   }
 
+  try {
+    new PublicKey(mint);
+  } catch {
+    await ctx.reply(
+      "❌ Adresse de token Solana invalide."
+    );
+    return;
+  }
+
   watchedMint = mint;
   lastTradeId = null;
+  lastRealSolReserves = null;
 
   if (watchInterval) {
     clearInterval(watchInterval);
@@ -81,8 +95,8 @@ bot.command("watch", async (ctx) => {
     "🪙 Token :\n" +
     mint +
     "\n\n" +
-    "📊 Trades vérifiés toutes les 45 secondes.\n" +
-    "💧 Surveillance de la liquidité Helius activée."
+    "📊 Trades : toutes les 45 secondes\n" +
+    "💧 Liquidité : surveillance Helius"
   );
 
   checkTrades();
@@ -93,6 +107,28 @@ bot.command("watch", async (ctx) => {
   );
 
   startHeliusMonitoring();
+});
+
+/* =========================
+   UNWATCH
+========================= */
+
+bot.command("unwatch", async (ctx) => {
+  watchedMint = null;
+  lastTradeId = null;
+  lastRealSolReserves = null;
+
+  if (watchInterval) {
+    clearInterval(watchInterval);
+    watchInterval = null;
+  }
+
+  stopHeliusMonitoring();
+
+  await ctx.reply(
+    "🛑 Surveillance arrêtée.\n\n" +
+    "Aucun token n'est actuellement surveillé."
+  );
 });
 
 /* =========================
@@ -234,7 +270,10 @@ async function sendTradeAlert(trade) {
       "</code>\n\n";
 
     if (volume !== null) {
-      message += "💵 Volume : $" + volume + "\n";
+      message +=
+        "💵 Volume : $" +
+        volume +
+        "\n";
     }
 
     message +=
@@ -245,11 +284,17 @@ async function sendTradeAlert(trade) {
       signature +
       "</code>";
 
-    await bot.telegram.sendMessage(chatId, message, {
-      parse_mode: "HTML"
-    });
+    await bot.telegram.sendMessage(
+      chatId,
+      message,
+      {
+        parse_mode: "HTML"
+      }
+    );
 
-    console.log("🟢 Alerte trade envoyée");
+    console.log(
+      "🟢 Alerte trade envoyée"
+    );
 
   } catch (error) {
     console.error(
@@ -260,7 +305,7 @@ async function sendTradeAlert(trade) {
 }
 
 /* =========================
-   HELIUS : BLOCKCHAIN
+   HELIUS : LIQUIDITÉ
 ========================= */
 
 function startHeliusMonitoring() {
@@ -269,47 +314,72 @@ function startHeliusMonitoring() {
   }
 
   try {
+    const mintPublicKey =
+      new PublicKey(watchedMint);
+
+    const programId =
+      new PublicKey(
+        "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+      );
+
+    const [bondingCurve] =
+      PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("bonding-curve"),
+          mintPublicKey.toBuffer()
+        ],
+        programId
+      );
+
+    console.log(
+      "📈 Bonding curve :",
+      bondingCurve.toBase58()
+    );
+
     const url =
       `wss://mainnet.helius-rpc.com/?api-key=${heliusApiKey}`;
 
     heliusWs = new WebSocket(url);
 
     heliusWs.on("open", () => {
-      console.log("🟢 Connecté à Helius");
+      console.log(
+        "🟢 Connecté à Helius"
+      );
 
       heliusWs.send(
         JSON.stringify({
           jsonrpc: "2.0",
           id: 1,
-          method: "logsSubscribe",
+          method: "accountSubscribe",
           params: [
+            bondingCurve.toBase58(),
             {
-              mentions: [watchedMint]
-            },
-            {
-              commitment: "confirmed"
+              commitment: "confirmed",
+              encoding: "base64"
             }
           ]
         })
       );
 
       console.log(
-        "⛓️ Surveillance blockchain activée pour le token"
+        "💧 Surveillance de la liquidité activée"
       );
     });
 
-    heliusWs.on("message", async (data) => {
+    heliusWs.on("message", (data) => {
       try {
-        const message = JSON.parse(data.toString());
+        const message =
+          JSON.parse(data.toString());
 
         if (
           message.result &&
           typeof message.result === "number"
         ) {
-          heliusSubscriptionId = message.result;
+          heliusSubscriptionId =
+            message.result;
 
           console.log(
-            "🟢 Abonnement Helius confirmé :",
+            "🟢 Abonnement liquidité confirmé :",
             heliusSubscriptionId
           );
 
@@ -317,31 +387,148 @@ function startHeliusMonitoring() {
         }
 
         if (
-          message.method !== "logsNotification"
+          message.method !==
+          "accountNotification"
         ) {
           return;
         }
 
-        const value =
+        const account =
           message.params?.result?.value;
 
-        const signature =
-          value?.signature;
+        const encodedData =
+          account?.data?.[0];
 
-        if (!signature) {
+        if (!encodedData) {
+          console.log(
+            "⚠️ Données bonding curve absentes"
+          );
           return;
         }
 
+        const buffer =
+          Buffer.from(
+            encodedData,
+            "base64"
+          );
+
+        /*
+         * Structure Pump.fun :
+         *
+         * 8 octets  = discriminator
+         * 8 octets  = virtual token reserves
+         * 8 octets  = virtual SOL reserves
+         * 8 octets  = real token reserves
+         * 8 octets  = real SOL reserves
+         */
+
+        if (buffer.length < 40) {
+          console.log(
+            "⚠️ Données bonding curve trop courtes"
+          );
+          return;
+        }
+
+        const virtualSolReserves =
+          Number(
+            buffer.readBigUInt64LE(16)
+          );
+
+        const realSolReserves =
+          Number(
+            buffer.readBigUInt64LE(32)
+          );
+
+        const virtualSol =
+          virtualSolReserves /
+          1000000000;
+
+        const realSol =
+          realSolReserves /
+          1000000000;
+
         console.log(
-          "⛓️ Activité blockchain détectée :",
-          signature
+          "💧 Liquidité bonding curve :",
+          realSol.toFixed(4),
+          "SOL"
         );
 
-        await sendBlockchainAlert(signature);
+        if (
+          lastRealSolReserves === null
+        ) {
+          lastRealSolReserves =
+            realSolReserves;
+
+          console.log(
+            "🧠 Réserve initiale mémorisée"
+          );
+
+          return;
+        }
+
+        const difference =
+          realSolReserves -
+          lastRealSolReserves;
+
+        const differenceSol =
+          difference /
+          1000000000;
+
+        if (differenceSol < 0) {
+          console.log(
+            "📉 Liquidité en baisse :",
+            differenceSol.toFixed(4),
+            "SOL"
+          );
+        }
+
+        if (differenceSol > 0) {
+          console.log(
+            "📈 Liquidité en hausse :",
+            differenceSol.toFixed(4),
+            "SOL"
+          );
+        }
+
+        /*
+         * Première alerte provisoire :
+         * baisse d'au moins 2 SOL
+         * entre deux mises à jour.
+         */
+
+        if (differenceSol <= -2) {
+          const message =
+            "🚨 <b>Forte baisse de liquidité</b>\n\n" +
+            "🪙 Token :\n" +
+            "<code>" +
+            watchedMint +
+            "</code>\n\n" +
+            "💧 Liquidité actuelle : <b>" +
+            realSol.toFixed(2) +
+            " SOL</b>\n\n" +
+            "📉 Variation : <b>" +
+            differenceSol.toFixed(2) +
+            " SOL</b>";
+
+          bot.telegram.sendMessage(
+            chatId,
+            message,
+            {
+              parse_mode: "HTML"
+            }
+          );
+
+          console.log(
+            "🚨 Alerte liquidité envoyée"
+          );
+        }
+
+        lastRealSolReserves =
+          realSolReserves;
 
       } catch (error) {
         console.error(
-          "🔴 Erreur traitement Helius :",
+          "🔴 Erreur traitement liquidité :",
           error.message
         );
       }
@@ -349,7 +536,7 @@ function startHeliusMonitoring() {
 
     heliusWs.on("close", () => {
       console.log(
-        "🟠 Helius déconnecté."
+        "🟠 Helius déconnecté"
       );
 
       heliusWs = null;
@@ -357,7 +544,10 @@ function startHeliusMonitoring() {
 
       if (watchedMint) {
         setTimeout(() => {
-          if (watchedMint && !heliusWs) {
+          if (
+            watchedMint &&
+            !heliusWs
+          ) {
             startHeliusMonitoring();
           }
         }, 5000);
@@ -373,7 +563,7 @@ function startHeliusMonitoring() {
 
   } catch (error) {
     console.error(
-      "🔴 Erreur démarrage Helius :",
+      "🔴 Erreur démarrage liquidité :",
       error.message
     );
   }
@@ -397,154 +587,6 @@ function stopHeliusMonitoring() {
 
   heliusWs = null;
   heliusSubscriptionId = null;
-}
-
-/* =========================
-   ALERTE BLOCKCHAIN
-========================= */
-
-async function sendBlockchainAlert(signature) {
-  try {
-    const url =
-      `https://api.helius.xyz/v0/transactions/?api-key=${heliusApiKey}`;
-
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        transactions: [signature]
-      })
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-
-      console.error(
-        "🔴 Helius transaction :",
-        response.status,
-        text
-      );
-
-      return;
-    }
-
-    const transactions = await response.json();
-
-    if (!transactions.length) {
-      console.log("ℹ️ Transaction non décodée");
-      return;
-    }
-
-    const tx = transactions[0];
-
-    console.log("🔎 TRANSACTION ANALYSÉE");
-    console.log("Type :", tx.type);
-    console.log("Description :", tx.description);
-
-    /*
-     * Pour le moment :
-     * on analyse la transaction mais on ne l'envoie
-     * PAS automatiquement sur Telegram.
-     */
-
-    if (tx.type === "SWAP") {
-      console.log("🔄 SWAP détecté");
-
-      if (tx.nativeTransfers?.length) {
-        for (const transfer of tx.nativeTransfers) {
-          const sol =
-            transfer.amount / 1000000000;
-
-          console.log(
-            "💰 Mouvement SOL :",
-            sol.toFixed(4),
-            "SOL"
-          );
-        }
-      }
-
-      if (tx.tokenTransfers?.length) {
-        for (const transfer of tx.tokenTransfers) {
-          console.log(
-            "🪙 Mouvement token :",
-            transfer.tokenAmount
-          );
-        }
-      }
-    }
-
-    /*
-     * On alerte seulement si la transaction
-     * semble importante.
-     */
-
-    let totalSol = 0;
-
-    if (tx.nativeTransfers?.length) {
-      for (const transfer of tx.nativeTransfers) {
-        totalSol +=
-          Math.abs(transfer.amount) / 1000000000;
-      }
-    }
-
-    console.log(
-      "💰 Total SOL déplacé :",
-      totalSol.toFixed(4),
-      "SOL"
-    );
-
-    /*
-     * Seuil provisoire :
-     * 5 SOL de mouvements cumulés.
-     *
-     * Ce n'est PAS encore un signal de retrait
-     * de liquidité. C'est seulement un filtre
-     * pour éviter le spam.
-     */
-
-    if (totalSol >= 5) {
-      const message =
-        "🚨 <b>Gros mouvement détecté</b>\n\n" +
-        "🪙 Token :\n" +
-        "<code>" +
-        watchedMint +
-        "</code>\n\n" +
-        "💰 SOL déplacés : <b>" +
-        totalSol.toFixed(2) +
-        " SOL</b>\n\n" +
-        "📌 Type : " +
-        (tx.type || "Inconnu") +
-        "\n\n" +
-        "🔗 Transaction :\n" +
-        "<code>" +
-        signature +
-        "</code>";
-
-      await bot.telegram.sendMessage(
-        chatId,
-        message,
-        {
-          parse_mode: "HTML"
-        }
-      );
-
-      console.log(
-        "🚨 Alerte gros mouvement envoyée"
-      );
-    } else {
-      console.log(
-        "🟢 Mouvement normal, aucune alerte Telegram"
-      );
-    }
-
-  } catch (error) {
-    console.error(
-      "🔴 Erreur analyse transaction :",
-      error.message
-    );
-  }
 }
 
 /* =========================
