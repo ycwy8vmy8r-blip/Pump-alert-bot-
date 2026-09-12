@@ -20,7 +20,54 @@ let watchInterval = null;
 
 let heliusWs = null;
 let heliusSubscriptionId = null;
+
 let lastRealSolReserves = null;
+
+/* =========================
+   PROTECTION TELEGRAM
+========================= */
+
+let lastTelegramMessageTime = 0;
+
+const TELEGRAM_MIN_INTERVAL = 3000;
+
+async function safeTelegramSend(message, options = {}) {
+  const now = Date.now();
+  const elapsed = now - lastTelegramMessageTime;
+
+  if (elapsed < TELEGRAM_MIN_INTERVAL) {
+    const waitTime =
+      TELEGRAM_MIN_INTERVAL - elapsed;
+
+    console.log(
+      `⏳ Protection Telegram : attente ${waitTime} ms`
+    );
+
+    await new Promise((resolve) =>
+      setTimeout(resolve, waitTime)
+    );
+  }
+
+  try {
+    await bot.telegram.sendMessage(
+      chatId,
+      message,
+      options
+    );
+
+    lastTelegramMessageTime = Date.now();
+
+    console.log(
+      "🟢 Message Telegram envoyé"
+    );
+
+  } catch (error) {
+    console.error(
+      "🔴 Erreur Telegram :",
+      error.message
+    );
+  }
+}
 
 /* =========================
    TELEGRAM
@@ -59,7 +106,9 @@ bot.command("status", (ctx) => {
 ========================= */
 
 bot.command("watch", async (ctx) => {
-  const parts = ctx.message.text.trim().split(/\s+/);
+  const parts =
+    ctx.message.text.trim().split(/\s+/);
+
   const mint = parts[1];
 
   if (!mint) {
@@ -151,7 +200,8 @@ async function checkTrades() {
     });
 
     if (!response.ok) {
-      const text = await response.text();
+      const text =
+        await response.text();
 
       console.error(
         "🔴 Anaxer REST :",
@@ -162,15 +212,20 @@ async function checkTrades() {
       return;
     }
 
-    const result = await response.json();
+    const result =
+      await response.json();
 
     const trades =
       Array.isArray(result)
         ? result
-        : result.data || result.trades || [];
+        : result.data ||
+          result.trades ||
+          [];
 
     if (!trades.length) {
-      console.log("ℹ️ Aucun trade trouvé");
+      console.log(
+        "ℹ️ Aucun trade trouvé"
+      );
       return;
     }
 
@@ -179,7 +234,8 @@ async function checkTrades() {
     );
 
     if (!lastTradeId) {
-      const newestTrade = trades[0];
+      const newestTrade =
+        trades[0];
 
       lastTradeId =
         newestTrade.id ||
@@ -188,7 +244,10 @@ async function checkTrades() {
         newestTrade.slot ||
         newestTrade.timestamp;
 
-      console.log("🧠 Dernier trade mémorisé");
+      console.log(
+        "🧠 Dernier trade mémorisé"
+      );
+
       return;
     }
 
@@ -210,11 +269,15 @@ async function checkTrades() {
     }
 
     if (!newTrades.length) {
-      console.log("⏳ Aucun nouveau trade");
+      console.log(
+        "⏳ Aucun nouveau trade"
+      );
+
       return;
     }
 
-    const newestTrade = newTrades[0];
+    const newestTrade =
+      newTrades[0];
 
     lastTradeId =
       newestTrade.id ||
@@ -227,9 +290,18 @@ async function checkTrades() {
       `🆕 ${newTrades.length} nouveau(x) trade(s)`
     );
 
-    for (const trade of newTrades.reverse()) {
-      await sendTradeAlert(trade);
-    }
+    /*
+     * Sécurité :
+     * maximum 1 alerte Telegram
+     * par cycle de vérification.
+     */
+
+    const newestAlert =
+      newTrades[newTrades.length - 1];
+
+    await sendTradeAlert(
+      newestAlert
+    );
 
   } catch (error) {
     console.error(
@@ -284,21 +356,16 @@ async function sendTradeAlert(trade) {
       signature +
       "</code>";
 
-    await bot.telegram.sendMessage(
-      chatId,
+    await safeTelegramSend(
       message,
       {
         parse_mode: "HTML"
       }
     );
 
-    console.log(
-      "🟢 Alerte trade envoyée"
-    );
-
   } catch (error) {
     console.error(
-      "🔴 Erreur Telegram :",
+      "🔴 Erreur préparation alerte trade :",
       error.message
     );
   }
@@ -339,7 +406,8 @@ function startHeliusMonitoring() {
     const url =
       `wss://mainnet.helius-rpc.com/?api-key=${heliusApiKey}`;
 
-    heliusWs = new WebSocket(url);
+    heliusWs =
+      new WebSocket(url);
 
     heliusWs.on("open", () => {
       console.log(
@@ -373,7 +441,8 @@ function startHeliusMonitoring() {
 
         if (
           message.result &&
-          typeof message.result === "number"
+          typeof message.result ===
+            "number"
         ) {
           heliusSubscriptionId =
             message.result;
@@ -403,6 +472,7 @@ function startHeliusMonitoring() {
           console.log(
             "⚠️ Données bonding curve absentes"
           );
+
           return;
         }
 
@@ -412,40 +482,21 @@ function startHeliusMonitoring() {
             "base64"
           );
 
-        /*
-         * Structure Pump.fun :
-         *
-         * 8 octets  = discriminator
-         * 8 octets  = virtual token reserves
-         * 8 octets  = virtual SOL reserves
-         * 8 octets  = real token reserves
-         * 8 octets  = real SOL reserves
-         */
-
         if (buffer.length < 40) {
           console.log(
             "⚠️ Données bonding curve trop courtes"
           );
+
           return;
         }
 
-        const virtualSolReserves =
-          Number(
-            buffer.readBigUInt64LE(16)
-          );
-
         const realSolReserves =
-          Number(
-            buffer.readBigUInt64LE(32)
-          );
-
-        const virtualSol =
-          virtualSolReserves /
-          1000000000;
+          buffer.readBigUInt64LE(32);
 
         const realSol =
-          realSolReserves /
-          1000000000;
+          Number(
+            realSolReserves
+          ) / 1000000000;
 
         console.log(
           "💧 Liquidité bonding curve :",
@@ -454,7 +505,8 @@ function startHeliusMonitoring() {
         );
 
         if (
-          lastRealSolReserves === null
+          lastRealSolReserves ===
+          null
         ) {
           lastRealSolReserves =
             realSolReserves;
@@ -467,14 +519,17 @@ function startHeliusMonitoring() {
         }
 
         const difference =
-          realSolReserves -
-          lastRealSolReserves;
+          Number(
+            realSolReserves -
+            lastRealSolReserves
+          );
 
         const differenceSol =
-          difference /
-          1000000000;
+          difference / 1000000000;
 
-        if (differenceSol < 0) {
+        if (
+          differenceSol < 0
+        ) {
           console.log(
             "📉 Liquidité en baisse :",
             differenceSol.toFixed(4),
@@ -482,7 +537,9 @@ function startHeliusMonitoring() {
           );
         }
 
-        if (differenceSol > 0) {
+        if (
+          differenceSol > 0
+        ) {
           console.log(
             "📈 Liquidité en hausse :",
             differenceSol.toFixed(4),
@@ -491,12 +548,13 @@ function startHeliusMonitoring() {
         }
 
         /*
-         * Première alerte provisoire :
-         * baisse d'au moins 2 SOL
-         * entre deux mises à jour.
+         * Alerte uniquement
+         * pour une baisse importante.
          */
 
-        if (differenceSol <= -2) {
+        if (
+          differenceSol <= -2
+        ) {
           const message =
             "🚨 <b>Forte baisse de liquidité</b>\n\n" +
             "🪙 Token :\n" +
@@ -510,16 +568,11 @@ function startHeliusMonitoring() {
             differenceSol.toFixed(2) +
             " SOL</b>";
 
-          bot.telegram.sendMessage(
-            chatId,
+          safeTelegramSend(
             message,
             {
               parse_mode: "HTML"
             }
-          );
-
-          console.log(
-            "🚨 Alerte liquidité envoyée"
           );
         }
 
@@ -540,7 +593,8 @@ function startHeliusMonitoring() {
       );
 
       heliusWs = null;
-      heliusSubscriptionId = null;
+      heliusSubscriptionId =
+        null;
 
       if (watchedMint) {
         setTimeout(() => {
@@ -586,7 +640,8 @@ function stopHeliusMonitoring() {
   }
 
   heliusWs = null;
-  heliusSubscriptionId = null;
+  heliusSubscriptionId =
+    null;
 }
 
 /* =========================
