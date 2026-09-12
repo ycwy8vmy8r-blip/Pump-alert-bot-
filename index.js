@@ -87,22 +87,135 @@ bot.command("watch", async (ctx) => {
   checkTrades();
   watchInterval = setInterval(checkTrades, 45000);
 
-  startHeliusMonitoring();
-});
-
-/* =========================
-   UNWATCH
-========================= */
-
-bot.command("unwatch", async (ctx) => {
-  watchedMint = null;
-  lastTradeId = null;
-
-  if (watchInterval) {
-    clearInterval(watchInterval);
-    watchInterval = null;
+  function startHeliusMonitoring() {
+  if (!watchedMint) {
+    return;
   }
 
+  try {
+    const connectionUrl =
+      `wss://mainnet.helius-rpc.com/?api-key=${heliusApiKey}`;
+
+    heliusWs = new WebSocket(connectionUrl);
+
+    heliusWs.on("open", async () => {
+      console.log("🟢 Connecté à Helius");
+
+      try {
+        const connection = new (require("@solana/web3.js").Connection)(
+          `https://mainnet.helius-rpc.com/?api-key=${heliusApiKey}`
+        );
+
+        const { PublicKey } = require("@solana/web3.js");
+
+        const [bondingCurve] =
+          PublicKey.findProgramAddressSync(
+            [
+              Buffer.from("bonding-curve"),
+              new PublicKey(watchedMint).toBuffer()
+            ],
+            new PublicKey(
+              "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+            )
+          );
+
+        console.log(
+          "📈 Bonding curve :",
+          bondingCurve.toBase58()
+        );
+
+        heliusWs.send(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "accountSubscribe",
+            params: [
+              bondingCurve.toBase58(),
+              {
+                commitment: "confirmed",
+                encoding: "base64"
+              }
+            ]
+          })
+        );
+
+        console.log(
+          "💧 Surveillance de la liquidité activée"
+        );
+
+      } catch (error) {
+        console.error(
+          "🔴 Erreur création surveillance liquidité :",
+          error.message
+        );
+      }
+    });
+
+    heliusWs.on("message", (data) => {
+      try {
+        const message = JSON.parse(data.toString());
+
+        if (
+          message.result &&
+          typeof message.result === "number"
+        ) {
+          heliusSubscriptionId = message.result;
+
+          console.log(
+            "🟢 Abonnement liquidité confirmé :",
+            heliusSubscriptionId
+          );
+
+          return;
+        }
+
+        if (
+          message.method !== "accountNotification"
+        ) {
+          return;
+        }
+
+        console.log(
+          "💧 Changement de la bonding curve détecté"
+        );
+
+      } catch (error) {
+        console.error(
+          "🔴 Erreur traitement liquidité :",
+          error.message
+        );
+      }
+    });
+
+    heliusWs.on("close", () => {
+      console.log("🟠 Helius déconnecté.");
+
+      heliusWs = null;
+      heliusSubscriptionId = null;
+
+      if (watchedMint) {
+        setTimeout(() => {
+          if (watchedMint && !heliusWs) {
+            startHeliusMonitoring();
+          }
+        }, 5000);
+      }
+    });
+
+    heliusWs.on("error", (error) => {
+      console.error(
+        "🔴 WebSocket Helius :",
+        error.message
+      );
+    });
+
+  } catch (error) {
+    console.error(
+      "🔴 Erreur démarrage Helius :",
+      error.message
+    );
+  }
+}
   stopHeliusMonitoring();
 
   await ctx.reply(
