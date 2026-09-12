@@ -17,7 +17,7 @@ const bot = new Telegraf(botToken);
 let watchedMint = null;
 let lastTradeId = null;
 let watchInterval = null;
-
+let lastTrade = null;
 let heliusWs = null;
 let heliusSubscriptionId = null;
 
@@ -130,6 +130,7 @@ bot.command("watch", async (ctx) => {
 
   watchedMint = mint;
   lastTradeId = null;
+  lastTrade = null;
   lastRealSolReserves = null;
 
   if (watchInterval) {
@@ -243,7 +244,7 @@ async function checkTrades() {
         newestTrade.txHash ||
         newestTrade.slot ||
         newestTrade.timestamp;
-
+lastTrade = newestTrade;
       console.log(
         "🧠 Dernier trade mémorisé"
       );
@@ -296,12 +297,9 @@ async function checkTrades() {
      * par cycle de vérification.
      */
 
-    const newestAlert =
-      newTrades[newTrades.length - 1];
-
-    await sendTradeAlert(
-      newestAlert
-    );
+    lastTrade = newTrades[0];
+console.log("🔕 Trade mémorisé, aucune alerte Telegram");
+    
 
   } catch (error) {
     console.error(
@@ -566,26 +564,62 @@ async function checkLiquidity() {
      * ALERTE FORTE BAISSE
      */
 
-    if (
-      difference <= -2
-    ) {
-      await safeTelegramSend(
-        "🚨 <b>Forte baisse de liquidité</b>\n\n" +
-        "🪙 Token :\n" +
-        "<code>" +
-        watchedMint +
-        "</code>\n\n" +
-        "💧 Liquidité actuelle : <b>" +
-        realSol.toFixed(2) +
-        " SOL</b>\n\n" +
-        "📉 Variation : <b>" +
-        difference.toFixed(2) +
-        " SOL</b>",
-        {
-          parse_mode: "HTML"
-        }
-      );
+    if (difference <= -2) {
+
+  let tradeInfo =
+    "⚠️ Aucun trade récent mémorisé.";
+
+  if (lastTrade) {
+
+    const volume =
+      lastTrade.volumeUsd ??
+      lastTrade.volume_usd ??
+      lastTrade.usdVolume ??
+      null;
+
+    const wallet =
+      lastTrade.wallet ??
+      lastTrade.trader ??
+      lastTrade.user ??
+      "Inconnu";
+
+    const signature =
+      lastTrade.signature ??
+      lastTrade.txHash ??
+      lastTrade.transaction ??
+      "Inconnue";
+
+    tradeInfo =
+      "📊 <b>Dernier trade avant la chute :</b>\n\n" +
+      "💵 Volume : " +
+      (volume !== null ? "$" + volume : "Inconnu") +
+      "\n" +
+      "👛 Wallet : <code>" +
+      wallet +
+      "</code>\n" +
+      "🔗 Transaction : <code>" +
+      signature +
+      "</code>";
+  }
+
+  await safeTelegramSend(
+    "🚨 <b>FORTE BAISSE DE LIQUIDITÉ</b>\n\n" +
+    "🪙 Token :\n" +
+    "<code>" +
+    watchedMint +
+    "</code>\n\n" +
+    "💧 Liquidité actuelle : <b>" +
+    realSol.toFixed(2) +
+    " SOL</b>\n\n" +
+    "📉 Variation : <b>" +
+    difference.toFixed(2) +
+    " SOL</b>\n\n" +
+    tradeInfo,
+    {
+      parse_mode: "HTML"
     }
+  );
+}
 
     /*
      * Si la liquidité remonte,
