@@ -29,7 +29,7 @@ let lastRealSolReserves = null;
 
 let lastTelegramMessageTime = 0;
 
-const TELEGRAM_MIN_INTERVAL = 3000;
+const TELEGRAM_MIN_INTERVAL = 10000;
 
 async function safeTelegramSend(message, options = {}) {
   const now = Date.now();
