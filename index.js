@@ -484,17 +484,37 @@ async function checkLiquidity() {
 
     /* Première valeur */
     if (lastRealSolReserves === null) {
-      lastRealSolReserves =
-        realSolReserves;
+  lastRealSolReserves =
+    realSolReserves;
 
-      console.log(
-        "🧠 Réserve initiale mémorisée :",
-        realSol.toFixed(4),
-        "SOL"
-      );
+  console.log(
+    "🧠 Réserve initiale mémorisée :",
+    realSol.toFixed(4),
+    "SOL"
+  );
 
-      return;
-    }
+  if (
+    realSol <= 0.001 &&
+    !lastLiquidityAlert
+  ) {
+    lastLiquidityAlert = true;
+
+    await safeTelegramSend(
+      "🚨 <b>LIQUIDITÉ À ZÉRO</b>\n\n" +
+      "🪙 Token :\n" +
+      "<code>" +
+      watchedMint +
+      "</code>\n\n" +
+      "💧 Liquidité : <b>0 SOL</b>\n\n" +
+      "⚠️ Attention : la bonding curve est vide.",
+      {
+        parse_mode: "HTML"
+      }
+    );
+  }
+
+  return;
+}
 
     const difference =
       Number(
