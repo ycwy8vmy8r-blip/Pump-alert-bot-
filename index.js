@@ -456,52 +456,60 @@ async function loadPoolVaults() {
 // =====================================================
 
 function readTokenAmount(accountInfo) {
-
   if (!accountInfo) {
     return null;
   }
 
-  // JSON parsed
   try {
+    let data = accountInfo.data;
 
-    const parsed =
-      accountInfo.data?.parsed;
+    // Avec getMultipleAccountsInfo(), web3.js
+    // renvoie normalement directement un Buffer.
+    if (Buffer.isBuffer(data)) {
+      if (data.length < 72) {
+        return null;
+      }
 
-    const amount =
-      parsed?.info?.tokenAmount?.amount;
-
-    if (amount !== undefined) {
-      return BigInt(amount);
+      // SPL Token Account:
+      // 0-31   mint
+      // 32-63  owner
+      // 64-71  amount (u64 little-endian)
+      return data.readBigUInt64LE(64);
     }
 
-  } catch {}
-
-  // Base64 fallback
-  try {
-
-    const data =
-      accountInfo.data;
-
+    // Sécurité si les données arrivent sous forme
+    // [base64, "base64"]
     if (
       Array.isArray(data) &&
+      data.length >= 2 &&
       data[1] === "base64"
     ) {
+      const buffer = Buffer.from(
+        data[0],
+        "base64"
+      );
 
-      const buffer =
-        Buffer.from(
-          data[0],
-          "base64"
-        );
-
-      if (buffer.length >= 72) {
-
-        return buffer.readBigUInt64LE(
-          64
-        );
+      if (buffer.length < 72) {
+        return null;
       }
+
+      return buffer.readBigUInt64LE(64);
     }
 
-  } catch {}
+    // Sécurité pour jsonParsed
+    const parsed =
+      data?.parsed?.info?.tokenAmount?.amount;
+
+    if (parsed !== undefined) {
+      return BigInt(parsed);
+    }
+
+  } catch (error) {
+    console.error(
+      "🔴 Lecture réserve token :",
+      error.message
+    );
+  }
 
   return null;
 }
