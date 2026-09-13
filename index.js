@@ -2,70 +2,134 @@ const { Connection, PublicKey } = require("@solana/web3.js");
 const { Telegraf } = require("telegraf");
 
 // ============================================================
-// PUMP ALERT BOT - RADAR SORTIE V4
-//
-// V4 = priorité aux signaux STRUCTURELS
-//
-// 1. Retrait de liquidité on-chain
-// 2. Chute brutale de réserve + base
-// 3. Chute du prix
-// 4. Chute de liquidité
-// 5. Pression vendeuse comme signal secondaire
-//
-// IMPORTANT : aucune détection ne garantit une sortie avant
-// un crash atomique ou extrêmement rapide.
+// RADAR SORTIE V5
+// Objectif : détecter les micro-signaux pré-crash
 // ============================================================
+
+// ------------------------------------------------------------
+// ENV
+// ------------------------------------------------------------
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 
-if (!BOT_TOKEN || !CHAT_ID || !HELIUS_API_KEY) {
-  throw new Error(
-    "Variables manquantes : BOT_TOKEN, CHAT_ID ou HELIUS_API_KEY"
-  );
+if (!BOT_TOKEN) {
+  console.error("❌ BOT_TOKEN manquant");
+  process.exit(1);
 }
+
+if (!CHAT_ID) {
+  console.error("❌ CHAT_ID manquant");
+  process.exit(1);
+}
+
+if (!HELIUS_API_KEY) {
+  console.error("❌ HELIUS_API_KEY manquant");
+  process.exit(1);
+}
+
+// ------------------------------------------------------------
+// CONNECTION
+// ------------------------------------------------------------
 
 const RPC_URL =
   `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
-const WS_URL =
+const WSS_URL =
   `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-
-const PUMPSWAP_PROGRAM =
-  "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
 const connection = new Connection(RPC_URL, {
   commitment: "processed",
-  wsEndpoint: WS_URL,
+  wsEndpoint: WSS_URL
 });
 
 const bot = new Telegraf(BOT_TOKEN);
 
-const watched = new Map();
+// ------------------------------------------------------------
+// CONSTANTES
+// ------------------------------------------------------------
 
-// ============================================================
-// RÉGLAGES V4
-// ============================================================
+const PUMPSWAP_PROGRAM =
+  "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
-const DEX_POLL_MS = 5000;
-const HEALTH_LOG_MS = 30000;
+const WSOL_MINT =
+  "So11111111111111111111111111111111111111112";
 
-const EVENT_WINDOW_MS = 30000;
+// Pool layout PumpSwap
+const BASE_VAULT_OFFSET = 139;
+const QUOTE_VAULT_OFFSET = 171;
 
-// Temps pendant lequel on attend les deux vaults
-// avant de calculer le mouvement.
-const RESERVE_BATCH_MS = 120;
+// ------------------------------------------------------------
+// ETAT
+// ------------------------------------------------------------
 
-// Protection anti-spam.
-const ALERT_COOLDOWN_MS = 45000;
+let watchedMint = null;
+let poolAddress = null;
 
-// ============================================================
-// OUTILS
-// ============================================================
+let baseVault = null;
+let quoteVault = null;
 
-function now() {
-  return Date.now();
+let baseSubscription = null;
+let quoteSubscription = null;
+let logSubscription = null;
+
+let currentBase = null;
+let currentQuote = null;
+
+let lastPrice = null;
+let lastLiquidity = null;
+
+let localHighPrice = null;
+let localHighLiquidity = null;
+
+let lastDexUpdate = 0;
+
+let onChainActive = false;
+
+let lastAlertTime = 0;
+let lastAlertLevel = "NORMAL";
+
+let lastStatusTime = 0;
+
+// ------------------------------------------------------------
+// HISTORIQUE MICRO
+// ------------------------------------------------------------
+
+const events = [];
+
+/*
+event = {
+  time,
+  type: BUY / SELL / WITHDRAW / ADD,
+  quote,
+  base,
+  tx
+}
+*/
+
+function cleanupEvents() {
+  const now = Date.now();
+
+  while (
+    events.length &&
+    now - events[0].time > 30000
+  ) {
+    events.shift();
+  }
+}
+
+// ------------------------------------------------------------
+// UTILITAIRES
+// ------------------------------------------------------------
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function safeNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
 }
 
 function clamp(value, min, max) {
@@ -73,597 +137,931 @@ function clamp(value, min, max) {
 }
 
 function formatSol(value) {
-  if (!Number.isFinite(value)) return "0.0000";
-  return value.toFixed(4);
+  return safeNumber(value).toFixed(4);
 }
 
-function formatUsd(value) {
-  if (!Number.isFinite(value)) return "0.00";
-  return value.toFixed(2);
+function formatPct(value) {
+  return safeNumber(value).toFixed(1);
 }
 
-function getDataBuffer(accountInfo) {
-  if (!accountInfo) return null;
+// ------------------------------------------------------------
+// TELEGRAM
+// ------------------------------------------------------------
 
+async function sendTelegram(text) {
   try {
-    const data = accountInfo.data;
-
-    if (Buffer.isBuffer(data)) {
-      return data;
-    }
-
-    if (Array.isArray(data)) {
-      if (data[1] === "base64") {
-        return Buffer.from(data[0], "base64");
-      }
-
-      if (data[1] === "base58") {
-        const bs58 = require("bs58");
-        return Buffer.from(bs58.decode(data[0]));
-      }
-    }
-  } catch (error) {
-    console.error(
-      "🔴 Buffer :",
-      error.message
-    );
+    await bot.telegram.sendMessage(CHAT_ID, text);
+    console.log("📨 Telegram envoyé");
+  } catch (err) {
+    console.error("❌ Telegram:", err.message);
   }
-
-  return null;
 }
 
 // ------------------------------------------------------------
-// SPL TOKEN ACCOUNT
+// LECTURE U64
 // ------------------------------------------------------------
 
-function readTokenAmount(accountInfo) {
-  if (!accountInfo) return null;
-
-  try {
-    const parsed =
-      accountInfo?.data?.parsed?.info?.tokenAmount?.amount;
-
-    if (parsed !== undefined) {
-      return BigInt(parsed);
-    }
-  } catch {}
-
-  const buffer =
-    getDataBuffer(accountInfo);
-
-  if (!buffer || buffer.length < 72) {
+function readU64LE(buffer, offset) {
+  if (!buffer || buffer.length < offset + 8) {
     return null;
   }
 
   try {
-    return buffer.readBigUInt64LE(64);
+    return buffer.readBigUInt64LE(offset);
   } catch {
     return null;
   }
 }
 
-// ============================================================
-// LECTURE POOL PUMPSWAP
-// ============================================================
+// ------------------------------------------------------------
+// TOKEN ACCOUNT
+// Amount SPL TokenAccount = offset 64
+// ------------------------------------------------------------
 
-function readPoolInfo(accountInfo) {
-  const buffer =
-    getDataBuffer(accountInfo);
+function readTokenAmount(data) {
+  let buffer = null;
 
-  if (!buffer || buffer.length < 203) {
-    throw new Error(
-      "Compte Pool PumpSwap trop court"
-    );
-  }
-
-  // Offsets PumpSwap officiels.
-  const baseVault =
-    new PublicKey(
-      buffer.subarray(139, 171)
-    );
-
-  const quoteVault =
-    new PublicKey(
-      buffer.subarray(171, 203)
-    );
-
-  // virtual_quote_reserves commence à 245.
-  // On essaie de lire un i128 complet.
-  let virtualQuoteRaw = 0n;
-
-  if (buffer.length >= 261) {
+  if (Buffer.isBuffer(data)) {
+    buffer = data;
+  } else if (data && Buffer.isBuffer(data.data)) {
+    buffer = data.data;
+  } else if (data && Array.isArray(data.data)) {
     try {
-      const low =
-        buffer.readBigUInt64LE(245);
-
-      const high =
-        buffer.readBigUInt64LE(253);
-
-      virtualQuoteRaw =
-        low + (high << 64n);
+      buffer = Buffer.from(data.data[0], "base64");
     } catch {
-      virtualQuoteRaw = 0n;
+      return null;
     }
   }
 
-  return {
-    baseVault,
-    quoteVault,
-    virtualQuoteRaw,
-  };
+  if (!buffer || buffer.length < 72) {
+    return null;
+  }
+
+  return readU64LE(buffer, 64);
 }
 
-// ============================================================
+// ------------------------------------------------------------
+// POOL VAULTS
+// ------------------------------------------------------------
+
+async function readPoolVaults(pool) {
+  try {
+    const info = await connection.getAccountInfo(
+      new PublicKey(pool),
+      "processed"
+    );
+
+    if (!info || !info.data) {
+      return null;
+    }
+
+    const data = Buffer.from(info.data);
+
+    if (data.length < QUOTE_VAULT_OFFSET + 32) {
+      return null;
+    }
+
+    const base = new PublicKey(
+      data.subarray(
+        BASE_VAULT_OFFSET,
+        BASE_VAULT_OFFSET + 32
+      )
+    );
+
+    const quote = new PublicKey(
+      data.subarray(
+        QUOTE_VAULT_OFFSET,
+        QUOTE_VAULT_OFFSET + 32
+      )
+    );
+
+    return {
+      base: base.toBase58(),
+      quote: quote.toBase58()
+    };
+
+  } catch (err) {
+    console.error("❌ Lecture vaults:", err.message);
+    return null;
+  }
+}
+
+// ------------------------------------------------------------
+// BALANCES INITIALES
+// ------------------------------------------------------------
+
+async function readVaultBalance(address) {
+  try {
+    const info = await connection.getAccountInfo(
+      new PublicKey(address),
+      "processed"
+    );
+
+    if (!info) {
+      return null;
+    }
+
+    return readTokenAmount(info.data);
+
+  } catch (err) {
+    console.error(
+      "❌ Lecture balance vault:",
+      err.message
+    );
+
+    return null;
+  }
+}
+
+// ------------------------------------------------------------
 // DEXSCREENER
-// ============================================================
+// ------------------------------------------------------------
 
-async function fetchDexPair(mint) {
-  const url =
-    `https://api.dexscreener.com/token-pairs/v1/solana/${mint}`;
+async function fetchDexData() {
+  if (!watchedMint) {
+    return null;
+  }
 
-  const response =
-    await fetch(url, {
-      headers: {
-        accept: "application/json",
-        "user-agent": "pump-alert-bot/4.0",
-      },
+  try {
+    const url =
+      `https://api.dexscreener.com/latest/dex/tokens/${watchedMint}`;
+
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error(
+        `HTTP ${response.status}`
+      );
+    }
+
+    const json = await response.json();
+
+    if (!json.pairs || !json.pairs.length) {
+      return null;
+    }
+
+    const pumpPairs = json.pairs.filter(pair => {
+      const dexId =
+        String(pair.dexId || "").toLowerCase();
+
+      return (
+        dexId.includes("pump") ||
+        dexId.includes("pumpswap")
+      );
     });
 
-  if (!response.ok) {
-    throw new Error(
-      `DexScreener HTTP ${response.status}`
+    const pairs =
+      pumpPairs.length
+        ? pumpPairs
+        : json.pairs;
+
+    pairs.sort((a, b) => {
+      const la =
+        safeNumber(a.liquidity?.usd);
+
+      const lb =
+        safeNumber(b.liquidity?.usd);
+
+      return lb - la;
+    });
+
+    const pair = pairs[0];
+
+    if (!pair) {
+      return null;
+    }
+
+    const price =
+      safeNumber(pair.priceUsd);
+
+    const liquidity =
+      safeNumber(pair.liquidity?.usd);
+
+    const detectedPool =
+      pair.pairAddress || null;
+
+    return {
+      price,
+      liquidity,
+      pool: detectedPool
+    };
+
+  } catch (err) {
+    console.error(
+      "⚠️ DexScreener:",
+      err.message
     );
+
+    return null;
+  }
+}
+
+// ------------------------------------------------------------
+// UPDATE PRIX / LIQUIDITE
+// ------------------------------------------------------------
+
+async function updateMarketData() {
+  const data = await fetchDexData();
+
+  if (!data) {
+    return;
   }
 
-  const data =
-    await response.json();
+  const now = Date.now();
 
-  const pairs =
-    Array.isArray(data)
-      ? data
-      : [];
+  lastPrice = data.price;
+  lastLiquidity = data.liquidity;
 
-  const pumpPairs =
-    pairs.filter((pair) =>
-      pair?.dexId === "pumpswap" ||
-      pair?.dexId === "pump-amm"
-    );
-
-  const candidates =
-    pumpPairs.length
-      ? pumpPairs
-      : pairs;
-
-  if (!candidates.length) {
-    throw new Error(
-      "Aucune paire trouvée"
-    );
+  if (
+    lastPrice > 0 &&
+    (
+      localHighPrice === null ||
+      lastPrice > localHighPrice
+    )
+  ) {
+    localHighPrice = lastPrice;
   }
 
-  candidates.sort(
-    (a, b) =>
-      Number(b?.liquidity?.usd ?? 0) -
-      Number(a?.liquidity?.usd ?? 0)
+  if (
+    lastLiquidity > 0 &&
+    (
+      localHighLiquidity === null ||
+      lastLiquidity > localHighLiquidity
+    )
+  ) {
+    localHighLiquidity = lastLiquidity;
+  }
+
+  lastDexUpdate = now;
+}
+
+// ------------------------------------------------------------
+// PRIX DEPUIS SOMMET
+// ------------------------------------------------------------
+
+function priceDrawdown() {
+  if (
+    !localHighPrice ||
+    !lastPrice ||
+    localHighPrice <= 0
+  ) {
+    return 0;
+  }
+
+  return (
+    (lastPrice - localHighPrice) /
+    localHighPrice
+  ) * 100;
+}
+
+// ------------------------------------------------------------
+// LIQUIDITE DEPUIS SOMMET
+// ------------------------------------------------------------
+
+function liquidityDrawdown() {
+  if (
+    !localHighLiquidity ||
+    !lastLiquidity ||
+    localHighLiquidity <= 0
+  ) {
+    return 0;
+  }
+
+  return (
+    (lastLiquidity - localHighLiquidity) /
+    localHighLiquidity
+  ) * 100;
+}
+
+// ------------------------------------------------------------
+// EVENEMENTS PAR FENETRE
+// ------------------------------------------------------------
+
+function getEvents(seconds) {
+  cleanupEvents();
+
+  const cutoff =
+    Date.now() - seconds * 1000;
+
+  return events.filter(
+    e => e.time >= cutoff
+  );
+}
+
+function getSellEvents(seconds) {
+  return getEvents(seconds)
+    .filter(e => e.type === "SELL");
+}
+
+function getBuyEvents(seconds) {
+  return getEvents(seconds)
+    .filter(e => e.type === "BUY");
+}
+
+// ------------------------------------------------------------
+// VOLUME SELL
+// ------------------------------------------------------------
+
+function sellVolume(seconds) {
+  return getSellEvents(seconds)
+    .reduce(
+      (sum, e) => sum + safeNumber(e.quote),
+      0
+    );
+}
+
+// ------------------------------------------------------------
+// VOLUME BUY
+// ------------------------------------------------------------
+
+function buyVolume(seconds) {
+  return getBuyEvents(seconds)
+    .reduce(
+      (sum, e) => sum + safeNumber(e.quote),
+      0
+    );
+}
+
+// ------------------------------------------------------------
+// RATIO SELL
+// ------------------------------------------------------------
+
+function sellRatio(seconds) {
+  const sells = sellVolume(seconds);
+  const buys = buyVolume(seconds);
+
+  const total = sells + buys;
+
+  if (total <= 0) {
+    return 0;
+  }
+
+  return (
+    sells / total
+  ) * 100;
+}
+
+// ------------------------------------------------------------
+// NOMBRE SELL
+// ------------------------------------------------------------
+
+function sellCount(seconds) {
+  return getSellEvents(seconds).length;
+}
+
+// ------------------------------------------------------------
+// GROS SELL
+// ------------------------------------------------------------
+
+function largestSell(seconds) {
+  const sells = getSellEvents(seconds);
+
+  if (!sells.length) {
+    return 0;
+  }
+
+  return Math.max(
+    ...sells.map(
+      e => safeNumber(e.quote)
+    )
+  );
+}
+
+// ------------------------------------------------------------
+// ACCELERATION SELL
+// Compare 3s avec les 3s précédentes
+// ------------------------------------------------------------
+
+function sellAcceleration() {
+  cleanupEvents();
+
+  const now = Date.now();
+
+  const recent = events.filter(
+    e =>
+      e.type === "SELL" &&
+      e.time >= now - 3000
   );
 
-  const pair =
-    candidates[0];
+  const previous = events.filter(
+    e =>
+      e.type === "SELL" &&
+      e.time >= now - 6000 &&
+      e.time < now - 3000
+  );
 
-  return {
-    pairAddress:
-      pair.pairAddress,
+  const recentVolume =
+    recent.reduce(
+      (s, e) => s + safeNumber(e.quote),
+      0
+    );
 
-    liquidityUsd:
-      Number(pair?.liquidity?.usd ?? 0),
+  const previousVolume =
+    previous.reduce(
+      (s, e) => s + safeNumber(e.quote),
+      0
+    );
 
-    priceUsd:
-      Number(pair?.priceUsd ?? 0),
-
-    priceNative:
-      Number(pair?.priceNative ?? 0),
-
-    volume24h:
-      Number(pair?.volume?.h24 ?? 0),
-
-    baseDecimals:
-      Number(
-        pair?.baseToken?.decimals ?? 6
-      ),
-
-    url:
-      pair?.url ||
-      `https://dexscreener.com/solana/${pair?.pairAddress}`,
-  };
-}
-
-// ============================================================
-// HISTORIQUE
-// ============================================================
-
-function addEvent(state, event) {
-  state.events.push(event);
-
-  const cutoff =
-    now() - EVENT_WINDOW_MS;
-
-  while (
-    state.events.length &&
-    state.events[0].ts < cutoff
-  ) {
-    state.events.shift();
+  if (previousVolume <= 0) {
+    return recentVolume > 0
+      ? 999
+      : 0;
   }
+
+  return (
+    recentVolume /
+    previousVolume
+  );
 }
 
-function getFlowStats(state, ms) {
+// ------------------------------------------------------------
+// SELL BURST
+// ------------------------------------------------------------
+
+function sellBurstScore() {
+  const s1 = sellVolume(1);
+  const s3 = sellVolume(3);
+  const s5 = sellVolume(5);
+  const c1 = sellCount(1);
+  const c3 = sellCount(3);
+
+  let score = 0;
+
+  // Activité instantanée
+  if (s1 >= 3) score += 8;
+  if (s1 >= 5) score += 8;
+  if (s1 >= 10) score += 10;
+  if (s1 >= 20) score += 12;
+
+  // Répétition
+  if (c1 >= 3) score += 6;
+  if (c1 >= 5) score += 8;
+  if (c3 >= 10) score += 8;
+
+  // Ratio
+  const ratio = sellRatio(3);
+
+  if (ratio >= 70) score += 5;
+  if (ratio >= 80) score += 7;
+  if (ratio >= 90) score += 10;
+
+  // Accélération
+  const acceleration =
+    sellAcceleration();
+
+  if (acceleration >= 2) score += 6;
+  if (acceleration >= 4) score += 8;
+  if (acceleration >= 8) score += 10;
+
+  return clamp(score, 0, 45);
+}
+
+// ------------------------------------------------------------
+// LIQUIDITY MICRO
+// ------------------------------------------------------------
+
+let liquiditySamples = [];
+
+/*
+{
+  time,
+  liquidity,
+  price
+}
+*/
+
+function addLiquiditySample() {
+  if (
+    !lastLiquidity ||
+    lastLiquidity <= 0
+  ) {
+    return;
+  }
+
+  liquiditySamples.push({
+    time: Date.now(),
+    liquidity: lastLiquidity,
+    price: lastPrice
+  });
+
   const cutoff =
-    now() - ms;
+    Date.now() - 60000;
 
-  let sellSol = 0;
-  let buySol = 0;
+  liquiditySamples =
+    liquiditySamples.filter(
+      x => x.time >= cutoff
+    );
+}
 
-  let sells = 0;
-  let buys = 0;
+// ------------------------------------------------------------
+// LIQUIDITE CHANGE
+// ------------------------------------------------------------
 
-  let withdrawalSol = 0;
-  let withdrawals = 0;
+function liquidityChange(seconds) {
+  const now = Date.now();
 
-  for (const event of state.events) {
-    if (event.ts < cutoff) {
-      continue;
-    }
+  const cutoff =
+    now - seconds * 1000;
 
-    if (event.type === "SELL") {
-      sellSol += event.quoteSol;
-      sells++;
-    }
+  const samples =
+    liquiditySamples.filter(
+      x => x.time >= cutoff
+    );
 
-    if (event.type === "BUY") {
-      buySol += event.quoteSol;
-      buys++;
-    }
+  if (
+    !samples.length ||
+    !lastLiquidity
+  ) {
+    return 0;
+  }
 
-    if (event.type === "LIQ_WITHDRAW") {
-      withdrawalSol += event.quoteSol;
-      withdrawals++;
-    }
+  const oldest =
+    samples[0].liquidity;
+
+  if (!oldest) {
+    return 0;
+  }
+
+  return (
+    (lastLiquidity - oldest) /
+    oldest
+  ) * 100;
+}
+
+// ------------------------------------------------------------
+// RESERVE MICRO CHANGE
+// ------------------------------------------------------------
+
+let reserveSamples = [];
+
+/*
+{
+  time,
+  quote
+}
+*/
+
+function addReserveSample() {
+  if (
+    currentQuote === null ||
+    currentQuote === undefined
+  ) {
+    return;
+  }
+
+  reserveSamples.push({
+    time: Date.now(),
+    quote: Number(currentQuote)
+  });
+
+  const cutoff =
+    Date.now() - 30000;
+
+  reserveSamples =
+    reserveSamples.filter(
+      x => x.time >= cutoff
+    );
+}
+
+function reserveChange(seconds) {
+  if (
+    currentQuote === null ||
+    currentQuote === undefined
+  ) {
+    return 0;
+  }
+
+  const cutoff =
+    Date.now() - seconds * 1000;
+
+  const samples =
+    reserveSamples.filter(
+      x => x.time >= cutoff
+    );
+
+  if (!samples.length) {
+    return 0;
+  }
+
+  const oldest =
+    samples[0].quote;
+
+  if (!oldest) {
+    return 0;
+  }
+
+  return (
+    (
+      Number(currentQuote) -
+      oldest
+    ) / oldest
+  ) * 100;
+}
+
+// ------------------------------------------------------------
+// SCORE PRIX
+// ------------------------------------------------------------
+
+function priceWeaknessScore() {
+  let score = 0;
+
+  const dd = priceDrawdown();
+
+  // Prix proche du sommet mais qui commence à décrocher
+  if (dd <= -1) score += 4;
+  if (dd <= -2) score += 7;
+  if (dd <= -3) score += 10;
+  if (dd <= -5) score += 15;
+  if (dd <= -8) score += 20;
+
+  return clamp(score, 0, 25);
+}
+
+// ------------------------------------------------------------
+// SCORE RESERVE
+// ------------------------------------------------------------
+
+function reserveRiskScore() {
+  let score = 0;
+
+  const r10 =
+    reserveChange(10);
+
+  const r5 =
+    reserveChange(5);
+
+  if (r5 <= -0.5) score += 5;
+  if (r5 <= -1) score += 7;
+  if (r5 <= -2) score += 10;
+  if (r5 <= -5) score += 15;
+
+  if (r10 <= -2) score += 5;
+  if (r10 <= -5) score += 8;
+  if (r10 <= -10) score += 12;
+  if (r10 <= -20) score += 18;
+
+  return clamp(score, 0, 30);
+}
+
+// ------------------------------------------------------------
+// SCORE LIQUIDITE
+// ------------------------------------------------------------
+
+function liquidityRiskScore() {
+  let score = 0;
+
+  const l5 =
+    liquidityChange(5);
+
+  const l15 =
+    liquidityChange(15);
+
+  if (l5 <= -1) score += 5;
+  if (l5 <= -3) score += 8;
+  if (l5 <= -5) score += 12;
+  if (l5 <= -10) score += 18;
+
+  if (l15 <= -3) score += 5;
+  if (l15 <= -8) score += 8;
+  if (l15 <= -15) score += 12;
+  if (l15 <= -25) score += 18;
+
+  return clamp(score, 0, 30);
+}
+
+// ------------------------------------------------------------
+// RETRAITS LIQUIDITE
+// ------------------------------------------------------------
+
+function withdrawalRiskScore() {
+  const withdrawals =
+    getEvents(10)
+      .filter(
+        e => e.type === "WITHDRAW"
+      );
+
+  if (!withdrawals.length) {
+    return 0;
   }
 
   const total =
-    sellSol + buySol;
+    withdrawals.reduce(
+      (s, e) =>
+        s + Math.abs(safeNumber(e.quote)),
+      0
+    );
 
-  const sellRatio =
-    total > 0
-      ? (sellSol / total) * 100
-      : 0;
+  let score = 10;
 
-  return {
-    sellSol,
-    buySol,
-    sells,
-    buys,
-    sellRatio,
-    withdrawalSol,
-    withdrawals,
-  };
+  if (total >= 5) score += 8;
+  if (total >= 20) score += 10;
+  if (total >= 50) score += 12;
+  if (withdrawals.length >= 2) score += 10;
+
+  return clamp(score, 0, 35);
 }
 
-// ============================================================
-// CALCUL DU RISQUE
-// ============================================================
-//
-// IMPORTANT : V4 ne laisse plus le ratio SELL dominer le score.
-//
-// Les vrais signaux structurels ont beaucoup plus de poids.
-// ============================================================
+// ------------------------------------------------------------
+// CONFLUENCE
+// Le cœur de V5
+// ------------------------------------------------------------
 
-function calculateRisk(state) {
+function calculateRisk() {
   let score = 0;
 
   const reasons = [];
 
-  const flow10 =
-    getFlowStats(state, 10000);
+  const burst =
+    sellBurstScore();
 
-  const flow30 =
-    getFlowStats(state, 30000);
+  const priceRisk =
+    priceWeaknessScore();
 
-  // ----------------------------------------------------------
-  // 1. RETRAIT DE LIQUIDITÉ ON-CHAIN
-  // ----------------------------------------------------------
+  const reserveRisk =
+    reserveRiskScore();
 
-  if (flow30.withdrawalSol >= 10) {
-    score += 65;
+  const liquidityRisk =
+    liquidityRiskScore();
 
-    reasons.push(
-      `retrait pool ${flow30.withdrawalSol.toFixed(2)} SOL`
-    );
-  } else if (flow30.withdrawalSol >= 5) {
-    score += 50;
+  const withdrawalRisk =
+    withdrawalRiskScore();
 
-    reasons.push(
-      `retrait pool ${flow30.withdrawalSol.toFixed(2)} SOL`
-    );
-  } else if (flow30.withdrawalSol >= 2) {
-    score += 35;
-
-    reasons.push(
-      `retrait pool ${flow30.withdrawalSol.toFixed(2)} SOL`
-    );
-  }
+  score += burst;
+  score += priceRisk;
+  score += reserveRisk;
+  score += liquidityRisk;
+  score += withdrawalRisk;
 
   // ----------------------------------------------------------
-  // 2. BAISSE RÉSERVE WSOL
+  // CONFLUENCE 1
+  // SELL agressifs + prix qui décroche
   // ----------------------------------------------------------
 
-  const reserve10 =
-    state.reserveHistory.filter(
-      (x) =>
-        x.ts >= now() - 10000
-    );
+  const sell10 =
+    sellVolume(10);
+
+  const ratio10 =
+    sellRatio(10);
+
+  const dd =
+    priceDrawdown();
 
   if (
-    reserve10.length &&
-    state.quoteSol > 0
-  ) {
-    const oldReserve =
-      reserve10[0].quoteSol;
-
-    if (oldReserve > 0) {
-      const drop =
-        ((oldReserve - state.quoteSol) /
-          oldReserve) *
-        100;
-
-      // IMPORTANT :
-      // une simple baisse de réserve n'est PAS forcément
-      // une sortie de liquidité.
-      //
-      // On l'utilise surtout si elle accompagne une baisse
-      // du prix ou un retrait on-chain.
-      if (drop >= 75) {
-        score += 35;
-
-        reasons.push(
-          `réserve WSOL -${drop.toFixed(1)}% / 10s`
-        );
-      } else if (drop >= 50) {
-        score += 25;
-
-        reasons.push(
-          `réserve WSOL -${drop.toFixed(1)}% / 10s`
-        );
-      } else if (drop >= 25) {
-        score += 15;
-
-        reasons.push(
-          `réserve WSOL -${drop.toFixed(1)}% / 10s`
-        );
-      } else if (drop >= 10) {
-        score += 8;
-
-        reasons.push(
-          `réserve WSOL -${drop.toFixed(1)}% / 10s`
-        );
-      }
-    }
-  }
-
-  // ----------------------------------------------------------
-  // 3. CHUTE LIQUIDITÉ
-  // ----------------------------------------------------------
-
-  const liq5 =
-    state.liquidityHistory.filter(
-      (x) =>
-        x.ts >= now() - 5000
-    );
-
-  const liq15 =
-    state.liquidityHistory.filter(
-      (x) =>
-        x.ts >= now() - 15000
-    );
-
-  const liq30 =
-    state.liquidityHistory.filter(
-      (x) =>
-        x.ts >= now() - 30000
-    );
-
-  function firstValue(list) {
-    return list.length
-      ? list[0].value
-      : state.liquidityUsd;
-  }
-
-  if (state.liquidityUsd > 0) {
-    const old5 =
-      firstValue(liq5);
-
-    const old15 =
-      firstValue(liq15);
-
-    const old30 =
-      firstValue(liq30);
-
-    const drop5 =
-      old5 > 0
-        ? ((old5 - state.liquidityUsd) /
-            old5) *
-          100
-        : 0;
-
-    const drop15 =
-      old15 > 0
-        ? ((old15 - state.liquidityUsd) /
-            old15) *
-          100
-        : 0;
-
-    const drop30 =
-      old30 > 0
-        ? ((old30 - state.liquidityUsd) /
-            old30) *
-          100
-        : 0;
-
-    if (drop5 >= 15) {
-      score += 40;
-
-      reasons.push(
-        `liquidité -${drop5.toFixed(1)}% / 5s`
-      );
-    } else if (drop5 >= 8) {
-      score += 30;
-
-      reasons.push(
-        `liquidité -${drop5.toFixed(1)}% / 5s`
-      );
-    } else if (drop5 >= 4) {
-      score += 18;
-
-      reasons.push(
-        `liquidité -${drop5.toFixed(1)}% / 5s`
-      );
-    }
-
-    if (drop15 >= 15) {
-      score += 35;
-
-      reasons.push(
-        `liquidité -${drop15.toFixed(1)}% / 15s`
-      );
-    } else if (drop15 >= 8) {
-      score += 20;
-
-      reasons.push(
-        `liquidité -${drop15.toFixed(1)}% / 15s`
-      );
-    }
-
-    if (drop30 >= 25) {
-      score += 35;
-
-      reasons.push(
-        `liquidité -${drop30.toFixed(1)}% / 30s`
-      );
-    } else if (drop30 >= 15) {
-      score += 20;
-
-      reasons.push(
-        `liquidité -${drop30.toFixed(1)}% / 30s`
-      );
-    }
-  }
-
-  // ----------------------------------------------------------
-  // 4. CHUTE DU PRIX
-  // ----------------------------------------------------------
-
-  if (
-    state.highPriceUsd > 0 &&
-    state.priceUsd > 0
-  ) {
-    const belowHigh =
-      ((state.highPriceUsd -
-        state.priceUsd) /
-        state.highPriceUsd) *
-      100;
-
-    if (belowHigh >= 20) {
-      score += 40;
-
-      reasons.push(
-        `prix -${belowHigh.toFixed(1)}% du sommet`
-      );
-    } else if (belowHigh >= 12) {
-      score += 30;
-
-      reasons.push(
-        `prix -${belowHigh.toFixed(1)}% du sommet`
-      );
-    } else if (belowHigh >= 7) {
-      score += 18;
-
-      reasons.push(
-        `prix -${belowHigh.toFixed(1)}% du sommet`
-      );
-    } else if (belowHigh >= 4) {
-      score += 8;
-
-      reasons.push(
-        `prix -${belowHigh.toFixed(1)}% du sommet`
-      );
-    }
-  }
-
-  // ----------------------------------------------------------
-  // 5. PRESSION VENDEUSE
-  // ----------------------------------------------------------
-  //
-  // Beaucoup moins de poids qu'en V3.
-  //
-  // Un marché peut avoir énormément de SELL et continuer
-  // à monter. Notre test l'a démontré.
-  // ----------------------------------------------------------
-
-  if (
-    flow10.sellSol >= 30 &&
-    flow10.sellRatio >= 90
+    sell10 >= 10 &&
+    ratio10 >= 75 &&
+    dd <= -1
   ) {
     score += 15;
-
     reasons.push(
-      `SELL ${flow10.sellSol.toFixed(2)} SOL + ratio ${flow10.sellRatio.toFixed(0)}%`
-    );
-  } else if (
-    flow10.sellSol >= 15 &&
-    flow10.sellRatio >= 90
-  ) {
-    score += 10;
-
-    reasons.push(
-      `SELL ${flow10.sellSol.toFixed(2)} SOL + ratio ${flow10.sellRatio.toFixed(0)}%`
-    );
-  } else if (
-    flow10.sellSol >= 8 &&
-    flow10.sellRatio >= 85
-  ) {
-    score += 5;
-
-    reasons.push(
-      `SELL ${flow10.sellSol.toFixed(2)} SOL + ratio ${flow10.sellRatio.toFixed(0)}%`
+      "SELL agressifs + prix sous le sommet"
     );
   }
 
   // ----------------------------------------------------------
-  // 6. SELL RÉPÉTÉS
+  // CONFLUENCE 2
+  // SELL agressifs + réserve en baisse
+  // ----------------------------------------------------------
+
+  const r10 =
+    reserveChange(10);
+
+  if (
+    sell10 >= 10 &&
+    ratio10 >= 70 &&
+    r10 <= -2
+  ) {
+    score += 15;
+    reasons.push(
+      "SELL agressifs + réserve en baisse"
+    );
+  }
+
+  // ----------------------------------------------------------
+  // CONFLUENCE 3
+  // SELL accélèrent
+  // ----------------------------------------------------------
+
+  const acceleration =
+    sellAcceleration();
+
+  if (
+    acceleration >= 3 &&
+    sellCount(3) >= 5
+  ) {
+    score += 12;
+
+    reasons.push(
+      "accélération brutale des SELL"
+    );
+  }
+
+  // ----------------------------------------------------------
+  // CONFLUENCE 4
+  // plusieurs gros SELL rapprochés
+  // ----------------------------------------------------------
+
+  const biggest =
+    largestSell(5);
+
+  const count5 =
+    sellCount(5);
+
+  if (
+    biggest >= 10 &&
+    count5 >= 3
+  ) {
+    score += 12;
+
+    reasons.push(
+      "gros SELL répétés"
+    );
+  }
+
+  // ----------------------------------------------------------
+  // CONFLUENCE 5
+  // prix monte encore mais pression extrême
   // ----------------------------------------------------------
 
   if (
-    flow10.sells >= 8 &&
-    flow10.sellSol >= 20
+    ratio10 >= 90 &&
+    sell10 >= 15 &&
+    dd > -1
   ) {
     score += 8;
 
     reasons.push(
-      `${flow10.sells} SELL / 10s`
+      "pression extrême malgré prix encore haut"
+    );
+  }
+
+  // ----------------------------------------------------------
+  // CONFLUENCE 6
+  // liquidité et réserve chutent ensemble
+  // ----------------------------------------------------------
+
+  const l10 =
+    liquidityChange(10);
+
+  if (
+    l10 <= -3 &&
+    r10 <= -2
+  ) {
+    score += 15;
+
+    reasons.push(
+      "liquidité + réserve se dégradent"
+    );
+  }
+
+  // ----------------------------------------------------------
+  // CONFLUENCE 7
+  // rupture du sommet
+  // ----------------------------------------------------------
+
+  if (
+    dd <= -3 &&
+    sell10 >= 5
+  ) {
+    score += 10;
+
+    reasons.push(
+      "rupture du sommet récent"
     );
   }
 
   return {
-    score: clamp(score, 0, 100),
+    score: clamp(
+      Math.round(score),
+      0,
+      100
+    ),
     reasons,
-    flow10,
-    flow30,
+    metrics: {
+      sell1: sellVolume(1),
+      sell3: sellVolume(3),
+      sell5: sellVolume(5),
+      sell10,
+      sell30: sellVolume(30),
+      buy10: buyVolume(10),
+      ratio10,
+      sellCount1: sellCount(1),
+      sellCount3: sellCount(3),
+      sellCount10: sellCount(10),
+      acceleration,
+      drawdown: dd,
+      reserve5: reserveChange(5),
+      reserve10: r10,
+      liquidity5: liquidityChange(5),
+      liquidity15: liquidityChange(15)
+    }
   };
 }
 
-// ============================================================
+// ------------------------------------------------------------
 // NIVEAU
-// ============================================================
+// ------------------------------------------------------------
 
-function riskLevel(score) {
+function getRiskLevel(score) {
   if (score >= 75) {
     return "URGENT";
   }
@@ -672,1416 +1070,1086 @@ function riskLevel(score) {
     return "DANGER";
   }
 
-  if (score >= 30) {
-    return "PRESSURE";
+  if (score >= 35) {
+    return "PRECRASH";
+  }
+
+  if (score >= 20) {
+    return "PRESSION";
   }
 
   return "NORMAL";
 }
 
-// ============================================================
-// CONDITIONS D'URGENCE V4
-// ============================================================
-//
-// Ces conditions sont séparées du score.
-//
-// C'est important : un événement critique ne doit pas attendre
-// que plusieurs petits points s'additionnent.
-// ============================================================
+// ------------------------------------------------------------
+// DOIT ALERTER ?
+// ------------------------------------------------------------
 
-function getEmergencySignals(state) {
-  const signals = [];
+function shouldAlert(level, score) {
+  const now = Date.now();
 
-  const flow10 =
-    getFlowStats(state, 10000);
+  // Normal
+  if (level === "NORMAL") {
+    return false;
+  }
 
-  const flow30 =
-    getFlowStats(state, 30000);
+  // Nouveau niveau
+  if (level !== lastAlertLevel) {
+    return true;
+  }
 
-  // ----------------------------------------------------------
-  // A. RETRAIT ON-CHAIN
-  // ----------------------------------------------------------
-
-  if (flow10.withdrawalSol >= 5) {
-    signals.push(
-      `🚨 retrait pool ${flow10.withdrawalSol.toFixed(2)} SOL / 10s`
+  // Urgent : cooldown court
+  if (level === "URGENT") {
+    return (
+      now - lastAlertTime >= 15000
     );
   }
 
-  // ----------------------------------------------------------
-  // B. RETRAIT IMPORTANT
-  // ----------------------------------------------------------
-
-  if (flow30.withdrawalSol >= 10) {
-    signals.push(
-      `🚨 retrait pool ${flow30.withdrawalSol.toFixed(2)} SOL / 30s`
+  // Danger
+  if (level === "DANGER") {
+    return (
+      now - lastAlertTime >= 20000
     );
   }
 
-  // ----------------------------------------------------------
-  // C. CHUTE RÉSERVE + PRESSION PRIX
-  // ----------------------------------------------------------
-
-  let reserveDrop = 0;
-
-  const reserve10 =
-    state.reserveHistory.filter(
-      (x) =>
-        x.ts >= now() - 10000
-    );
-
-  if (
-    reserve10.length &&
-    reserve10[0].quoteSol > 0
-  ) {
-    reserveDrop =
-      (
-        (
-          reserve10[0].quoteSol -
-          state.quoteSol
-        ) /
-        reserve10[0].quoteSol
-      ) *
-      100;
-  }
-
-  let belowHigh = 0;
-
-  if (
-    state.highPriceUsd > 0 &&
-    state.priceUsd > 0
-  ) {
-    belowHigh =
-      (
-        (
-          state.highPriceUsd -
-          state.priceUsd
-        ) /
-        state.highPriceUsd
-      ) *
-      100;
-  }
-
-  // Une énorme baisse de réserve seule peut être un BUY.
-  // On ne déclenche donc l'urgence que si elle est accompagnée
-  // d'un vrai signal de faiblesse.
-  if (
-    reserveDrop >= 50 &&
-    belowHigh >= 7
-  ) {
-    signals.push(
-      `🚨 réserve WSOL -${reserveDrop.toFixed(1)}% + prix faible`
+  // Precrash
+  if (level === "PRECRASH") {
+    return (
+      now - lastAlertTime >= 30000
     );
   }
 
-  // ----------------------------------------------------------
-  // D. LIQUIDITÉ + PRIX
-  // ----------------------------------------------------------
-
-  const liq10 =
-    state.liquidityHistory.filter(
-      (x) =>
-        x.ts >= now() - 10000
-    );
-
-  if (
-    liq10.length &&
-    liq10[0].value > 0
-  ) {
-    const liqDrop =
-      (
-        (
-          liq10[0].value -
-          state.liquidityUsd
-        ) /
-        liq10[0].value
-      ) *
-      100;
-
-    if (
-      liqDrop >= 20 &&
-      belowHigh >= 10
-    ) {
-      signals.push(
-        `🚨 liquidité -${liqDrop.toFixed(1)}% + prix -${belowHigh.toFixed(1)}%`
-      );
-    }
-  }
-
-  return signals;
+  // Pression
+  return (
+    now - lastAlertTime >= 60000
+  );
 }
 
-// ============================================================
-// ALERTES TELEGRAM
-// ============================================================
+// ------------------------------------------------------------
+// MESSAGE ALERTE
+// ------------------------------------------------------------
 
-async function sendAlert(
-  state,
+async function sendRiskAlert(
   level,
-  title,
-  lines,
-  force = false
+  analysis
 ) {
-  const t =
-    now();
+  const m =
+    analysis.metrics;
 
-  if (!force) {
-    if (
-      state.lastAlertLevel === level &&
-      t - state.lastAlertAt <
-        ALERT_COOLDOWN_MS
-    ) {
-      return false;
-    }
+  let title = "";
 
-    if (
-      state.lastAlertLevel === level &&
-      state.lastAlertScore !== null &&
-      state.riskScore <
-        state.lastAlertScore + 15 &&
-      t - state.lastAlertAt <
-        180000
-    ) {
-      return false;
-    }
+  if (level === "URGENT") {
+    title =
+      "🚨 SIGNAL DE SORTIE URGENT";
+  } else if (level === "DANGER") {
+    title =
+      "🟠 DANGER : DÉGRADATION RAPIDE";
+  } else if (level === "PRECRASH") {
+    title =
+      "🟡 PRÉ-CRASH : MICRO-SIGNAUX";
+  } else {
+    title =
+      "🟠 PRESSION VENDEUSE";
   }
+
+  const reasonText =
+    analysis.reasons.length
+      ? analysis.reasons.join(" | ")
+      : "activité vendeuse inhabituelle";
 
   const message =
-    `${title}\n\n` +
-    lines.join("\n");
+`${title}
 
-  try {
-    await bot.telegram.sendMessage(
-      CHAT_ID,
-      message
-    );
+Score risque : ${analysis.score}/100
 
-    state.lastAlertAt = t;
-    state.lastAlertLevel = level;
-    state.lastAlertScore =
-      state.riskScore;
+Prix : $${safeNumber(lastPrice).toFixed(8)}
+Liquidité : $${safeNumber(lastLiquidity).toFixed(2)}
 
-    console.log(
-      `📨 Telegram envoyé : ${level} ${state.riskScore}/100`
-    );
+SELL 1s : ${formatSol(m.sell1)} SOL
+SELL 3s : ${formatSol(m.sell3)} SOL
+SELL 5s : ${formatSol(m.sell5)} SOL
+SELL 10s : ${formatSol(m.sell10)} SOL
+SELL ratio 10s : ${formatPct(m.ratio10)}%
 
-    return true;
-  } catch (error) {
-    console.error(
-      "🔴 Telegram :",
-      error.message
-    );
+SELL / 10s : ${m.sellCount10}
 
-    return false;
-  }
+Réserve WSOL :
+${currentQuote !== null
+  ? formatSol(Number(currentQuote))
+  : "N/A"} SOL
+
+Prix sous sommet :
+${formatPct(m.drawdown)}%
+
+Réserve 5s :
+${formatPct(m.reserve5)}%
+
+Réserve 10s :
+${formatPct(m.reserve10)}%
+
+Liquidité 5s :
+${formatPct(m.liquidity5)}%
+
+⚠️ Signaux :
+${reasonText}
+
+📡 RADAR V5`;
+
+  await sendTelegram(message);
+
+  lastAlertTime = Date.now();
+  lastAlertLevel = level;
 }
 
-// ============================================================
-// ÉVALUATION
-// ============================================================
+// ------------------------------------------------------------
+// EVALUATION
+// ------------------------------------------------------------
 
-async function evaluateAlert(state) {
-  const risk =
-    calculateRisk(state);
-
-  state.riskScore =
-    risk.score;
-
-  state.riskReasons =
-    risk.reasons;
-
-  // ----------------------------------------------------------
-  // PRIORITÉ ABSOLUE AUX SIGNAUX D'URGENCE
-  // ----------------------------------------------------------
-
-  const emergency =
-    getEmergencySignals(state);
-
-  if (emergency.length > 0) {
-    await sendAlert(
-      state,
-      "URGENT",
-      "🚨 SIGNAL DE SORTIE URGENT",
-      [
-        `Score risque : ${risk.score}/100`,
-        `Prix : $${state.priceUsd.toFixed(8)}`,
-        `Liquidité : $${formatUsd(state.liquidityUsd)}`,
-        `Réserve WSOL : ${formatSol(state.quoteSol)} SOL`,
-        `SELL 10s : ${formatSol(risk.flow10.sellSol)} SOL`,
-        `SELL ratio : ${risk.flow10.sellRatio.toFixed(1)}%`,
-        "",
-        "⚠️ SIGNAUX CRITIQUES :",
-        ...emergency.slice(0, 5),
-        "",
-        "⚠️ Vérifie immédiatement le marché.",
-      ],
-      true
-    );
-
+async function evaluateRisk() {
+  if (!watchedMint) {
     return;
   }
 
-  // ----------------------------------------------------------
-  // DANGER
-  // ----------------------------------------------------------
+  cleanupEvents();
 
-  if (risk.score >= 50) {
-    await sendAlert(
-      state,
-      "DANGER",
-      "🟠 DANGER : DÉGRADATION DU POOL",
-      [
-        `Score risque : ${risk.score}/100`,
-        `Prix : $${state.priceUsd.toFixed(8)}`,
-        `Liquidité : $${formatUsd(state.liquidityUsd)}`,
-        `Réserve WSOL : ${formatSol(state.quoteSol)} SOL`,
-        `SELL 10s : ${formatSol(risk.flow10.sellSol)} SOL`,
-        `SELL ratio : ${risk.flow10.sellRatio.toFixed(1)}%`,
-        "",
-        `Signaux : ${
-          risk.reasons.slice(0, 6).join(" | ") ||
-          "aucun"
-        }`,
-      ]
+  const analysis =
+    calculateRisk();
+
+  const level =
+    getRiskLevel(
+      analysis.score
     );
 
-    return;
+  if (
+    shouldAlert(
+      level,
+      analysis.score
+    )
+  ) {
+    await sendRiskAlert(
+      level,
+      analysis
+    );
   }
 
-  // ----------------------------------------------------------
-  // PRESSURE
-  // ----------------------------------------------------------
-
-  if (risk.score >= 30) {
-    await sendAlert(
-      state,
-      "PRESSURE",
-      "🟡 PRESSION / SURVEILLANCE",
-      [
-        `Score risque : ${risk.score}/100`,
-        `Prix : $${state.priceUsd.toFixed(8)}`,
-        `Liquidité : $${formatUsd(state.liquidityUsd)}`,
-        `SELL 10s : ${formatSol(risk.flow10.sellSol)} SOL`,
-        `SELL ratio : ${risk.flow10.sellRatio.toFixed(1)}%`,
-        "",
-        `Signaux : ${
-          risk.reasons.slice(0, 5).join(" | ") ||
-          "aucun"
-        }`,
-      ]
-    );
+  if (level === "NORMAL") {
+    lastAlertLevel = "NORMAL";
   }
 }
 
-// ============================================================
-// TRAITEMENT DES VAULTS
-// ============================================================
-//
-// Règles V4 :
-//
-// base ↓ + quote ↑ = SELL
-// base ↑ + quote ↓ = BUY
-// base ↓ + quote ↓ = RETRAIT LIQUIDITÉ
-// base ↑ + quote ↑ = AJOUT LIQUIDITÉ
-//
-// C'est la partie la plus importante du système.
-// ============================================================
+// ------------------------------------------------------------
+// ENREGISTREMENT EVENEMENT
+// ------------------------------------------------------------
 
-function processReserveSnapshot(
-  state,
-  baseRaw,
-  quoteRaw,
-  source = "WS"
+function recordEvent(
+  type,
+  quote,
+  base,
+  tx
 ) {
+  events.push({
+    time: Date.now(),
+    type,
+    quote: Math.abs(
+      safeNumber(quote)
+    ),
+    base: Math.abs(
+      safeNumber(base)
+    ),
+    tx: tx || null
+  });
+
+  cleanupEvents();
+
+  console.log(
+    `📊 ${type} | ${safeNumber(quote).toFixed(4)} SOL`
+  );
+}
+
+// ------------------------------------------------------------
+// BATCH VAULT
+// ------------------------------------------------------------
+
+let pendingBase = null;
+let pendingQuote = null;
+
+let batchTimer = null;
+
+function scheduleVaultEvaluation() {
+  if (batchTimer) {
+    return;
+  }
+
+  batchTimer = setTimeout(() => {
+    batchTimer = null;
+
+    processVaultBatch();
+
+  }, 80);
+}
+
+// ------------------------------------------------------------
+// PROCESS DELTA
+// ------------------------------------------------------------
+
+function processVaultBatch() {
   if (
-    baseRaw === null ||
-    quoteRaw === null
+    pendingBase === null ||
+    pendingQuote === null
   ) {
     return;
   }
 
+  const newBase =
+    pendingBase;
+
+  const newQuote =
+    pendingQuote;
+
+  pendingBase = null;
+  pendingQuote = null;
+
   if (
-    state.previousBaseRaw === null ||
-    state.previousQuoteRaw === null
+    currentBase === null ||
+    currentQuote === null
   ) {
-    state.previousBaseRaw =
-      baseRaw;
+    currentBase = newBase;
+    currentQuote = newQuote;
 
-    state.previousQuoteRaw =
-      quoteRaw;
-
-    state.baseRaw =
-      baseRaw;
-
-    state.quoteRaw =
-      quoteRaw;
-
-    state.quoteSol =
-      Number(quoteRaw) / 1e9;
+    addReserveSample();
 
     return;
   }
 
-  const dBaseRaw =
-    baseRaw -
-    state.previousBaseRaw;
+  const baseDelta =
+    newBase - currentBase;
 
-  const dQuoteRaw =
-    quoteRaw -
-    state.previousQuoteRaw;
+  const quoteDelta =
+    newQuote - currentQuote;
 
-  // On met à jour le snapshot.
-  state.previousBaseRaw =
-    baseRaw;
+  currentBase = newBase;
+  currentQuote = newQuote;
 
-  state.previousQuoteRaw =
-    quoteRaw;
+  addReserveSample();
 
-  state.baseRaw =
-    baseRaw;
+  if (
+    baseDelta === 0 &&
+    quoteDelta === 0
+  ) {
+    return;
+  }
 
-  state.quoteRaw =
-    quoteRaw;
+  /*
+   SELL :
+   base vault ↓
+   quote vault ↑
 
-  state.quoteSol =
-    Number(quoteRaw) / 1e9;
+   BUY :
+   base vault ↑
+   quote vault ↓
 
-  state.baseTokens =
-    Number(baseRaw) /
-    Math.pow(
-      10,
-      state.baseDecimals || 6
-    );
+   RETRAIT :
+   base vault ↓
+   quote vault ↓
 
-  const dBase =
-    Number(dBaseRaw) /
-    Math.pow(
-      10,
-      state.baseDecimals || 6
-    );
+   AJOUT :
+   base vault ↑
+   quote vault ↑
+  */
 
-  const dQuote =
-    Number(dQuoteRaw) /
+  const baseDown =
+    baseDelta < 0;
+
+  const baseUp =
+    baseDelta > 0;
+
+  const quoteDown =
+    quoteDelta < 0;
+
+  const quoteUp =
+    quoteDelta > 0;
+
+  const quoteAbs =
+    Math.abs(
+      Number(quoteDelta)
+    ) /
     1e9;
 
-  // ----------------------------------------------------------
-  // Ignore les micro variations
-  // ----------------------------------------------------------
-
-  if (
-    Math.abs(dBase) < 0.000001 &&
-    Math.abs(dQuote) < 0.000001
-  ) {
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // SELL
-  // ----------------------------------------------------------
-
-  if (
-    dBase < 0 &&
-    dQuote > 0
-  ) {
-    const sellSol =
-      Math.abs(dQuote);
-
-    addEvent(state, {
-      ts: now(),
-      type: "SELL",
-      quoteSol: sellSol,
-      baseTokens: Math.abs(dBase),
-      source,
-    });
-
-    console.log(
-      `🔴 SELL : +${sellSol.toFixed(4)} SOL`
+  const baseAbs =
+    Math.abs(
+      Number(baseDelta)
     );
 
-    evaluateAlert(state).catch(
-      () => {}
+  if (
+    baseDown &&
+    quoteUp
+  ) {
+    recordEvent(
+      "SELL",
+      quoteAbs,
+      baseAbs,
+      null
     );
 
     return;
   }
 
-  // ----------------------------------------------------------
-  // BUY
-  // ----------------------------------------------------------
-
   if (
-    dBase > 0 &&
-    dQuote < 0
+    baseUp &&
+    quoteDown
   ) {
-    const buySol =
-      Math.abs(dQuote);
-
-    addEvent(state, {
-      ts: now(),
-      type: "BUY",
-      quoteSol: buySol,
-      baseTokens: dBase,
-      source,
-    });
-
-    console.log(
-      `🟢 BUY : -${buySol.toFixed(4)} SOL`
-    );
-
-    // IMPORTANT :
-    // Une baisse de réserve due à un BUY ne devient pas
-    // automatiquement un signal de sortie.
-    //
-    // C'est exactement la correction du problème observé
-    // pendant notre test V3.
-
-    evaluateAlert(state).catch(
-      () => {}
+    recordEvent(
+      "BUY",
+      quoteAbs,
+      baseAbs,
+      null
     );
 
     return;
   }
 
-  // ----------------------------------------------------------
-  // RETRAIT DE LIQUIDITÉ
-  // ----------------------------------------------------------
-
   if (
-    dBase < 0 &&
-    dQuote < 0
+    baseDown &&
+    quoteDown
   ) {
-    const removedSol =
-      Math.abs(dQuote);
-
-    addEvent(state, {
-      ts: now(),
-      type: "LIQ_WITHDRAW",
-      quoteSol: removedSol,
-      baseTokens: Math.abs(dBase),
-      source,
-    });
-
-    console.log(
-      `🚨 RETRAIT LIQUIDITÉ : -${removedSol.toFixed(4)} SOL`
-    );
-
-    // Le retrait on-chain est immédiatement important.
-    evaluateAlert(state).catch(
-      () => {}
+    recordEvent(
+      "WITHDRAW",
+      quoteAbs,
+      baseAbs,
+      null
     );
 
     return;
   }
 
-  // ----------------------------------------------------------
-  // AJOUT LIQUIDITÉ
-  // ----------------------------------------------------------
-
   if (
-    dBase > 0 &&
-    dQuote > 0
+    baseUp &&
+    quoteUp
   ) {
-    addEvent(state, {
-      ts: now(),
-      type: "LIQ_ADD",
-      quoteSol: dQuote,
-      baseTokens: dBase,
-      source,
-    });
-
-    console.log(
-      `🟢 AJOUT LIQUIDITÉ : +${dQuote.toFixed(4)} SOL`
+    recordEvent(
+      "ADD",
+      quoteAbs,
+      baseAbs,
+      null
     );
 
     return;
   }
-
-  console.log(
-    `ℹ️ Mouvement non classé : base=${dBase.toFixed(
-      6
-    )} quote=${dQuote.toFixed(6)}`
-  );
 }
 
-// ============================================================
-// WATCH ON-CHAIN
-// ============================================================
+// ------------------------------------------------------------
+// BASE VAULT SUBSCRIPTION
+// ------------------------------------------------------------
 
-async function setupOnChain(state) {
-  const poolInfo =
-    await connection.getAccountInfo(
-      state.poolPubkey,
-      "processed"
-    );
-
-  if (!poolInfo) {
-    throw new Error(
-      "Compte Pool introuvable"
-    );
-  }
-
-  const pool =
-    readPoolInfo(poolInfo);
-
-  state.baseVault =
-    pool.baseVault;
-
-  state.quoteVault =
-    pool.quoteVault;
-
-  state.virtualQuoteRaw =
-    pool.virtualQuoteRaw;
-
-  const infos =
-    await connection.getMultipleAccountsInfo(
-      [
-        state.baseVault,
-        state.quoteVault,
-      ],
-      "processed"
-    );
-
-  const baseRaw =
-    readTokenAmount(infos[0]);
-
-  const quoteRaw =
-    readTokenAmount(infos[1]);
-
-  if (
-    baseRaw === null ||
-    quoteRaw === null
-  ) {
-    throw new Error(
-      "Impossible de lire les réserves initiales"
-    );
-  }
-
-  state.previousBaseRaw =
-    baseRaw;
-
-  state.previousQuoteRaw =
-    quoteRaw;
-
-  state.baseRaw =
-    baseRaw;
-
-  state.quoteRaw =
-    quoteRaw;
-
-  state.quoteSol =
-    Number(quoteRaw) /
-    1e9;
-
-  state.baseTokens =
-    Number(baseRaw) /
-    Math.pow(
-      10,
-      state.baseDecimals
-    );
-
-  console.log(
-    "🟢 Pool :",
-    state.poolAddress
-  );
-
-  console.log(
-    "🟢 Base vault :",
-    state.baseVault.toBase58()
-  );
-
-  console.log(
-    "🟢 Quote vault :",
-    state.quoteVault.toBase58()
-  );
-
-  console.log(
-    "🟢 WSOL initial :",
-    state.quoteSol.toFixed(4)
-  );
-
-  // ----------------------------------------------------------
-  // BASE VAULT
-  // ----------------------------------------------------------
-
-  state.baseSub =
-    await connection.onAccountChange(
-      state.baseVault,
-      (accountInfo, context) => {
-        const raw =
-          readTokenAmount(
-            accountInfo
-          );
-
-        if (raw === null) {
-          return;
-        }
-
-        state.pendingBaseRaw =
-          raw;
-
-        state.pendingSlot =
-          context.slot;
-
-        scheduleReserveProcess(
-          state
-        );
-      },
-      {
-        commitment: "processed",
-        encoding: "base64",
-      }
-    );
-
-  // ----------------------------------------------------------
-  // QUOTE VAULT
-  // ----------------------------------------------------------
-
-  state.quoteSub =
-    await connection.onAccountChange(
-      state.quoteVault,
-      (accountInfo, context) => {
-        const raw =
-          readTokenAmount(
-            accountInfo
-          );
-
-        if (raw === null) {
-          return;
-        }
-
-        state.pendingQuoteRaw =
-          raw;
-
-        state.pendingSlot =
-          context.slot;
-
-        scheduleReserveProcess(
-          state
-        );
-      },
-      {
-        commitment: "processed",
-        encoding: "base64",
-      }
-    );
-
-  // ----------------------------------------------------------
-  // LOGS PUMPSWAP
-  // ----------------------------------------------------------
-
-  state.logsSub =
-    await connection.onLogs(
-      state.poolPubkey,
-      (logInfo) => {
-        if (logInfo.err) {
-          return;
-        }
-
-        const logs =
-          logInfo.logs || [];
-
-        const joined =
-          logs.join(" ");
-
-        if (/sell/i.test(joined)) {
-          console.log(
-            `⚠️ LOG PUMPSWAP SELL ${logInfo.signature}`
-          );
-        }
-
-        if (/buy/i.test(joined)) {
-          console.log(
-            `ℹ️ LOG PUMPSWAP BUY ${logInfo.signature}`
-          );
-        }
-
-        if (
-          /withdraw/i.test(joined)
-        ) {
-          console.log(
-            `🚨 LOG PUMPSWAP WITHDRAW ${logInfo.signature}`
-          );
-        }
-
-        if (
-          /deposit/i.test(joined)
-        ) {
-          console.log(
-            `🟢 LOG PUMPSWAP DEPOSIT ${logInfo.signature}`
-          );
-        }
-      },
-      "processed"
-    );
-
-  state.onChainActive =
-    true;
-}
-
-// ============================================================
-// BATCH VAULTS
-// ============================================================
-
-function scheduleReserveProcess(state) {
-  if (state.reserveTimer) {
+async function subscribeBaseVault() {
+  if (!baseVault) {
     return;
   }
 
-  state.reserveTimer =
-    setTimeout(() => {
-      state.reserveTimer =
-        null;
-
-      const baseRaw =
-        state.pendingBaseRaw !==
-        undefined
-          ? state.pendingBaseRaw
-          : state.baseRaw;
-
-      const quoteRaw =
-        state.pendingQuoteRaw !==
-        undefined
-          ? state.pendingQuoteRaw
-          : state.quoteRaw;
-
-      state.pendingBaseRaw =
-        undefined;
-
-      state.pendingQuoteRaw =
-        undefined;
-
-      processReserveSnapshot(
-        state,
-        baseRaw,
-        quoteRaw
-      );
-    }, RESERVE_BATCH_MS);
-}
-
-// ============================================================
-// ARRÊT ON-CHAIN
-// ============================================================
-
-async function stopOnChain(state) {
   try {
-    if (
-      state.baseSub !==
-      undefined
-    ) {
-      await connection.removeAccountChangeListener(
-        state.baseSub
-      );
-    }
-  } catch {}
+    baseSubscription =
+      connection.onAccountChange(
+        new PublicKey(baseVault),
+        accountInfo => {
+          const amount =
+            readTokenAmount(
+              accountInfo.data
+            );
 
-  try {
-    if (
-      state.quoteSub !==
-      undefined
-    ) {
-      await connection.removeAccountChangeListener(
-        state.quoteSub
-      );
-    }
-  } catch {}
+          if (
+            amount === null
+          ) {
+            return;
+          }
 
-  try {
-    if (
-      state.logsSub !==
-      undefined
-    ) {
-      await connection.removeOnLogsListener(
-        state.logsSub
-      );
-    }
-  } catch {}
+          pendingBase =
+            amount;
 
-  state.baseSub =
-    undefined;
-
-  state.quoteSub =
-    undefined;
-
-  state.logsSub =
-    undefined;
-
-  state.onChainActive =
-    false;
-}
-
-// ============================================================
-// POLLING DEX
-// ============================================================
-
-async function pollDex(state) {
-  try {
-    const dex =
-      await fetchDexPair(
-        state.mint
+          scheduleVaultEvaluation();
+        },
+        {
+          commitment: "processed",
+          encoding: "base64"
+        }
       );
 
-    if (
-      state.poolAddress &&
-      dex.pairAddress &&
-      dex.pairAddress !==
-        state.poolAddress
-    ) {
-      console.log(
-        `⚠️ Autre paire détectée : ${dex.pairAddress}`
-      );
-    }
-
-    state.liquidityUsd =
-      dex.liquidityUsd;
-
-    state.priceUsd =
-      dex.priceUsd;
-
-    state.priceNative =
-      dex.priceNative;
-
-    state.volume24h =
-      dex.volume24h;
-
-    if (
-      dex.baseDecimals > 0
-    ) {
-      state.baseDecimals =
-        dex.baseDecimals;
-    }
-
-    const t =
-      now();
-
-    state.liquidityHistory.push({
-      ts: t,
-      value:
-        state.liquidityUsd,
-    });
-
-    state.reserveHistory.push({
-      ts: t,
-      quoteSol:
-        state.quoteSol,
-    });
-
-    while (
-      state.liquidityHistory.length &&
-      state.liquidityHistory[0].ts <
-        t - 120000
-    ) {
-      state.liquidityHistory.shift();
-    }
-
-    while (
-      state.reserveHistory.length &&
-      state.reserveHistory[0].ts <
-        t - 120000
-    ) {
-      state.reserveHistory.shift();
-    }
-
-    // --------------------------------------------------------
-    // SOMMET LOCAL
-    // --------------------------------------------------------
-
-    if (
-      state.priceUsd >
-      state.highPriceUsd
-    ) {
-      state.highPriceUsd =
-        state.priceUsd;
-
-      state.highAt =
-        t;
-    }
-
-    await evaluateAlert(
-      state
+    console.log(
+      "🟢 Base vault surveillé"
     );
-  } catch (error) {
+
+  } catch (err) {
     console.error(
-      "🔴 DexScreener :",
-      error.message
+      "❌ Base subscription:",
+      err.message
     );
   }
 }
 
-// ============================================================
-// DÉMARRAGE WATCH
-// ============================================================
+// ------------------------------------------------------------
+// QUOTE VAULT SUBSCRIPTION
+// ------------------------------------------------------------
 
-async function startWatch(mint) {
-  if (watched.has(mint)) {
-    return watched.get(mint);
+async function subscribeQuoteVault() {
+  if (!quoteVault) {
+    return;
   }
 
-  const dex =
-    await fetchDexPair(
-      mint
-    );
-
-  const state = {
-    mint,
-
-    poolAddress:
-      dex.pairAddress,
-
-    poolPubkey:
-      new PublicKey(
-        dex.pairAddress
-      ),
-
-    dex,
-
-    baseVault: null,
-    quoteVault: null,
-
-    previousBaseRaw: null,
-    previousQuoteRaw: null,
-
-    pendingBaseRaw:
-      undefined,
-
-    pendingQuoteRaw:
-      undefined,
-
-    pendingSlot:
-      null,
-
-    baseRaw: null,
-    quoteRaw: null,
-
-    virtualQuoteRaw:
-      0n,
-
-    baseDecimals:
-      dex.baseDecimals || 6,
-
-    baseTokens:
-      0,
-
-    quoteSol:
-      0,
-
-    priceUsd:
-      dex.priceUsd || 0,
-
-    priceNative:
-      dex.priceNative || 0,
-
-    liquidityUsd:
-      dex.liquidityUsd || 0,
-
-    volume24h:
-      dex.volume24h || 0,
-
-    highPriceUsd:
-      dex.priceUsd || 0,
-
-    highAt:
-      now(),
-
-    events: [],
-
-    liquidityHistory: [],
-
-    reserveHistory: [],
-
-    riskScore:
-      0,
-
-    riskReasons: [],
-
-    lastAlertAt:
-      0,
-
-    lastAlertLevel:
-      null,
-
-    lastAlertScore:
-      null,
-
-    baseSub:
-      undefined,
-
-    quoteSub:
-      undefined,
-
-    logsSub:
-      undefined,
-
-    reserveTimer:
-      null,
-
-    dexTimer:
-      null,
-
-    healthTimer:
-      null,
-
-    onChainActive:
-      false,
-  };
-
-  watched.set(
-    mint,
-    state
-  );
-
   try {
-    await setupOnChain(
-      state
-    );
+    quoteSubscription =
+      connection.onAccountChange(
+        new PublicKey(quoteVault),
+        accountInfo => {
+          const amount =
+            readTokenAmount(
+              accountInfo.data
+            );
 
-    await pollDex(
-      state
-    );
+          if (
+            amount === null
+          ) {
+            return;
+          }
 
-    state.dexTimer =
-      setInterval(
-        () => {
-          pollDex(
-            state
-          ).catch(() => {});
+          pendingQuote =
+            amount;
+
+          scheduleVaultEvaluation();
         },
-        DEX_POLL_MS
-      );
-
-    state.healthTimer =
-      setInterval(
-        () => {
-          console.log(
-            `💓 ${mint.slice(
-              0,
-              8
-            )} | ` +
-            `risk=${state.riskScore}/100 | ` +
-            `liq=$${state.liquidityUsd.toFixed(0)} | ` +
-            `price=$${state.priceUsd.toFixed(8)} | ` +
-            `WSOL=${state.quoteSol.toFixed(4)} | ` +
-            `onchain=${
-              state.onChainActive
-                ? "ON"
-                : "OFF"
-            }`
-          );
-        },
-        HEALTH_LOG_MS
+        {
+          commitment: "processed",
+          encoding: "base64"
+        }
       );
 
     console.log(
-      "🚀 RADAR SORTIE V4 ACTIVÉ :",
-      mint
+      "🟢 Quote vault surveillé"
     );
 
-    return state;
-  } catch (error) {
-    watched.delete(
-      mint
+  } catch (err) {
+    console.error(
+      "❌ Quote subscription:",
+      err.message
     );
-
-    await stopOnChain(
-      state
-    );
-
-    throw error;
   }
 }
 
-// ============================================================
-// ARRÊT WATCH
-// ============================================================
+// ------------------------------------------------------------
+// LOGS PUMPSWAP
+// ------------------------------------------------------------
 
-async function stopWatch(mint) {
-  const state =
-    watched.get(mint);
+async function subscribeLogs() {
+  if (!poolAddress) {
+    return;
+  }
 
-  if (!state) {
+  try {
+    logSubscription =
+      connection.onLogs(
+        new PublicKey(poolAddress),
+        logInfo => {
+
+          const logs =
+            logInfo.logs || [];
+
+          const text =
+            logs.join(" ");
+
+          const lower =
+            text.toLowerCase();
+
+          if (
+            lower.includes("sell")
+          ) {
+            console.log(
+              "⚠️ LOG PUMPSWAP SELL"
+            );
+          }
+
+          if (
+            lower.includes("buy")
+          ) {
+            console.log(
+              "🟢 LOG PUMPSWAP BUY"
+            );
+          }
+
+        },
+        "processed"
+      );
+
+    console.log(
+      "🟢 Logs PumpSwap actifs"
+    );
+
+  } catch (err) {
+    console.error(
+      "❌ Logs subscription:",
+      err.message
+    );
+  }
+}
+
+// ------------------------------------------------------------
+// INITIALISATION VAULTS
+// ------------------------------------------------------------
+
+async function initializeVaultBalances() {
+  if (
+    !baseVault ||
+    !quoteVault
+  ) {
     return false;
   }
 
-  clearInterval(
-    state.dexTimer
-  );
+  const base =
+    await readVaultBalance(
+      baseVault
+    );
 
-  clearInterval(
-    state.healthTimer
-  );
+  const quote =
+    await readVaultBalance(
+      quoteVault
+    );
 
   if (
-    state.reserveTimer
+    base === null ||
+    quote === null
   ) {
-    clearTimeout(
-      state.reserveTimer
+    console.error(
+      "❌ Impossible d'initialiser les réserves"
     );
+
+    return false;
   }
 
-  await stopOnChain(
-    state
+  currentBase = base;
+  currentQuote = quote;
+
+  addReserveSample();
+
+  console.log(
+    "💧 Base :",
+    base.toString()
   );
 
-  watched.delete(
-    mint
+  console.log(
+    "💧 Quote :",
+    quote.toString()
   );
 
   return true;
 }
 
-// ============================================================
-// TELEGRAM /START
-// ============================================================
+// ------------------------------------------------------------
+// RESET
+// ------------------------------------------------------------
 
-bot.start(
-  async (ctx) => {
-    await ctx.reply(
-      "🤖 Radar Sortie V4 actif.\n\n" +
-      "/watch MINT\n" +
-      "/status\n" +
-      "/unwatch"
+async function resetSubscriptions() {
+  try {
+    if (
+      baseSubscription !== null
+    ) {
+      await connection.removeAccountChangeListener(
+        baseSubscription
+      );
+    }
+  } catch {}
+
+  try {
+    if (
+      quoteSubscription !== null
+    ) {
+      await connection.removeAccountChangeListener(
+        quoteSubscription
+      );
+    }
+  } catch {}
+
+  try {
+    if (
+      logSubscription !== null
+    ) {
+      await connection.removeOnLogsListener(
+        logSubscription
+      );
+    }
+  } catch {}
+
+  baseSubscription = null;
+  quoteSubscription = null;
+  logSubscription = null;
+}
+
+// ------------------------------------------------------------
+// DISCOVERY
+// ------------------------------------------------------------
+
+async function discoverPool() {
+  const data =
+    await fetchDexData();
+
+  if (!data) {
+    throw new Error(
+      "Token introuvable sur DexScreener"
     );
   }
-);
 
-// ============================================================
-// TELEGRAM /WATCH
-// ============================================================
-
-bot.command(
-  "watch",
-  async (ctx) => {
-    const parts =
-      ctx.message.text
-        .trim()
-        .split(/\s+/);
-
-    const mint =
-      parts[1];
-
-    if (!mint) {
-      return ctx.reply(
-        "Utilise : /watch ADRESSE_DU_TOKEN"
-      );
-    }
-
-    try {
-      new PublicKey(
-        mint
-      );
-    } catch {
-      return ctx.reply(
-        "❌ Adresse Solana invalide."
-      );
-    }
-
-    try {
-      await startWatch(
-        mint
-      );
-
-      await ctx.reply(
-        "🟢 RADAR SORTIE V4 ACTIVÉ\n\n" +
-        "Priorité aux signaux structurels :\n" +
-        "• retraits de liquidité on-chain\n" +
-        "• variations simultanées des vaults\n" +
-        "• chute du prix\n" +
-        "• chute de liquidité\n" +
-        "• pression vendeuse secondaire\n\n" +
-        "🚨 Les retraits importants peuvent déclencher une urgence immédiate.\n\n" +
-        "⚠️ Aucune alerte ne garantit une sortie avant un crash extrêmement rapide."
-      );
-    } catch (error) {
-      console.error(
-        "🔴 /watch :",
-        error.message
-      );
-
-      await ctx.reply(
-        `❌ Impossible d'activer le radar : ${error.message}`
-      );
-    }
-  }
-);
-
-// ============================================================
-// TELEGRAM /UNWATCH
-// ============================================================
-
-bot.command(
-  "unwatch",
-  async (ctx) => {
-    const mint =
-      ctx.message.text
-        .trim()
-        .split(/\s+/)[1];
-
-    if (mint) {
-      const stopped =
-        await stopWatch(
-          mint
-        );
-
-      return ctx.reply(
-        stopped
-          ? `🛑 Surveillance arrêtée : ${mint}`
-          : "ℹ️ Ce token n'était pas surveillé."
-      );
-    }
-
-    const all =
-      [
-        ...watched.keys()
-      ];
-
-    for (
-      const item of all
-    ) {
-      await stopWatch(
-        item
-      );
-    }
-
-    await ctx.reply(
-      all.length
-        ? `🛑 ${all.length} surveillance(s) arrêtée(s).`
-        : "ℹ️ Aucune surveillance active."
+  if (!data.pool) {
+    throw new Error(
+      "Pool introuvable"
     );
   }
-);
 
-// ============================================================
-// TELEGRAM /STATUS
-// ============================================================
+  poolAddress =
+    data.pool;
 
-bot.command(
-  "status",
-  async (ctx) => {
-    if (!watched.size) {
-      return ctx.reply(
-        "📡 Aucun token surveillé."
-      );
-    }
+  lastPrice =
+    data.price;
 
-    for (
-      const state of watched.values()
-    ) {
-      const risk =
-        calculateRisk(
-          state
-        );
+  lastLiquidity =
+    data.liquidity;
 
-      let belowHigh =
-        0;
+  localHighPrice =
+    data.price;
 
-      if (
-        state.highPriceUsd > 0 &&
-        state.priceUsd > 0
-      ) {
-        belowHigh =
-          (
-            (
-              state.highPriceUsd -
-              state.priceUsd
-            ) /
-            state.highPriceUsd
-          ) *
-          100;
-      }
+  localHighLiquidity =
+    data.liquidity;
 
-      const emergency =
-        getEmergencySignals(
-          state
-        );
+  console.log(
+    "🏊 Pool :",
+    poolAddress
+  );
 
-      await ctx.reply(
-        `📡 RADAR V4\n\n` +
+  const vaults =
+    await readPoolVaults(
+      poolAddress
+    );
 
-        `Token : ${state.mint}\n` +
-
-        `Pool : ${state.poolAddress}\n\n` +
-
-        `💰 Prix : $${state.priceUsd.toFixed(8)}\n` +
-
-        `💧 Liquidité : $${formatUsd(
-          state.liquidityUsd
-        )}\n` +
-
-        `📈 Sommet : $${state.highPriceUsd.toFixed(8)}\n` +
-
-        `📉 Sous sommet : ${belowHigh.toFixed(2)}%\n\n` +
-
-        `🪙 WSOL réserve : ${formatSol(
-          state.quoteSol
-        )} SOL\n` +
-
-        `🔴 SELL 10s : ${formatSol(
-          risk.flow10.sellSol
-        )} SOL\n` +
-
-        `🔴 SELL ratio 10s : ${risk.flow10.sellRatio.toFixed(
-          1
-        )}%\n` +
-
-        `🔴 SELL 30s : ${formatSol(
-          risk.flow30.sellSol
-        )} SOL\n` +
-
-        `🟢 BUY 10s : ${formatSol(
-          risk.flow10.buySol
-        )} SOL\n\n` +
-
-        `🚨 Retrait pool 30s : ${formatSol(
-          risk.flow30.withdrawalSol
-        )} SOL\n` +
-
-        `🎯 RISQUE : ${risk.score}/100\n` +
-
-        `📡 On-chain : ${
-          state.onChainActive
-            ? "ACTIVE"
-            : "OFF"
-        }\n\n` +
-
-        `🚨 Urgence : ${
-          emergency.length
-            ? emergency.join(" | ")
-            : "NON"
-        }\n\n` +
-
-        `🔎 Raisons : ${
-          risk.reasons.slice(
-            0,
-            6
-          ).join(" | ") ||
-          "aucune"
-        }`
-      );
-    }
+  if (!vaults) {
+    throw new Error(
+      "Impossible de lire les vaults PumpSwap"
+    );
   }
-);
 
-// ============================================================
-// ERREURS TELEGRAM
-// ============================================================
+  baseVault =
+    vaults.base;
 
-bot.catch(
-  (error) => {
+  quoteVault =
+    vaults.quote;
+
+  console.log(
+    "🪙 Base vault :",
+    baseVault
+  );
+
+  console.log(
+    "💧 Quote vault :",
+    quoteVault
+  );
+}
+
+// ------------------------------------------------------------
+// START WATCH
+// ------------------------------------------------------------
+
+async function startWatch(mint) {
+  try {
+    await resetSubscriptions();
+
+    watchedMint =
+      mint.trim();
+
+    events.length = 0;
+    liquiditySamples = [];
+    reserveSamples = [];
+
+    currentBase = null;
+    currentQuote = null;
+
+    lastPrice = null;
+    lastLiquidity = null;
+
+    localHighPrice = null;
+    localHighLiquidity = null;
+
+    lastAlertTime = 0;
+    lastAlertLevel = "NORMAL";
+
+    console.log(
+      "🔎 Recherche pool..."
+    );
+
+    await discoverPool();
+
+    const initialized =
+      await initializeVaultBalances();
+
+    if (!initialized) {
+      throw new Error(
+        "Initialisation des réserves impossible"
+      );
+    }
+
+    await subscribeBaseVault();
+    await subscribeQuoteVault();
+    await subscribeLogs();
+
+    onChainActive = true;
+
+    await sendTelegram(
+`🛰️ RADAR SORTIE V5 ACTIVÉ
+
+Token :
+${watchedMint}
+
+Pool :
+${poolAddress}
+
+Je surveille maintenant :
+
+• micro-SELL 1s / 3s / 5s / 10s
+• accélération des SELL
+• SELL répétés
+• pression vendeuse extrême
+• vraies variations des vaults
+• retraits de liquidité
+• réserve WSOL
+• liquidité
+• prix
+• sommet récent
+• confluence pré-crash
+
+🟢 On-chain : ACTIVE
+
+⚠️ V5 cherche des signaux précoces, mais aucune alerte ne peut garantir une sortie avant un crash.`);
+
+  } catch (err) {
     console.error(
-      "🔴 Telegram bot :",
-      error.message
+      "❌ startWatch:",
+      err.message
+    );
+
+    onChainActive = false;
+
+    await sendTelegram(
+`❌ RADAR V5
+
+Impossible d'activer la surveillance.
+
+Erreur :
+${err.message}`
     );
   }
-);
+}
 
-// ============================================================
-// DÉMARRAGE
-// ============================================================
+// ------------------------------------------------------------
+// STOP WATCH
+// ------------------------------------------------------------
 
-bot.launch();
+async function stopWatch() {
+  await resetSubscriptions();
 
-console.log(
-  "🤖 Pump Alert Bot Radar Sortie V4 démarré."
-);
+  watchedMint = null;
+  poolAddress = null;
+
+  baseVault = null;
+  quoteVault = null;
+
+  currentBase = null;
+  currentQuote = null;
+
+  onChainActive = false;
+
+  events.length = 0;
+  liquiditySamples = [];
+  reserveSamples = [];
+
+  await sendTelegram(
+    "🔴 RADAR V5 arrêté."
+  );
+}
+
+// ------------------------------------------------------------
+// STATUS
+// ------------------------------------------------------------
+
+async function sendStatus() {
+  if (!watchedMint) {
+    await sendTelegram(
+      "ℹ️ Aucun token surveillé."
+    );
+
+    return;
+  }
+
+  await updateMarketData();
+
+  addLiquiditySample();
+  addReserveSample();
+
+  const analysis =
+    calculateRisk();
+
+  const level =
+    getRiskLevel(
+      analysis.score
+    );
+
+  const m =
+    analysis.metrics;
+
+  const status =
+`🛰️ RADAR V5
+
+Token :
+${watchedMint}
+
+Pool :
+${poolAddress || "N/A"}
+
+💰 Prix :
+$${safeNumber(lastPrice).toFixed(8)}
+
+💧 Liquidité :
+$${safeNumber(lastLiquidity).toFixed(2)}
+
+📈 Sommet :
+$${safeNumber(localHighPrice).toFixed(8)}
+
+📉 Sous sommet :
+${formatPct(m.drawdown)}%
+
+💧 Réserve WSOL :
+${currentQuote !== null
+  ? formatSol(Number(currentQuote))
+  : "N/A"} SOL
+
+🔴 SELL 1s :
+${formatSol(m.sell1)} SOL
+
+🔴 SELL 3s :
+${formatSol(m.sell3)} SOL
+
+🔴 SELL 5s :
+${formatSol(m.sell5)} SOL
+
+🔴 SELL 10s :
+${formatSol(m.sell10)} SOL
+
+🔴 SELL 30s :
+${formatSol(m.sell30)} SOL
+
+📊 SELL ratio 10s :
+${formatPct(m.ratio10)}%
+
+🔢 SELL / 10s :
+${m.sellCount10}
+
+⚡ Accélération :
+${safeNumber(m.acceleration).toFixed(2)}x
+
+💧 Réserve 5s :
+${formatPct(m.reserve5)}%
+
+💧 Réserve 10s :
+${formatPct(m.reserve10)}%
+
+💧 Liquidité 5s :
+${formatPct(m.liquidity5)}%
+
+💧 Liquidité 15s :
+${formatPct(m.liquidity15)}%
+
+🎯 RISQUE :
+${analysis.score}/100
+
+NIVEAU :
+${level}
+
+📡 On-chain :
+${onChainActive
+  ? "ACTIVE"
+  : "INACTIVE"}
+
+🔎 Raisons :
+${analysis.reasons.length
+  ? analysis.reasons.join(" | ")
+  : "aucune"}`;
+
+  await sendTelegram(
+    status
+  );
+}
+
+// ------------------------------------------------------------
+// COMMANDES TELEGRAM
+// ------------------------------------------------------------
+
+bot.command("watch", async ctx => {
+  const text =
+    ctx.message.text
+      .replace("/watch", "")
+      .trim();
+
+  if (!text) {
+    await ctx.reply(
+      "Utilisation : /watch MINT"
+    );
+
+    return;
+  }
+
+  await ctx.reply(
+    "🔎 V5 recherche le pool..."
+  );
+
+  await startWatch(text);
+});
+
+// ------------------------------------------------------------
+
+bot.command("unwatch", async ctx => {
+  await stopWatch();
+});
+
+// ------------------------------------------------------------
+
+bot.command("status", async ctx => {
+  await sendStatus();
+});
+
+// ------------------------------------------------------------
+
+bot.command("help", async ctx => {
+  await ctx.reply(
+`🛰️ RADAR SORTIE V5
+
+Commandes :
+
+/watch MINT
+→ surveiller un token
+
+/status
+→ état actuel du radar
+
+/unwatch
+→ arrêter
+
+V5 surveille les micro-signaux pré-crash, les SELL rapides, les variations réelles des réserves, les retraits de liquidité et la perte du sommet.`
+  );
+});
+
+// ------------------------------------------------------------
+// MARKET LOOP
+// ------------------------------------------------------------
+
+setInterval(async () => {
+  if (!watchedMint) {
+    return;
+  }
+
+  try {
+    await updateMarketData();
+
+    addLiquiditySample();
+
+    addReserveSample();
+
+    await evaluateRisk();
+
+  } catch (err) {
+    console.error(
+      "❌ Market loop:",
+      err.message
+    );
+  }
+
+}, 3000);
+
+// ------------------------------------------------------------
+// RESERVE LOOP
+// ------------------------------------------------------------
+
+setInterval(async () => {
+  if (!watchedMint) {
+    return;
+  }
+
+  try {
+    if (
+      quoteVault &&
+      currentQuote !== null
+    ) {
+      addReserveSample();
+    }
+
+  } catch (err) {
+    console.error(
+      "❌ Reserve loop:",
+      err.message
+    );
+  }
+
+}, 1000);
+
+// ------------------------------------------------------------
+// WATCHDOG
+// ------------------------------------------------------------
+
+setInterval(async () => {
+  if (!watchedMint) {
+    return;
+  }
+
+  const age =
+    Date.now() - lastDexUpdate;
+
+  if (
+    age > 30000
+  ) {
+    console.log(
+      "⚠️ DexScreener non actualisé depuis",
+      Math.round(age / 1000),
+      "s"
+    );
+  }
+
+  if (
+    !onChainActive
+  ) {
+    console.log(
+      "⚠️ On-chain inactif"
+    );
+  }
+
+}, 15000);
+
+// ------------------------------------------------------------
+// START BOT
+// ------------------------------------------------------------
+
+bot.launch()
+  .then(() => {
+    console.log(
+      "🛰️ RADAR SORTIE V5 démarré"
+    );
+
+    console.log(
+      "📡 Helius RPC/WSS actif"
+    );
+  })
+  .catch(err => {
+    console.error(
+      "❌ Bot launch:",
+      err.message
+    );
+
+    process.exit(1);
+  });
+
+// ------------------------------------------------------------
+// STOP PROPRE
+// ------------------------------------------------------------
 
 process.once(
   "SIGINT",
