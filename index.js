@@ -1,6 +1,5 @@
 const { Telegraf } = require("telegraf");
 const { Connection, PublicKey } = require("@solana/web3.js");
-const WebSocket = require("ws");
 
 // ============================================================
 // CONFIG
@@ -38,59 +37,48 @@ const PUMPSWAP_PROGRAM =
 const WSOL_MINT =
   "So11111111111111111111111111111111111111112";
 
-// Token surveillé
+// ============================================================
+// ETAT
+// ============================================================
+
 let watchedMint = null;
 
-// Pool
 let poolAddress = null;
 let baseVault = null;
 let quoteVault = null;
 
-// WebSocket
-let ws = null;
-let wsReconnectTimer = null;
-let wsSubscriptionId = null;
-let wsReady = false;
+let baseSubscriptionId = null;
+let quoteSubscriptionId = null;
 
-// Intervalles
 let dexTimer = null;
 let anaxerTimer = null;
 let healthTimer = null;
 
-// Etat marché
 let currentLiquidityUsd = null;
-let lastDexLiquidity = null;
 
-let currentQuoteReserve = null;
 let currentBaseReserve = null;
+let currentQuoteReserve = null;
+
+let previousBaseReserve = null;
+let previousQuoteReserve = null;
 
 let highestLiquidity = 0;
 let highestPrice = null;
 
-let lastPrice = null;
+let lastPriceUsd = null;
 
-// Historique transactions
-const trades = [];
+// Historique ultra court
+const flowEvents = [];
 
 // Dernière alerte
-let lastAlertTime = 0;
+let lastAlertAt = 0;
 let lastAlertType = "";
-
-// Evite de traiter deux fois la même transaction
-const processedSignatures = new Set();
-
-// Limite mémoire
-const MAX_SIGNATURES = 2000;
 
 // ============================================================
 // UTILITAIRES
 // ============================================================
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function nowMs() {
+function now() {
   return Date.now();
 }
 
@@ -114,12 +102,16 @@ function formatSol(value) {
 }
 
 function shortAddress(address) {
-  if (!address) return "N/A";
+  if (!address) {
+    return "N/A";
+  }
+
+  const s = address.toString();
 
   return (
-    address.slice(0, 6) +
+    s.slice(0, 6) +
     "..." +
-    address.slice(-6)
+    s.slice(-6)
   );
 }
 
@@ -139,12 +131,37 @@ async function sendTelegram(message) {
     );
 
     console.log("📨 Telegram envoyé");
+
   } catch (error) {
     console.error(
       "❌ Telegram :",
       error.message
     );
   }
+}
+
+// ============================================================
+// ALERTES
+// ============================================================
+
+async function alertOnce(
+  type,
+  message,
+  cooldown = 4000
+) {
+  const current = now();
+
+  if (
+    type === lastAlertType &&
+    current - lastAlertAt < cooldown
+  ) {
+    return;
+  }
+
+  lastAlertType = type;
+  lastAlertAt = current;
+
+  await sendTelegram(message);
 }
 
 // ============================================================
@@ -159,19 +176,21 @@ async function getDexPair(mint) {
 
     if (!response.ok) {
       throw new Error(
-        `DexScreener HTTP ${response.status}`
+        `HTTP ${response.status}`
       );
     }
 
-    const data = await response.json();
+    const data =
+      await response.json();
 
-    const pairs = data.pairs || [];
+    const pairs =
+      data.pairs || [];
 
     const pumpPair =
       pairs.find(
         p =>
-          p.dexId === "pumpswap" &&
-          p.chainId === "solana"
+          p.chainId === "solana" &&
+          p.dexId === "pumpswap"
       ) ||
       pairs.find(
         p =>
@@ -191,59 +210,48 @@ async function getDexPair(mint) {
 }
 
 // ============================================================
-// TROUVER LE POOL PUMPSWAP
+// TROUVER LE POOL
 // ============================================================
 
-async function findPumpSwapPool(mint) {
-  const pair = await getDexPair(mint);
+async function findPool(mint) {
+  const pair =
+    await getDexPair(mint);
 
   if (!pair) {
     throw new Error(
-      "Impossible de trouver le pool PumpSwap."
+      "Pool PumpSwap introuvable."
     );
   }
 
-  const address =
-    pair.pairAddress;
-
-  if (!address) {
+  if (!pair.pairAddress) {
     throw new Error(
-      "Le pool n'a pas d'adresse."
+      "Adresse du pool absente."
     );
   }
 
   return {
-    pool: new PublicKey(address),
+    pool:
+      new PublicKey(
+        pair.pairAddress
+      ),
+
     liquidityUsd:
-      Number(pair.liquidity?.usd || 0),
+      Number(
+        pair.liquidity?.usd || 0
+      ),
+
     priceUsd:
-      Number(pair.priceUsd || 0),
-    pair
+      Number(
+        pair.priceUsd || 0
+      )
   };
 }
 
 // ============================================================
-// DECODER DU POOL PUMPSWAP
+// DECODER POOL PUMPSWAP
 // ============================================================
 
 function decodePoolVaults(data) {
-  /*
-    PumpSwap Pool layout :
-
-    discriminator     8
-    bump               1
-    index              2
-    creator           32
-    base_mint         32
-    quote_mint        32
-    lp_mint           32
-    pool_base_vault   32
-    pool_quote_vault  32
-
-    base vault offset  = 139
-    quote vault offset = 171
-  */
-
   if (!data) {
     return null;
   }
@@ -253,23 +261,43 @@ function decodePoolVaults(data) {
       ? data
       : Buffer.from(data);
 
+  /*
+    Layout PumpSwap :
+
+    discriminator       8
+    bump                 1
+    index                2
+    creator             32
+    base_mint           32
+    quote_mint          32
+    lp_mint             32
+    pool_base_vault     32
+    pool_quote_vault    32
+
+    base vault  = 139
+    quote vault = 171
+  */
+
   if (buffer.length < 203) {
     return null;
   }
 
-  const baseVault =
-    new PublicKey(
-      buffer.subarray(139, 171)
-    );
-
-  const quoteVault =
-    new PublicKey(
-      buffer.subarray(171, 203)
-    );
-
   return {
-    baseVault,
-    quoteVault
+    baseVault:
+      new PublicKey(
+        buffer.subarray(
+          139,
+          171
+        )
+      ),
+
+    quoteVault:
+      new PublicKey(
+        buffer.subarray(
+          171,
+          203
+        )
+      )
   };
 }
 
@@ -287,11 +315,13 @@ async function loadPoolVaults(pool) {
   }
 
   const decoded =
-    decodePoolVaults(info.data);
+    decodePoolVaults(
+      info.data
+    );
 
   if (!decoded) {
     throw new Error(
-      "Impossible de décoder les vaults du pool."
+      "Impossible de décoder le pool."
     );
   }
 
@@ -299,24 +329,29 @@ async function loadPoolVaults(pool) {
 }
 
 // ============================================================
-// LECTURE RESERVE TOKEN
+// LECTURE TOKEN ACCOUNT
 // ============================================================
 
-function readTokenAmount(accountInfo) {
-  if (!accountInfo) {
+function readRawTokenAmount(info) {
+  if (!info) {
     return null;
   }
 
   try {
-    const data = accountInfo.data;
+    const data =
+      info.data;
 
-    // Buffer brut
-    if (Buffer.isBuffer(data)) {
+    // Buffer
+    if (
+      Buffer.isBuffer(data)
+    ) {
       if (data.length < 72) {
         return null;
       }
 
-      return data.readBigUInt64LE(64);
+      return data.readBigUInt64LE(
+        64
+      );
     }
 
     // Base64
@@ -335,20 +370,24 @@ function readTokenAmount(accountInfo) {
         return null;
       }
 
-      return buffer.readBigUInt64LE(64);
+      return buffer.readBigUInt64LE(
+        64
+      );
     }
 
-    // jsonParsed
-    const parsed =
+    // Parsed
+    const amount =
       data?.parsed?.info?.tokenAmount?.amount;
 
-    if (parsed !== undefined) {
-      return BigInt(parsed);
+    if (
+      amount !== undefined
+    ) {
+      return BigInt(amount);
     }
 
   } catch (error) {
     console.error(
-      "🔴 Lecture réserve :",
+      "🔴 Lecture token :",
       error.message
     );
   }
@@ -361,10 +400,6 @@ function readTokenAmount(accountInfo) {
 // ============================================================
 
 async function loadInitialReserves() {
-  if (!baseVault || !quoteVault) {
-    return false;
-  }
-
   const accounts =
     await connection.getMultipleAccountsInfo(
       [
@@ -374,106 +409,117 @@ async function loadInitialReserves() {
       "processed"
     );
 
-  const baseAmount =
-    readTokenAmount(accounts[0]);
-
-  const quoteAmount =
-    readTokenAmount(accounts[1]);
-
   if (
-    baseAmount === null ||
-    quoteAmount === null
+    !accounts ||
+    accounts.length !== 2
   ) {
     return false;
   }
 
-  currentBaseReserve =
-    Number(baseAmount) / 1e6;
+  const baseRaw =
+    readRawTokenAmount(
+      accounts[0]
+    );
+
+  const quoteRaw =
+    readRawTokenAmount(
+      accounts[1]
+    );
+
+  if (
+    baseRaw === null ||
+    quoteRaw === null
+  ) {
+    return false;
+  }
+
+  /*
+    PumpSwap token accounts :
+
+    quote WSOL = 9 decimals
+
+    Le mint peut avoir des décimales différentes.
+    On récupère ici les valeurs brutes.
+  */
 
   currentQuoteReserve =
-    Number(quoteAmount) / 1e9;
+    Number(quoteRaw) / 1e9;
+
+  currentBaseReserve =
+    Number(baseRaw);
+
+  previousQuoteReserve =
+    currentQuoteReserve;
+
+  previousBaseReserve =
+    currentBaseReserve;
 
   return true;
 }
 
 // ============================================================
-// PRIX APPROXIMATIF
+// HISTORIQUE DES FLUX
 // ============================================================
 
-function calculatePriceSol() {
-  if (
-    !currentBaseReserve ||
-    !currentQuoteReserve
-  ) {
-    return null;
-  }
-
-  if (currentBaseReserve <= 0) {
-    return null;
-  }
-
-  return (
-    currentQuoteReserve /
-    currentBaseReserve
-  );
-}
-
-// ============================================================
-// HISTORIQUE DES TRADES
-// ============================================================
-
-function addTrade(type, quoteSol, signature) {
-  const timestamp = nowMs();
-
-  trades.push({
+function addFlow(type, amountSol) {
+  flowEvents.push({
     type,
-    quoteSol,
-    timestamp,
-    signature
+    amountSol,
+    timestamp: now()
   });
 
-  // garde seulement 30 secondes
+  cleanupFlows();
+}
+
+function cleanupFlows() {
   const cutoff =
-    timestamp - 30000;
+    now() - 15000;
 
   while (
-    trades.length &&
-    trades[0].timestamp < cutoff
+    flowEvents.length &&
+    flowEvents[0].timestamp < cutoff
   ) {
-    trades.shift();
+    flowEvents.shift();
   }
 }
 
-// ============================================================
-// STATS COURTES
-// ============================================================
-
-function getStats(seconds) {
+function getFlowStats(seconds) {
   const cutoff =
-    nowMs() - seconds * 1000;
+    now() -
+    seconds * 1000;
 
-  const recent =
-    trades.filter(
-      t => t.timestamp >= cutoff
-    );
-
-  let buys = 0;
   let sells = 0;
+  let buys = 0;
+
   let sellCount = 0;
   let buyCount = 0;
 
-  for (const trade of recent) {
-    if (trade.type === "SELL") {
-      sells += trade.quoteSol;
+  for (
+    const event of flowEvents
+  ) {
+    if (
+      event.timestamp < cutoff
+    ) {
+      continue;
+    }
+
+    if (
+      event.type === "SELL"
+    ) {
+      sells += event.amountSol;
       sellCount++;
-    } else {
-      buys += trade.quoteSol;
+    }
+
+    if (
+      event.type === "BUY"
+    ) {
+      buys += event.amountSol;
       buyCount++;
     }
   }
 
   const total =
-    buys + sells;
+    sells + buys;
 
   const sellPct =
     total > 0
@@ -481,609 +527,460 @@ function getStats(seconds) {
       : 0;
 
   return {
-    buys,
     sells,
-    sellPct,
-    buyCount,
+    buys,
     sellCount,
-    total
+    buyCount,
+    total,
+    sellPct
   };
 }
 
 // ============================================================
-// ALERTE AVEC ANTI-SPAM
+// ANALYSE IMMEDIATE DU QUOTE VAULT
 // ============================================================
 
-async function smartAlert(
-  type,
-  message,
-  cooldownMs = 4000
-) {
-  const now = nowMs();
-
-  if (
-    type === lastAlertType &&
-    now - lastAlertTime < cooldownMs
-  ) {
-    return;
-  }
-
-  lastAlertTime = now;
-  lastAlertType = type;
-
-  await sendTelegram(message);
-}
-
-// ============================================================
-// ANALYSE DU SIGNAL
-// ============================================================
-
-async function analyzeTradeSignal({
-  type,
-  quoteSol,
-  signature
-}) {
-  const stats3 =
-    getStats(3);
-
-  const stats5 =
-    getStats(5);
-
-  const stats10 =
-    getStats(10);
-
-  const price =
-    calculatePriceSol();
-
-  // ----------------------------------------------------------
-  // Niveau CRITIQUE
-  // ----------------------------------------------------------
-
-  if (
-    type === "SELL" &&
-    (
-      stats3.sellPct >= 85 ||
-      stats5.sellPct >= 85
-    )
-  ) {
-    await smartAlert(
-      "CRITICAL_SELL",
-      `
-🚨 <b>SIGNAL SORTIE CRITIQUE</b>
-
-<b>SELL 3s :</b> ${stats3.sellPct.toFixed(1)}%
-<b>SELL 5s :</b> ${stats5.sellPct.toFixed(1)}%
-<b>SELL 10s :</b> ${stats10.sellPct.toFixed(1)}%
-
-<b>Ventes 5s :</b> ${formatSol(stats5.sells)} SOL
-<b>Achats 5s :</b> ${formatSol(stats5.buys)} SOL
-
-<b>Prix :</b> ${price !== null ? price.toExponential(4) : "N/A"} SOL
-
-⚠️ Pression vendeuse extrêmement forte.
-
-Signature :
-<code>${signature}</code>
-`,
-      2500
-    );
-
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // SELL PRESSURE FORTE
-  // ----------------------------------------------------------
-
-  if (
-    type === "SELL" &&
-    stats3.sellPct >= 70 &&
-    stats5.sells >= 1
-  ) {
-    await smartAlert(
-      "STRONG_SELL",
-      `
-🔴 <b>PRESSION SELL FORTE</b>
-
-<b>SELL 3s :</b> ${stats3.sellPct.toFixed(1)}%
-<b>SELL 5s :</b> ${stats5.sellPct.toFixed(1)}%
-<b>SELL 10s :</b> ${stats10.sellPct.toFixed(1)}%
-
-<b>Volume SELL 5s :</b> ${formatSol(stats5.sells)} SOL
-<b>Volume BUY 5s :</b> ${formatSol(stats5.buys)} SOL
-
-⚠️ Plusieurs ventes rapprochées détectées.
-`,
-      4000
-    );
-
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // ACCELERATION SELL
-  // ----------------------------------------------------------
-
-  if (
-    type === "SELL" &&
-    stats3.sellPct >= 60 &&
-    stats3.sellCount >= 3
-  ) {
-    await smartAlert(
-      "SELL_ACCELERATION",
-      `
-🟠 <b>ACCÉLÉRATION DES VENTES</b>
-
-<b>SELL 3s :</b> ${stats3.sellPct.toFixed(1)}%
-<b>Nombre de SELL :</b> ${stats3.sellCount}
-
-<b>Volume SELL :</b> ${formatSol(stats3.sells)} SOL
-<b>Volume BUY :</b> ${formatSol(stats3.buys)} SOL
-
-📡 Le radar commence à voir un retournement.
-`,
-      6000
-    );
-  }
-}
-
-// ============================================================
-// ANALYSE TRANSACTION
-// ============================================================
-
-function getAccountKeyString(accountKey) {
-  if (!accountKey) {
-    return null;
-  }
-
-  if (typeof accountKey === "string") {
-    return accountKey;
-  }
-
-  if (accountKey.pubkey) {
-    return accountKey.pubkey.toString();
-  }
-
-  return null;
-}
-
-function extractVaultDelta(
-  transaction,
-  vaultAddress
+async function processQuoteChange(
+  newQuoteReserve
 ) {
   if (
-    !transaction ||
-    !transaction.meta ||
-    !transaction.transaction
+    previousQuoteReserve === null
   ) {
-    return null;
-  }
+    previousQuoteReserve =
+      newQuoteReserve;
 
-  const meta =
-    transaction.meta;
+    currentQuoteReserve =
+      newQuoteReserve;
 
-  const accountKeys =
-    transaction.transaction.message.accountKeys || [];
-
-  const vaultIndex =
-    accountKeys.findIndex(
-      key =>
-        getAccountKeyString(key) ===
-        vaultAddress.toString()
-    );
-
-  if (vaultIndex === -1) {
-    return null;
-  }
-
-  const pre =
-    (meta.preTokenBalances || [])
-      .find(
-        b =>
-          b.accountIndex ===
-          vaultIndex
-      );
-
-  const post =
-    (meta.postTokenBalances || [])
-      .find(
-        b =>
-          b.accountIndex ===
-          vaultIndex
-      );
-
-  if (!pre || !post) {
-    return null;
-  }
-
-  const preAmount =
-    BigInt(
-      pre.uiTokenAmount.amount
-    );
-
-  const postAmount =
-    BigInt(
-      post.uiTokenAmount.amount
-    );
-
-  return {
-    delta:
-      postAmount - preAmount,
-    pre: preAmount,
-    post: postAmount,
-    decimals:
-      post.uiTokenAmount.decimals
-  };
-}
-
-// ============================================================
-// TRAITEMENT D'UNE TRANSACTION
-// ============================================================
-
-async function processSignature(signature) {
-  if (!signature) {
     return;
   }
 
+  const old =
+    previousQuoteReserve;
+
+  const change =
+    newQuoteReserve - old;
+
+  const decrease =
+    old > 0
+      ? ((old - newQuoteReserve) /
+          old) *
+        100
+      : 0;
+
+  currentQuoteReserve =
+    newQuoteReserve;
+
+  previousQuoteReserve =
+    newQuoteReserve;
+
+  /*
+    QUOTE DOWN
+
+    Le pool perd du WSOL.
+
+    C'est compatible avec :
+    - SELL
+    - retrait
+    - autre opération de liquidité
+
+    On considère cela comme un
+    "outflow" dangereux immédiatement.
+  */
+
   if (
-    processedSignatures.has(signature)
+    change < 0
   ) {
-    return;
-  }
+    const outflow =
+      Math.abs(change);
 
-  processedSignatures.add(signature);
-
-  if (
-    processedSignatures.size >
-    MAX_SIGNATURES
-  ) {
-    const first =
-      processedSignatures.values().next().value;
-
-    processedSignatures.delete(first);
-  }
-
-  try {
-    const tx =
-      await connection.getParsedTransaction(
-        signature,
-        {
-          commitment: "processed",
-          maxSupportedTransactionVersion: 0
-        }
-      );
-
-    if (!tx || !tx.meta) {
-      return;
-    }
-
-    if (tx.meta.err) {
-      return;
-    }
-
-    const quote =
-      extractVaultDelta(
-        tx,
-        quoteVault
-      );
-
-    const base =
-      extractVaultDelta(
-        tx,
-        baseVault
-      );
-
-    if (!quote || !base) {
-      return;
-    }
-
-    const quoteDeltaSol =
-      Number(quote.delta) /
-      1e9;
-
-    const baseDelta =
-      Number(base.delta) /
-      Math.pow(
-        10,
-        base.decimals
-      );
-
-    /*
-      SELL :
-
-      trader donne des tokens
-      -> base vault augmente
-
-      trader reçoit du SOL
-      -> quote vault diminue
-    */
-
-    let type = null;
-
-    if (
-      quoteDeltaSol < 0 &&
-      baseDelta > 0
-    ) {
-      type = "SELL";
-    }
-
-    /*
-      BUY :
-
-      quote vault augmente
-      base vault diminue
-    */
-
-    else if (
-      quoteDeltaSol > 0 &&
-      baseDelta < 0
-    ) {
-      type = "BUY";
-    }
-
-    if (!type) {
-      return;
-    }
-
-    const volume =
-      Math.abs(quoteDeltaSol);
-
-    if (volume <= 0) {
-      return;
-    }
-
-    // Mise à jour réserve
-    if (quote.post !== undefined) {
-      currentQuoteReserve =
-        Number(quote.post) / 1e9;
-    }
-
-    if (base.post !== undefined) {
-      currentBaseReserve =
-        Number(base.post) /
-        Math.pow(
-          10,
-          base.decimals
-        );
-    }
-
-    const oldPrice =
-      lastPrice;
-
-    const newPrice =
-      calculatePriceSol();
-
-    lastPrice =
-      newPrice;
-
-    addTrade(
-      type,
-      volume,
-      signature
+    addFlow(
+      "SELL",
+      outflow
     );
 
     console.log(
-      `${type} | ${volume.toFixed(4)} SOL | ${signature}`
+      `🔻 WSOL OUTFLOW ${outflow.toFixed(4)} SOL`
     );
 
+    const stats1 =
+      getFlowStats(1);
+
+    const stats3 =
+      getFlowStats(3);
+
+    const stats5 =
+      getFlowStats(5);
+
     // --------------------------------------------------------
-    // GROSSE VENTE INDIVIDUELLE
+    // SORTIE URGENTE
     // --------------------------------------------------------
 
     if (
-      type === "SELL" &&
-      volume >= 3
+      decrease >= 3 ||
+      outflow >= 5 ||
+      stats1.sellPct >= 85 ||
+      stats3.sellPct >= 85
     ) {
-      await smartAlert(
-        "BIG_SELL",
+      await alertOnce(
+        "URGENT_OUTFLOW",
         `
-⚠️ <b>GROSSE VENTE DÉTECTÉE</b>
+🚨 <b>SIGNAL DE SORTIE URGENT</b>
 
-<b>Montant :</b> ${volume.toFixed(3)} SOL
+<b>Sortie WSOL détectée :</b>
+${formatSol(outflow)} SOL
 
-<b>SELL 3s :</b> ${getStats(3).sellPct.toFixed(1)}%
-<b>SELL 5s :</b> ${getStats(5).sellPct.toFixed(1)}%
+<b>Baisse réserve :</b>
+${decrease.toFixed(2)}%
 
-<b>Réserve WSOL :</b> ${formatSol(currentQuoteReserve)} SOL
+<b>SELL 1s :</b>
+${stats1.sellPct.toFixed(1)}%
 
-<b>Signature :</b>
-<code>${signature}</code>
+<b>SELL 3s :</b>
+${stats3.sellPct.toFixed(1)}%
+
+<b>SELL 5s :</b>
+${stats5.sellPct.toFixed(1)}%
+
+<b>Réserve WSOL :</b>
+${formatSol(currentQuoteReserve)} SOL
+
+⚠️ Flux vendeur très agressif.
 `,
-        3000
+        2000
+      );
+
+      return;
+    }
+
+    // --------------------------------------------------------
+    // PRE-ALERTE
+    // --------------------------------------------------------
+
+    if (
+      decrease >= 1 ||
+      outflow >= 1 ||
+      stats3.sellPct >= 70
+    ) {
+      await alertOnce(
+        "SELL_PRESSURE",
+        `
+🟠 <b>PRESSION VENDEUSE</b>
+
+<b>WSOL sorti :</b>
+${formatSol(outflow)} SOL
+
+<b>Variation réserve :</b>
+-${decrease.toFixed(2)}%
+
+<b>SELL 3s :</b>
+${stats3.sellPct.toFixed(1)}%
+
+<b>SELL 5s :</b>
+${stats5.sellPct.toFixed(1)}%
+
+<b>Réserve :</b>
+${formatSol(currentQuoteReserve)} SOL
+
+📡 Le radar détecte une accélération.
+`,
+        5000
       );
     }
 
-    // --------------------------------------------------------
-    // CHUTE DE PRIX
-    // --------------------------------------------------------
+    return;
+  }
 
-    if (
-      type === "SELL" &&
-      oldPrice &&
-      newPrice
-    ) {
-      const priceChange =
-        ((newPrice - oldPrice) /
-          oldPrice) *
-        100;
+  /*
+    QUOTE UP
 
-      if (priceChange <= -5) {
-        await smartAlert(
-          "PRICE_DROP",
-          `
-🚨 <b>CHUTE RAPIDE DU PRIX</b>
+    Le pool reçoit du WSOL.
+    Cela correspond typiquement à un BUY.
+  */
 
-<b>Variation transaction :</b> ${priceChange.toFixed(2)}%
+  if (
+    change > 0
+  ) {
+    addFlow(
+      "BUY",
+      change
+    );
 
-<b>SELL :</b> ${volume.toFixed(3)} SOL
-
-<b>Réserve WSOL :</b> ${formatSol(currentQuoteReserve)} SOL
-
-⚠️ Risque de cascade de ventes.
-`,
-          2500
-        );
-      }
-    }
-
-    await analyzeTradeSignal({
-      type,
-      quoteSol: volume,
-      signature
-    });
-
-  } catch (error) {
-    console.error(
-      "🔴 Analyse transaction :",
-      error.message
+    console.log(
+      `🟢 WSOL INFLOW ${change.toFixed(4)} SOL`
     );
   }
 }
 
 // ============================================================
-// WEBSOCKET PUMPSWAP
+// ANALYSE VAULT TOKEN
 // ============================================================
 
-function startWebSocket() {
+async function processBaseChange(
+  newBaseRaw
+) {
+  if (
+    previousBaseReserve === null
+  ) {
+    previousBaseReserve =
+      newBaseRaw;
+
+    currentBaseReserve =
+      newBaseRaw;
+
+    return;
+  }
+
+  const old =
+    previousBaseReserve;
+
+  const change =
+    newBaseRaw - old;
+
+  currentBaseReserve =
+    newBaseRaw;
+
+  previousBaseReserve =
+    newBaseRaw;
+
+  /*
+    BASE UP + QUOTE DOWN
+    = confirmation SELL
+
+    BASE DOWN + QUOTE UP
+    = confirmation BUY
+  */
+
+  if (
+    change > 0 &&
+    previousQuoteReserve !== null
+  ) {
+    console.log(
+      "🔴 Base vault en hausse : SELL confirmé"
+    );
+  }
+
+  if (
+    change < 0 &&
+    previousQuoteReserve !== null
+  ) {
+    console.log(
+      "🟢 Base vault en baisse : BUY confirmé"
+    );
+  }
+}
+
+// ============================================================
+// ABONNEMENT VAULT WSOL
+// ============================================================
+
+async function subscribeQuoteVault() {
+  if (!quoteVault) {
+    throw new Error(
+      "Quote vault absent."
+    );
+  }
+
+  if (
+    quoteSubscriptionId !== null
+  ) {
+    try {
+      await connection.removeAccountChangeListener(
+        quoteSubscriptionId
+      );
+    } catch {}
+
+    quoteSubscriptionId = null;
+  }
+
+  quoteSubscriptionId =
+    await connection.onAccountChange(
+      quoteVault,
+      accountInfo => {
+        try {
+          const raw =
+            readRawTokenAmount(
+              accountInfo
+            );
+
+          if (raw === null) {
+            return;
+          }
+
+          const reserve =
+            Number(raw) / 1e9;
+
+          /*
+            IMPORTANT :
+
+            L'alerte principale part
+            directement d'ici.
+
+            Aucun getParsedTransaction.
+            Aucun confirmed.
+            Aucun appel RPC supplémentaire.
+          */
+
+          processQuoteChange(
+            reserve
+          ).catch(error => {
+            console.error(
+              "🔴 Quote analysis :",
+              error.message
+            );
+          });
+
+        } catch (error) {
+          console.error(
+            "🔴 Quote callback :",
+            error.message
+          );
+        }
+      },
+      {
+        commitment: "processed",
+        encoding: "base64"
+      }
+    );
+
+  console.log(
+    "🟢 Surveillance WSOL ACTIVE"
+  );
+}
+
+// ============================================================
+// ABONNEMENT VAULT TOKEN
+// ============================================================
+
+async function subscribeBaseVault() {
+  if (!baseVault) {
+    throw new Error(
+      "Base vault absent."
+    );
+  }
+
+  if (
+    baseSubscriptionId !== null
+  ) {
+    try {
+      await connection.removeAccountChangeListener(
+        baseSubscriptionId
+      );
+    } catch {}
+
+    baseSubscriptionId = null;
+  }
+
+  baseSubscriptionId =
+    await connection.onAccountChange(
+      baseVault,
+      accountInfo => {
+        try {
+          const raw =
+            readRawTokenAmount(
+              accountInfo
+            );
+
+          if (raw === null) {
+            return;
+          }
+
+          processBaseChange(
+            Number(raw)
+          );
+
+        } catch (error) {
+          console.error(
+            "🔴 Base callback :",
+            error.message
+          );
+        }
+      },
+      {
+        commitment: "processed",
+        encoding: "base64"
+      }
+    );
+
+  console.log(
+    "🟢 Surveillance TOKEN ACTIVE"
+  );
+}
+
+// ============================================================
+// LOGS PUMPSWAP
+// ============================================================
+
+let logsSubscriptionId = null;
+
+async function subscribePoolLogs() {
   if (!poolAddress) {
     return;
   }
 
-  if (ws) {
+  if (
+    logsSubscriptionId !== null
+  ) {
     try {
-      ws.close();
+      await connection.removeOnLogsListener(
+        logsSubscriptionId
+      );
     } catch {}
+
+    logsSubscriptionId = null;
   }
 
+  logsSubscriptionId =
+    await connection.onLogs(
+      poolAddress,
+      info => {
+        if (
+          info.err
+        ) {
+          return;
+        }
+
+        const logs =
+          info.logs || [];
+
+        const joined =
+          logs.join(" ").toLowerCase();
+
+        /*
+          On utilise les logs comme
+          deuxième radar.
+
+          On ne récupère PAS la transaction.
+        */
+
+        if (
+          joined.includes("sell")
+        ) {
+          console.log(
+            "⚠️ LOG PUMPSWAP SELL",
+            info.signature
+          );
+        }
+
+        if (
+          joined.includes("buy")
+        ) {
+          console.log(
+            "🟢 LOG PUMPSWAP BUY",
+            info.signature
+          );
+        }
+      },
+      "processed"
+    );
+
   console.log(
-    "📡 Connexion WebSocket..."
+    "🟢 Surveillance LOGS ACTIVE"
   );
-
-  wsReady = false;
-
-  ws =
-    new WebSocket(WS_URL);
-
-  ws.on("open", () => {
-    console.log(
-      "🟢 WebSocket connecté"
-    );
-
-    wsReady = true;
-
-    const request = {
-      jsonrpc: "2.0",
-      id: 1,
-      method: "logsSubscribe",
-      params: [
-        {
-          mentions: [
-            poolAddress.toString()
-          ]
-        },
-        {
-          commitment: "processed"
-        }
-      ]
-    };
-
-    ws.send(
-      JSON.stringify(request)
-    );
-  });
-
-  ws.on("message", async data => {
-    try {
-      const message =
-        JSON.parse(
-          data.toString()
-        );
-
-      // Confirmation abonnement
-      if (
-        message.result &&
-        message.id === 1
-      ) {
-        wsSubscriptionId =
-          message.result;
-
-        console.log(
-          "🟢 Surveillance pool active :",
-          poolAddress.toString()
-        );
-
-        return;
-      }
-
-      const value =
-        message?.params?.result?.value;
-
-      if (!value) {
-        return;
-      }
-
-      if (value.err) {
-        return;
-      }
-
-      const signature =
-        value.signature;
-
-      if (!signature) {
-        return;
-      }
-
-      /*
-        Petite attente pour laisser le RPC
-        rendre la transaction disponible.
-      */
-
-      await sleep(20);
-
-      await processSignature(
-        signature
-      );
-
-    } catch (error) {
-      console.error(
-        "🔴 WebSocket message :",
-        error.message
-      );
-    }
-  });
-
-  ws.on("error", error => {
-    console.error(
-      "🔴 WebSocket :",
-      error.message
-    );
-  });
-
-  ws.on("close", () => {
-    console.log(
-      "🟠 WebSocket fermé"
-    );
-
-    wsReady = false;
-
-    if (wsReconnectTimer) {
-      return;
-    }
-
-    wsReconnectTimer =
-      setTimeout(() => {
-        wsReconnectTimer = null;
-
-        if (watchedMint) {
-          startWebSocket();
-        }
-
-      }, 1500);
-  });
 }
 
 // ============================================================
-// DEX LIQUIDITY FALLBACK
+// DEXSCREENER FILET DE SÉCURITÉ
 // ============================================================
 
 async function checkDexLiquidity() {
@@ -1125,88 +1022,37 @@ async function checkDexLiquidity() {
     if (
       price > 0
     ) {
-      highestPrice =
-        highestPrice === null
-          ? price
-          : Math.max(
-              highestPrice,
-              price
-            );
-    }
+      lastPriceUsd =
+        price;
 
-    // chute liquidité
-    if (
-      lastDexLiquidity &&
-      lastDexLiquidity > 0
-    ) {
-      const change =
-        ((liquidity -
-          lastDexLiquidity) /
-          lastDexLiquidity) *
-        100;
-
-      if (change <= -5) {
-        await smartAlert(
-          "DEX_LIQUIDITY_DROP",
-          `
-🚨 <b>BAISSE LIQUIDITÉ</b>
-
-<b>Avant :</b> $${formatUsd(lastDexLiquidity)}
-<b>Maintenant :</b> $${formatUsd(liquidity)}
-
-<b>Variation :</b> ${change.toFixed(2)}%
-
-⚠️ Filet de sécurité DexScreener.
-`,
-          4000
-        );
+      if (
+        highestPrice === null ||
+        price > highestPrice
+      ) {
+        highestPrice =
+          price;
       }
     }
 
-    lastDexLiquidity =
-      liquidity;
+    /*
+      DexScreener n'est PLUS le radar principal.
 
-    // seuils absolus
+      C'est seulement le filet de sécurité.
+    */
+
     if (
-      liquidity > 0 &&
-      liquidity <= 5000
-    ) {
-      await smartAlert(
-        "LIQUIDITY_5K",
-        `
-🚨 <b>LIQUIDITÉ CRITIQUE</b>
-
-💧 <b>$${formatUsd(liquidity)}</b>
-
-Le pool est extrêmement dégradé.
-`,
-        10000
-      );
-
-    } else if (
-      liquidity > 0 &&
-      liquidity <= 20000
-    ) {
-      await smartAlert(
-        "LIQUIDITY_20K",
-        `
-🔴 <b>LIQUIDITÉ TRÈS FAIBLE</b>
-
-💧 <b>$${formatUsd(liquidity)}</b>
-`,
-        15000
-      );
-
-    } else if (
       liquidity > 0 &&
       liquidity <= 50000
     ) {
-      await smartAlert(
-        "LIQUIDITY_50K",
+      await alertOnce(
+        "DEX_LOW",
         `
-🟠 <b>LIQUIDITÉ EN BAISSE</b>
+🔴 <b>LIQUIDITÉ DEX FAIBLE</b>
 
-💧 <b>$${formatUsd(liquidity)}</b>
+<b>Liquidité :</b>
+$${formatUsd(liquidity)}
+
+⚠️ Filet de sécurité.
 `,
         30000
       );
@@ -1214,7 +1060,7 @@ Le pool est extrêmement dégradé.
 
   } catch (error) {
     console.error(
-      "🔴 Liquidity check :",
+      "🔴 Dex check :",
       error.message
     );
   }
@@ -1251,31 +1097,29 @@ async function checkAnaxer() {
       );
 
     if (!response.ok) {
-      throw new Error(
-        `Anaxer HTTP ${response.status}`
-      );
+      return;
     }
 
     const data =
       await response.json();
 
-    const tradesData =
+    const list =
       data.trades ||
       data.data ||
       [];
 
-    if (!Array.isArray(tradesData)) {
+    if (!Array.isArray(list)) {
       return;
     }
 
     const cutoff =
-      Date.now() - 10000;
+      now() - 10000;
 
-    let buy = 0;
-    let sell = 0;
+    let buys = 0;
+    let sells = 0;
 
     for (
-      const trade of tradesData
+      const trade of list
     ) {
       const timestamp =
         new Date(
@@ -1317,42 +1161,48 @@ async function checkAnaxer() {
       if (
         from === watchedMint
       ) {
-        sell += volume;
+        sells += volume;
       }
 
       if (
         to === watchedMint
       ) {
-        buy += volume;
+        buys += volume;
       }
     }
 
     const total =
-      buy + sell;
+      buys + sells;
 
-    if (total <= 0) {
+    if (
+      total <= 0
+    ) {
       return;
     }
 
     const sellPct =
-      (sell / total) * 100;
+      (sells / total) * 100;
 
     if (
       sellPct >= 85
     ) {
-      await smartAlert(
-        "ANAXER_EXTREME",
+      await alertOnce(
+        "ANAXER_SELL",
         `
-🚨 <b>ANAXER : SELL EXTRÊME</b>
+🚨 <b>CONFIRMATION ANAXER</b>
 
-<b>SELL 10s :</b> ${sellPct.toFixed(1)}%
+<b>SELL 10s :</b>
+${sellPct.toFixed(1)}%
 
-<b>SELL :</b> $${formatUsd(sell)}
-<b>BUY :</b> $${formatUsd(buy)}
+<b>SELL :</b>
+$${formatUsd(sells)}
+
+<b>BUY :</b>
+$${formatUsd(buys)}
 
 ⚠️ Confirmation externe du retournement.
 `,
-        8000
+        10000
       );
     }
 
@@ -1368,54 +1218,57 @@ async function checkAnaxer() {
 // STATUS
 // ============================================================
 
-function statusMessage() {
-  const s3 =
-    getStats(3);
+function getStatus() {
+  const stats1 =
+    getFlowStats(1);
 
-  const s5 =
-    getStats(5);
+  const stats3 =
+    getFlowStats(3);
 
-  const s10 =
-    getStats(10);
+  const stats5 =
+    getFlowStats(5);
 
   return `
-📡 <b>RADAR SORTIE</b>
+📡 <b>RADAR SORTIE V2</b>
 
 <b>Token :</b>
 <code>${watchedMint || "Aucun"}</code>
 
 <b>Pool :</b>
-<code>${poolAddress ? shortAddress(poolAddress.toString()) : "N/A"}</code>
+<code>${poolAddress ? shortAddress(poolAddress) : "N/A"}</code>
 
-<b>WebSocket :</b>
-${wsReady ? "🟢 ACTIVE" : "🔴 INACTIVE"}
+<b>WSOL :</b>
+${quoteSubscriptionId !== null ? "🟢 ACTIVE" : "🔴 INACTIVE"}
+
+<b>Vault TOKEN :</b>
+${baseSubscriptionId !== null ? "🟢 ACTIVE" : "🔴 INACTIVE"}
+
+<b>Logs PumpSwap :</b>
+${logsSubscriptionId !== null ? "🟢 ACTIVE" : "🔴 INACTIVE"}
 
 <b>Réserve WSOL :</b>
 ${formatSol(currentQuoteReserve)} SOL
 
-<b>Réserve token :</b>
-${formatSol(currentBaseReserve)}
-
-<b>Liquidité Dex :</b>
+<b>Liquidité DEX :</b>
 $${formatUsd(currentLiquidityUsd)}
 
 <b>Plus haute liquidité :</b>
 $${formatUsd(highestLiquidity)}
 
+<b>SELL 1s :</b>
+${stats1.sellPct.toFixed(1)}%
+
 <b>SELL 3s :</b>
-${s3.sellPct.toFixed(1)}%
+${stats3.sellPct.toFixed(1)}%
 
 <b>SELL 5s :</b>
-${s5.sellPct.toFixed(1)}%
+${stats5.sellPct.toFixed(1)}%
 
-<b>SELL 10s :</b>
-${s10.sellPct.toFixed(1)}%
+<b>Flux SELL 5s :</b>
+${formatSol(stats5.sells)} SOL
 
-<b>Ventes 5s :</b>
-${formatSol(s5.sells)} SOL
-
-<b>Achats 5s :</b>
-${formatSol(s5.buys)} SOL
+<b>Flux BUY 5s :</b>
+${formatSol(stats5.buys)} SOL
 `;
 }
 
@@ -1427,14 +1280,15 @@ async function startWatch(mint) {
   try {
     await stopWatch();
 
-    watchedMint = mint;
+    watchedMint =
+      mint;
 
-    console.log(
-      "🔎 Recherche pool..."
+    await sendTelegram(
+      "🔎 Recherche du pool PumpSwap..."
     );
 
     const found =
-      await findPumpSwapPool(
+      await findPool(
         mint
       );
 
@@ -1481,17 +1335,24 @@ async function startWatch(mint) {
 
     if (!reservesOk) {
       throw new Error(
-        "Impossible de lire les réserves du pool."
+        "Impossible de lire les réserves."
       );
     }
 
-    trades.length = 0;
-    processedSignatures.clear();
+    flowEvents.length = 0;
 
-    lastDexLiquidity = null;
-    lastPrice = calculatePriceSol();
+    /*
+      IMPORTANT :
 
-    startWebSocket();
+      On démarre les trois radars
+      sans getParsedTransaction.
+    */
+
+    await subscribeQuoteVault();
+
+    await subscribeBaseVault();
+
+    await subscribePoolLogs();
 
     dexTimer =
       setInterval(
@@ -1507,7 +1368,15 @@ async function startWatch(mint) {
 
     healthTimer =
       setInterval(
-        checkWebSocketHealth,
+        () => {
+          if (
+            quoteSubscriptionId === null
+          ) {
+            console.log(
+              "⚠️ Quote subscription absente"
+            );
+          }
+        },
         5000
       );
 
@@ -1515,7 +1384,7 @@ async function startWatch(mint) {
 
     await sendTelegram(
       `
-🟢 <b>RADAR ACTIVÉ</b>
+🟢 <b>RADAR SORTIE V2 ACTIVÉ</b>
 
 <b>Token :</b>
 <code>${mint}</code>
@@ -1529,29 +1398,30 @@ $${formatUsd(currentLiquidityUsd)}
 <b>Réserve WSOL :</b>
 ${formatSol(currentQuoteReserve)} SOL
 
-<b>WebSocket :</b>
-🟢 surveillance transactions ACTIVE
+<b>Vault WSOL :</b>
+🟢 ACTIVE
 
-<b>Détection :</b>
-SELL / BUY
-3s / 5s / 10s
-Prix
-Réserve WSOL
-Liquidité
+<b>Vault TOKEN :</b>
+🟢 ACTIVE
 
-📡 Le radar est prêt.
+<b>Logs PumpSwap :</b>
+🟢 ACTIVE
+
+⚡ Détection directe des mouvements de réserve.
+
+⚠️ Aucune attente de getParsedTransaction pour l'alerte principale.
 `
     );
 
   } catch (error) {
     console.error(
-      "❌ Watch :",
-      error
+      "❌ START WATCH :",
+      error.message
     );
 
     await sendTelegram(
       `
-❌ <b>Échec surveillance</b>
+❌ <b>ERREUR RADAR</b>
 
 ${error.message}
 `
@@ -1565,34 +1435,64 @@ ${error.message}
 
 async function stopWatch() {
   if (dexTimer) {
-    clearInterval(dexTimer);
+    clearInterval(
+      dexTimer
+    );
+
     dexTimer = null;
   }
 
   if (anaxerTimer) {
-    clearInterval(anaxerTimer);
+    clearInterval(
+      anaxerTimer
+    );
+
     anaxerTimer = null;
   }
 
   if (healthTimer) {
-    clearInterval(healthTimer);
+    clearInterval(
+      healthTimer
+    );
+
     healthTimer = null;
   }
 
-  if (wsReconnectTimer) {
-    clearTimeout(wsReconnectTimer);
-    wsReconnectTimer = null;
-  }
-
-  if (ws) {
+  if (
+    baseSubscriptionId !== null
+  ) {
     try {
-      ws.close();
+      await connection.removeAccountChangeListener(
+        baseSubscriptionId
+      );
     } catch {}
+
+    baseSubscriptionId = null;
   }
 
-  ws = null;
-  wsReady = false;
-  wsSubscriptionId = null;
+  if (
+    quoteSubscriptionId !== null
+  ) {
+    try {
+      await connection.removeAccountChangeListener(
+        quoteSubscriptionId
+      );
+    } catch {}
+
+    quoteSubscriptionId = null;
+  }
+
+  if (
+    logsSubscriptionId !== null
+  ) {
+    try {
+      await connection.removeOnLogsListener(
+        logsSubscriptionId
+      );
+    } catch {}
+
+    logsSubscriptionId = null;
+  }
 
   watchedMint = null;
 
@@ -1601,99 +1501,97 @@ async function stopWatch() {
   quoteVault = null;
 
   currentLiquidityUsd = null;
-  currentQuoteReserve = null;
+
   currentBaseReserve = null;
+  currentQuoteReserve = null;
+
+  previousBaseReserve = null;
+  previousQuoteReserve = null;
 
   highestLiquidity = 0;
   highestPrice = null;
-  lastPrice = null;
+  lastPriceUsd = null;
 
-  lastDexLiquidity = null;
-
-  trades.length = 0;
-  processedSignatures.clear();
+  flowEvents.length = 0;
 }
 
 // ============================================================
-// HEALTH CHECK
+// COMMANDES
 // ============================================================
 
-async function checkWebSocketHealth() {
-  if (!watchedMint) {
-    return;
-  }
-
-  if (!wsReady) {
-    console.log(
-      "⚠️ WebSocket non connecté"
-    );
-  }
-}
-
-// ============================================================
-// COMMANDES TELEGRAM
-// ============================================================
-
-bot.command("start", async ctx => {
-  await ctx.reply(
-    "📡 Radar PumpSwap prêt.\n\n" +
-    "Utilise :\n" +
-    "/watch TON_MINT\n" +
-    "/status\n" +
-    "/unwatch"
-  );
-});
-
-bot.command("watch", async ctx => {
-  const parts =
-    ctx.message.text
-      .trim()
-      .split(/\s+/);
-
-  const mint =
-    parts[1];
-
-  if (!mint) {
+bot.command(
+  "start",
+  async ctx => {
     await ctx.reply(
-      "❌ Utilisation :\n/watch ADRESSE_DU_TOKEN"
+      "📡 Radar PumpSwap prêt.\n\n" +
+      "/watch ADRESSE_TOKEN\n" +
+      "/status\n" +
+      "/unwatch"
     );
-
-    return;
   }
+);
 
-  try {
-    new PublicKey(mint);
-  } catch {
-    await ctx.reply(
-      "❌ Adresse Solana invalide."
-    );
+bot.command(
+  "watch",
+  async ctx => {
+    const parts =
+      ctx.message.text
+        .trim()
+        .split(/\s+/);
 
-    return;
-  }
+    const mint =
+      parts[1];
 
-  await ctx.reply(
-    "🔎 Analyse du token et recherche du pool..."
-  );
+    if (!mint) {
+      await ctx.reply(
+        "❌ Utilisation : /watch ADRESSE_TOKEN"
+      );
 
-  await startWatch(mint);
-});
-
-bot.command("status", async ctx => {
-  await ctx.reply(
-    statusMessage(),
-    {
-      parse_mode: "HTML"
+      return;
     }
-  );
-});
 
-bot.command("unwatch", async ctx => {
-  await stopWatch();
+    try {
+      new PublicKey(mint);
+    } catch {
+      await ctx.reply(
+        "❌ Adresse Solana invalide."
+      );
 
-  await ctx.reply(
-    "🛑 Surveillance arrêtée."
-  );
-});
+      return;
+    }
+
+    await ctx.reply(
+      "🔎 Initialisation du radar..."
+    );
+
+    await startWatch(
+      mint
+    );
+  }
+);
+
+bot.command(
+  "status",
+  async ctx => {
+    await ctx.reply(
+      getStatus(),
+      {
+        parse_mode: "HTML"
+      }
+    );
+  }
+);
+
+bot.command(
+  "unwatch",
+  async ctx => {
+    await stopWatch();
+
+    await ctx.reply(
+      "🛑 Radar arrêté."
+    );
+  }
+);
 
 // ============================================================
 // LANCEMENT
@@ -1702,7 +1600,7 @@ bot.command("unwatch", async ctx => {
 bot.launch();
 
 console.log(
-  "🤖 Pump Radar lancé."
+  "🤖 Pump Radar V2 lancé."
 );
 
 process.once(
