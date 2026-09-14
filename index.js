@@ -1,39 +1,45 @@
 const fs = require("fs");
 const path = require("path");
 const WebSocket = require("ws");
-const { Connection, PublicKey } = require("@solana/web3.js");
+const {
+  Connection,
+  PublicKey
+} = require("@solana/web3.js");
 const { Telegraf } = require("telegraf");
 
 /*
 ===========================================================
- PUMP TEST BOT V5.2
+ PUMP TEST BOT V5.3
 ===========================================================
 
- STRATEGIE :
+ SIMULATION UNIQUEMENT
 
- - Capital fixe : 10 $
- - Objectif : +5 %
- - Simulation uniquement
- - Pas de wallet
- - Pas de clé privée
- - Pas de transaction réelle
+ Capital :
+   10 $
 
- NOUVEAUTE V5.2 :
+ Objectif :
+   +5 %
 
- - DEX Screener = prix/liquidité secondaire
- - Helius WSS = surveillance directe du pool PumpSwap
- - Surveillance des vaults base + quote
- - Détection :
-      BUY
-      SELL
-      WITHDRAWAL
-      LIQUIDITY ADD
-      RESERVE SHOCK
- - Blocage d'achat après anomalie on-chain
- - Rapport crash Telegram
- - Historique 60 secondes
- - Sauvegarde locale
- - Reconnexion WebSocket
+ Nouveauté majeure :
+
+   V5.2 :
+      DexScreener -> pairAddress -> vérification
+
+   V5.3 :
+      PumpSwap directement
+      ↓
+      recherche des Pool accounts
+      dont baseMint = token
+      ↓
+      vérification quoteMint = WSOL
+      ↓
+      sélection du meilleur pool
+      ↓
+      surveillance directe des vaults
+
+ Aucun wallet.
+ Aucune clé privée.
+ Aucune transaction réelle.
 ===========================================================
 */
 
@@ -46,7 +52,7 @@ const CHAT_ID = process.env.CHAT_ID;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 
 const DEFAULT_MINT =
-  "HjoAZW2wFe4tUmHXwkUsRddiSLq4Ej5JzvM4UBydwaXv";
+  "DJaLFMuqBa4JupES5KzRV5YHLRPMTQM2spm1jurt6Fa9";
 
 const CAPITAL_USD = 10;
 const TARGET_PROFIT = 0.05;
@@ -58,8 +64,11 @@ const CRASH_HISTORY_MS = 60000;
 
 const OBSERVATION_AFTER_SELL_MS = 30000;
 
-const NO_NEW_BUY_AFTER_MS = 43 * 60 * 1000;
-const MAX_SESSION_MS = 45 * 60 * 1000;
+const NO_NEW_BUY_AFTER_MS =
+  43 * 60 * 1000;
+
+const MAX_SESSION_MS =
+  45 * 60 * 1000;
 
 // Entrée
 const MIN_LIQUIDITY_USD = 3000;
@@ -71,22 +80,23 @@ const ENTRY_PRICE_DROP_10S = -0.04;
 const ENTRY_LIQ_DROP_10S = -0.10;
 const ENTRY_LIQ_DROP_30S = -0.15;
 
-// Crash DEX
+// Crash
 const CRASH_PRICE_DROP_10S = -0.20;
 const CRASH_LIQ_DROP_10S = -0.50;
 const CRASH_MIN_LIQUIDITY = 1;
 
 // On-chain
 const ONCHAIN_BATCH_MS = 80;
-
-const ONCHAIN_WITHDRAWAL_BLOCK_MS = 30000;
+const ONCHAIN_BLOCK_MS = 30000;
 
 const ONCHAIN_RESERVE_SHOCK_5S = -0.05;
-const ONCHAIN_RESERVE_SHOCK_10S = -0.10;
 
 const ONCHAIN_MIN_CHANGE_SOL = 0.01;
 
-// PumpSwap
+// ========================================================
+// PROGRAMMES
+// ========================================================
+
 const PUMPSWAP_PROGRAM =
   "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
@@ -94,7 +104,7 @@ const WSOL_MINT =
   "So11111111111111111111111111111111111111112";
 
 // ========================================================
-// PATHS
+// DATA
 // ========================================================
 
 const DATA_DIR =
@@ -103,36 +113,68 @@ const DATA_DIR =
     : path.join(__dirname, "data");
 
 if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.mkdirSync(DATA_DIR, {
+    recursive: true
+  });
 }
 
 const MARKET_FILE =
-  path.join(DATA_DIR, "market_history.jsonl");
+  path.join(
+    DATA_DIR,
+    "market_history.jsonl"
+  );
 
 const TRADES_FILE =
-  path.join(DATA_DIR, "trade_history.json");
+  path.join(
+    DATA_DIR,
+    "trade_history.json"
+  );
 
 const CRASH_FILE =
-  path.join(DATA_DIR, "crash_reports.json");
+  path.join(
+    DATA_DIR,
+    "crash_reports.json"
+  );
 
 const SUMMARY_FILE =
-  path.join(DATA_DIR, "v52_summary.json");
+  path.join(
+    DATA_DIR,
+    "v53_summary.json"
+  );
+
+// ========================================================
+// CHECK ENV
+// ========================================================
+
+if (!BOT_TOKEN) {
+  console.error(
+    "❌ BOT_TOKEN manquant."
+  );
+  process.exit(1);
+}
+
+if (!CHAT_ID) {
+  console.error(
+    "❌ CHAT_ID manquant."
+  );
+  process.exit(1);
+}
+
+if (!HELIUS_API_KEY) {
+  console.error(
+    "❌ HELIUS_API_KEY manquant."
+  );
+  process.exit(1);
+}
 
 // ========================================================
 // TELEGRAM
 // ========================================================
 
-if (!BOT_TOKEN || !CHAT_ID) {
-  console.error("❌ BOT_TOKEN ou CHAT_ID manquant.");
-  process.exit(1);
-}
-
-if (!HELIUS_API_KEY) {
-  console.error("❌ HELIUS_API_KEY manquant.");
-  process.exit(1);
-}
-
-const bot = new Telegraf(BOT_TOKEN);
+const bot =
+  new Telegraf(
+    BOT_TOKEN
+  );
 
 // ========================================================
 // SOLANA
@@ -144,16 +186,22 @@ const RPC_URL =
 const WSS_URL =
   `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
-const connection = new Connection(RPC_URL, {
-  commitment: "processed",
-});
+const connection =
+  new Connection(
+    RPC_URL,
+    {
+      commitment: "processed"
+    }
+  );
 
 // ========================================================
-// ETAT
+// STATE
 // ========================================================
 
 let running = false;
-let mint = DEFAULT_MINT;
+
+let mint =
+  DEFAULT_MINT;
 
 let marketTimer = null;
 let sessionTimer = null;
@@ -175,24 +223,18 @@ let favorableConfirmations = 0;
 
 let healthScore = 100;
 
-let lastMarketData = null;
-
 let marketHistory = [];
 let onchainHistory = [];
 
-let crashReports = [];
 let tradeHistory = [];
+let crashReports = [];
 
 // ========================================================
-// ON-CHAIN STATE
+// POOL STATE
 // ========================================================
-
-let ws = null;
-
-let wsReconnectTimer = null;
-let wsReconnectAttempts = 0;
 
 let poolAddress = null;
+
 let baseVaultAddress = null;
 let quoteVaultAddress = null;
 
@@ -201,135 +243,55 @@ let poolQuoteMint = null;
 
 let virtualQuoteReserves = 0n;
 
+let selectedPoolQuoteReserve = 0n;
+
+// ========================================================
+// WEBSOCKET
+// ========================================================
+
+let ws = null;
+
+let wsReconnectTimer = null;
+let wsReconnectAttempts = 0;
+
+let onchainBatchTimer = null;
+
+let wsBaseSubscriptionId = null;
+let wsQuoteSubscriptionId = null;
+let wsPoolSubscriptionId = null;
+
+// ========================================================
+// VAULT STATE
+// ========================================================
+
 let baseVaultState = {
   amount: null,
-  slot: null,
+  slot: null
 };
 
 let quoteVaultState = {
   amount: null,
-  slot: null,
+  slot: null
 };
 
 let lastProcessedVaults = {
   base: null,
-  quote: null,
+  quote: null
 };
 
-let onchainBatchTimer = null;
-
 let lastOnchainEvent = null;
+let lastOnchainRisk = null;
 
 let onchainBlockedUntil = 0;
 
-let lastOnchainRisk = null;
-
 // ========================================================
-// LOAD DATA
-// ========================================================
-
-function loadJson(file, fallback) {
-  try {
-    if (!fs.existsSync(file)) {
-      return fallback;
-    }
-
-    return JSON.parse(
-      fs.readFileSync(file, "utf8")
-    );
-  } catch (error) {
-    console.error(
-      `⚠️ Impossible de lire ${file}:`,
-      error.message
-    );
-
-    return fallback;
-  }
-}
-
-tradeHistory =
-  loadJson(TRADES_FILE, []);
-
-crashReports =
-  loadJson(CRASH_FILE, []);
-
-const summary =
-  loadJson(SUMMARY_FILE, {
-    totalProfit: 0,
-  });
-
-totalProfit =
-  Number(summary.totalProfit || 0);
-
-// ========================================================
-// SAVE
-// ========================================================
-
-function saveJson(file, data) {
-  try {
-    fs.writeFileSync(
-      file,
-      JSON.stringify(data, null, 2)
-    );
-  } catch (error) {
-    console.error(
-      `❌ Erreur sauvegarde ${file}:`,
-      error.message
-    );
-  }
-}
-
-function appendMarketPoint(point) {
-  try {
-    fs.appendFileSync(
-      MARKET_FILE,
-      JSON.stringify(point) + "\n"
-    );
-  } catch (error) {
-    console.error(
-      "❌ Erreur market_history:",
-      error.message
-    );
-  }
-}
-
-function saveSummary() {
-  saveJson(
-    SUMMARY_FILE,
-    {
-      updatedAt: new Date().toISOString(),
-      mint,
-      totalProfit,
-      cyclesCompleted: cycleNumber,
-      sessionStart,
-    }
-  );
-}
-
-// ========================================================
-// TELEGRAM HELPERS
-// ========================================================
-
-async function telegram(message) {
-  try {
-    await bot.telegram.sendMessage(
-      CHAT_ID,
-      message
-    );
-  } catch (error) {
-    console.error(
-      "❌ Telegram:",
-      error.message
-    );
-  }
-}
-
-// ========================================================
-// FORMAT
+// UTILS
 // ========================================================
 
 function shortMint(value) {
-  if (!value) return "???";
+  if (!value) {
+    return "???";
+  }
 
   return (
     value.slice(0, 6) +
@@ -343,7 +305,10 @@ function money(value) {
     return "N/A";
   }
 
-  return `$${value.toFixed(4)}`;
+  return (
+    "$" +
+    value.toFixed(4)
+  );
 }
 
 function pct(value) {
@@ -351,7 +316,10 @@ function pct(value) {
     return "N/A";
   }
 
-  return `${value.toFixed(2)}%`;
+  return (
+    value.toFixed(2) +
+    "%"
+  );
 }
 
 function formatPrice(value) {
@@ -359,9 +327,136 @@ function formatPrice(value) {
     return "N/A";
   }
 
-  return value < 0.001
-    ? value.toFixed(10)
-    : value.toFixed(8);
+  if (value < 0.001) {
+    return value.toFixed(10);
+  }
+
+  return value.toFixed(8);
+}
+
+function sleep(ms) {
+  return new Promise(
+    resolve =>
+      setTimeout(
+        resolve,
+        ms
+      )
+  );
+}
+
+// ========================================================
+// FILES
+// ========================================================
+
+function loadJson(
+  file,
+  fallback
+) {
+  try {
+    if (!fs.existsSync(file)) {
+      return fallback;
+    }
+
+    return JSON.parse(
+      fs.readFileSync(
+        file,
+        "utf8"
+      )
+    );
+  } catch {
+    return fallback;
+  }
+}
+
+function saveJson(
+  file,
+  data
+) {
+  try {
+    fs.writeFileSync(
+      file,
+      JSON.stringify(
+        data,
+        null,
+        2
+      )
+    );
+  } catch (error) {
+    console.error(
+      "❌ Sauvegarde:",
+      error.message
+    );
+  }
+}
+
+function appendMarketPoint(
+  point
+) {
+  try {
+    fs.appendFileSync(
+      MARKET_FILE,
+      JSON.stringify(point) +
+        "\n"
+    );
+  } catch (error) {
+    console.error(
+      "❌ market_history:",
+      error.message
+    );
+  }
+}
+
+function saveSummary() {
+  saveJson(
+    SUMMARY_FILE,
+    {
+      updatedAt:
+        new Date().toISOString(),
+
+      mint,
+
+      totalProfit,
+
+      cyclesCompleted:
+        cycleNumber,
+
+      sessionStart,
+
+      poolAddress
+    }
+  );
+}
+
+tradeHistory =
+  loadJson(
+    TRADES_FILE,
+    []
+  );
+
+crashReports =
+  loadJson(
+    CRASH_FILE,
+    []
+  );
+
+// ========================================================
+// TELEGRAM
+// ========================================================
+
+async function telegram(
+  message
+) {
+  try {
+    await bot.telegram.sendMessage(
+      CHAT_ID,
+      message
+    );
+  } catch (error) {
+    console.error(
+      "❌ Telegram:",
+      error.message
+    );
+  }
 }
 
 // ========================================================
@@ -387,8 +482,9 @@ async function getMarketData() {
 
     if (
       !data ||
-      !Array.isArray(data.pairs) ||
-      data.pairs.length === 0
+      !Array.isArray(
+        data.pairs
+      )
     ) {
       return null;
     }
@@ -396,58 +492,86 @@ async function getMarketData() {
     const pumpPairs =
       data.pairs.filter(
         pair =>
-          String(pair.dexId || "")
-            .toLowerCase() ===
+          String(
+            pair.dexId || ""
+          ).toLowerCase() ===
           "pumpswap"
       );
 
-    if (pumpPairs.length === 0) {
+    if (
+      pumpPairs.length === 0
+    ) {
       return null;
     }
 
     pumpPairs.sort(
       (a, b) =>
-        Number(b.liquidity?.usd || 0) -
-        Number(a.liquidity?.usd || 0)
+        Number(
+          b.liquidity?.usd || 0
+        ) -
+        Number(
+          a.liquidity?.usd || 0
+        )
     );
 
     const pair =
       pumpPairs[0];
 
     const price =
-      Number(pair.priceUsd || 0);
+      Number(
+        pair.priceUsd || 0
+      );
 
     const liquidity =
-      Number(pair.liquidity?.usd || 0);
+      Number(
+        pair.liquidity?.usd || 0
+      );
 
     if (
-      !Number.isFinite(price) ||
+      !Number.isFinite(
+        price
+      ) ||
       price <= 0
     ) {
       return null;
     }
 
     return {
-      timestamp: Date.now(),
+      timestamp:
+        Date.now(),
+
       price,
+
       liquidity,
+
       pairAddress:
-        pair.pairAddress || null,
+        pair.pairAddress ||
+        null,
 
       volume24h:
-        Number(pair.volume?.h24 || 0),
+        Number(
+          pair.volume?.h24 || 0
+        ),
 
       buys5m:
-        Number(pair.txns?.m5?.buys || 0),
+        Number(
+          pair.txns?.m5?.buys || 0
+        ),
 
       sells5m:
-        Number(pair.txns?.m5?.sells || 0),
+        Number(
+          pair.txns?.m5?.sells || 0
+        ),
 
       priceChange5m:
-        Number(pair.priceChange?.m5 || 0),
+        Number(
+          pair.priceChange?.m5 || 0
+        ),
 
       priceChange1h:
-        Number(pair.priceChange?.h1 || 0),
+        Number(
+          pair.priceChange?.h1 || 0
+        )
     };
 
   } catch (error) {
@@ -461,50 +585,52 @@ async function getMarketData() {
 }
 
 // ========================================================
-// HISTORY HELPERS
+// HISTORY
 // ========================================================
 
 function cleanupHistory() {
   const cutoff =
-    Date.now() - HISTORY_MS;
+    Date.now() -
+    HISTORY_MS;
 
   marketHistory =
     marketHistory.filter(
-      x => x.timestamp >= cutoff
+      x =>
+        x.timestamp >=
+        cutoff
     );
-
-  const onchainCutoff =
-    Date.now() - HISTORY_MS;
 
   onchainHistory =
     onchainHistory.filter(
-      x => x.timestamp >= onchainCutoff
+      x =>
+        x.timestamp >=
+        cutoff
     );
 }
 
-function getPreviousPoint(msAgo) {
+function getPreviousPoint(
+  msAgo
+) {
   const target =
-    Date.now() - msAgo;
-
-  let best = null;
+    Date.now() -
+    msAgo;
 
   for (
-    let i = marketHistory.length - 1;
+    let i =
+      marketHistory.length - 1;
     i >= 0;
     i--
   ) {
-    const point =
-      marketHistory[i];
-
     if (
-      point.timestamp <= target
+      marketHistory[i]
+        .timestamp <=
+      target
     ) {
-      best = point;
-      break;
+      return marketHistory[i];
     }
   }
 
-  return best;
+  return null;
 }
 
 function percentageChange(
@@ -512,8 +638,12 @@ function percentageChange(
   previous
 ) {
   if (
-    !Number.isFinite(current) ||
-    !Number.isFinite(previous) ||
+    !Number.isFinite(
+      current
+    ) ||
+    !Number.isFinite(
+      previous
+    ) ||
     previous <= 0
   ) {
     return null;
@@ -525,64 +655,53 @@ function percentageChange(
   );
 }
 
-// ========================================================
-// DEX METRICS
-// ========================================================
-
 function getDexMetrics() {
-  const previous10 =
-    getPreviousPoint(10000);
+  const p10 =
+    getPreviousPoint(
+      10000
+    );
 
-  const previous30 =
-    getPreviousPoint(30000);
-
-  const price10 =
-    previous10
-      ? percentageChange(
-          currentPrice,
-          previous10.price
-        )
-      : null;
-
-  const price30 =
-    previous30
-      ? percentageChange(
-          currentPrice,
-          previous30.price
-        )
-      : null;
-
-  const liquidity10 =
-    previous10
-      ? percentageChange(
-          currentLiquidity,
-          previous10.liquidity
-        )
-      : null;
-
-  const liquidity30 =
-    previous30
-      ? percentageChange(
-          currentLiquidity,
-          previous30.liquidity
-        )
-      : null;
+  const p30 =
+    getPreviousPoint(
+      30000
+    );
 
   return {
-    price10,
-    price30,
-    liquidity10,
-    liquidity30,
+    price10:
+      p10
+        ? percentageChange(
+            currentPrice,
+            p10.price
+          )
+        : null,
+
+    liquidity10:
+      p10
+        ? percentageChange(
+            currentLiquidity,
+            p10.liquidity
+          )
+        : null,
+
+    liquidity30:
+      p30
+        ? percentageChange(
+            currentLiquidity,
+            p30.liquidity
+          )
+        : null
   };
 }
 
 // ========================================================
-// HEALTH SCORE
+// HEALTH
 // ========================================================
 
 function calculateHealthScore() {
   if (
-    !Number.isFinite(currentLiquidity) ||
+    !Number.isFinite(
+      currentLiquidity
+    ) ||
     currentLiquidity <= 0
   ) {
     return 0;
@@ -628,9 +747,9 @@ function calculateHealthScore() {
     score -= 20;
   }
 
-  // Anomaly on-chain
   if (
-    Date.now() < onchainBlockedUntil
+    Date.now() <
+    onchainBlockedUntil
   ) {
     score -= 40;
   }
@@ -646,24 +765,31 @@ function calculateHealthScore() {
 
   return Math.max(
     0,
-    Math.min(100, score)
+    Math.min(
+      100,
+      score
+    )
   );
 }
 
 // ========================================================
-// ENTRY FILTER
+// ENTRY
 // ========================================================
 
 function entryHealthy() {
   if (
-    !Number.isFinite(currentPrice) ||
+    !Number.isFinite(
+      currentPrice
+    ) ||
     currentPrice <= 0
   ) {
     return false;
   }
 
   if (
-    !Number.isFinite(currentLiquidity) ||
+    !Number.isFinite(
+      currentLiquidity
+    ) ||
     currentLiquidity <
       MIN_LIQUIDITY_USD
   ) {
@@ -739,13 +865,17 @@ function entryHealthy() {
 }
 
 // ========================================================
-// CRASH DETECTION
+// CRASH
 // ========================================================
 
 function detectCrash() {
   if (
-    !Number.isFinite(currentPrice) ||
-    !Number.isFinite(currentLiquidity)
+    !Number.isFinite(
+      currentPrice
+    ) ||
+    !Number.isFinite(
+      currentLiquidity
+    )
   ) {
     return null;
   }
@@ -771,7 +901,8 @@ function detectCrash() {
   ) {
     reasons.push(
       `liquidité ${pct(
-        metrics.liquidity10 * 100
+        metrics.liquidity10 *
+          100
       )} / 10s`
     );
   }
@@ -783,12 +914,12 @@ function detectCrash() {
   ) {
     reasons.push(
       `prix ${pct(
-        metrics.price10 * 100
+        metrics.price10 *
+          100
       )} / 10s`
     );
   }
 
-  // Signal on-chain critique
   if (
     lastOnchainRisk &&
     lastOnchainRisk.level ===
@@ -799,18 +930,20 @@ function detectCrash() {
     );
   }
 
-  if (reasons.length === 0) {
+  if (
+    reasons.length === 0
+  ) {
     return null;
   }
 
   return {
     reasons,
-    metrics,
+    metrics
   };
 }
 
 // ========================================================
-// PUMPSWAP POOL DECODER
+// PUBLIC KEY
 // ========================================================
 
 function readPubkey(
@@ -818,9 +951,8 @@ function readPubkey(
   offset
 ) {
   if (
-    !buffer ||
     buffer.length <
-      offset + 32
+    offset + 32
   ) {
     return null;
   }
@@ -833,83 +965,125 @@ function readPubkey(
   );
 }
 
-function readU64LE(
-  buffer,
-  offset
-) {
-  if (
-    !buffer ||
-    buffer.length <
-      offset + 8
-  ) {
-    return null;
-  }
-
-  return buffer.readBigUInt64LE(
-    offset
-  );
-}
+// ========================================================
+// SIGNED I128
+// ========================================================
 
 function readI128LE(
   buffer,
   offset
 ) {
   if (
-    !buffer ||
     buffer.length <
-      offset + 16
+    offset + 16
   ) {
     return 0n;
   }
 
-  return buffer.readBigInt64LE(offset) +
-    (buffer.readBigInt64LE(offset + 8) << 64n);
+  let value = 0n;
+
+  for (
+    let i = 0;
+    i < 16;
+    i++
+  ) {
+    value |=
+      BigInt(
+        buffer[
+          offset + i
+        ]
+      ) <<
+      BigInt(
+        8 * i
+      );
+  }
+
+  const sign =
+    1n << 127n;
+
+  const mask =
+    (1n << 128n) - 1n;
+
+  if (
+    value & sign
+  ) {
+    value =
+      -(
+        (~value & mask) +
+        1n
+      );
+  }
+
+  return value;
 }
 
-/*
- PumpSwap Pool layout:
+// ========================================================
+// POOL DECODER
+// ========================================================
 
- discriminator              0-8
- bump                       8
- index                      9-11
- creator                   11-43
- base_mint                 43-75
- quote_mint                75-107
- lp_mint                   107-139
- pool_base_token_account   139-171
- pool_quote_token_account  171-203
- lp_supply                 203-211
- coin_creator              211-243
- is_mayhem_mode            243
- is_cashback_coin          244
- virtual_quote_reserves    245-261
-*/
+function decodePool(
+  buffer
+) {
+  /*
+    PumpSwap Pool
 
-function decodePool(buffer) {
+    discriminator: 0-8
+    bump: 8
+    index: 9-11
+    creator: 11-43
+    base_mint: 43-75
+    quote_mint: 75-107
+    lp_mint: 107-139
+    pool_base_token_account: 139-171
+    pool_quote_token_account: 171-203
+    lp_supply: 203-211
+    coin_creator: 211-243
+    is_mayhem_mode: 243
+    is_cashback_coin: 244
+    virtual_quote_reserves: 245-261
+  */
+
   if (
-    !Buffer.isBuffer(buffer) ||
+    !Buffer.isBuffer(
+      buffer
+    ) ||
     buffer.length < 203
   ) {
     throw new Error(
-      "Données Pool PumpSwap trop courtes."
+      "Compte Pool trop court."
     );
   }
 
   const baseMint =
-    readPubkey(buffer, 43);
+    readPubkey(
+      buffer,
+      43
+    );
 
   const quoteMint =
-    readPubkey(buffer, 75);
+    readPubkey(
+      buffer,
+      75
+    );
 
   const baseVault =
-    readPubkey(buffer, 139);
+    readPubkey(
+      buffer,
+      139
+    );
 
   const quoteVault =
-    readPubkey(buffer, 171);
+    readPubkey(
+      buffer,
+      171
+    );
 
   const virtualQuote =
     buffer.length >= 261
-      ? readI128LE(buffer, 245)
+      ? readI128LE(
+          buffer,
+          245
+        )
       : 0n;
 
   return {
@@ -926,110 +1100,283 @@ function decodePool(buffer) {
       quoteVault?.toBase58(),
 
     virtualQuoteReserves:
-      virtualQuote,
+      virtualQuote
   };
 }
 
 // ========================================================
-// VERIFY POOL
+// DISCOVERY PUMPSWAP
 // ========================================================
 
-async function loadPool(poolAddressCandidate) {
-  if (!poolAddressCandidate) {
-    return null;
-  }
+async function discoverPumpSwapPools() {
+  console.log(
+    "🔎 Recherche directe des pools PumpSwap..."
+  );
 
   try {
-    const poolPk =
+    const tokenPk =
       new PublicKey(
-        poolAddressCandidate
+        mint
       );
 
-    const account =
-      await connection.getAccountInfo(
-        poolPk,
-        "processed"
+    /*
+     IMPORTANT :
+
+     On ne dépend plus de pairAddress.
+
+     On demande directement au programme
+     PumpSwap les comptes dont :
+
+       offset 43 = baseMint
+
+     C'est précisément le champ base_mint
+     du compte Pool.
+    */
+
+    const accounts =
+      await connection.getProgramAccounts(
+        new PublicKey(
+          PUMPSWAP_PROGRAM
+        ),
+        {
+          commitment:
+            "processed",
+
+          filters: [
+            {
+              memcmp: {
+                offset: 43,
+                bytes:
+                  tokenPk.toBase58()
+              }
+            }
+          ]
+        }
       );
 
-    if (!account) {
-      throw new Error(
-        "Compte pool introuvable."
-      );
-    }
-
-    const owner =
-      account.owner.toBase58();
+    console.log(
+      `🔎 ${accounts.length} pool(s) PumpSwap trouvé(s).`
+    );
 
     if (
-      owner !== PUMPSWAP_PROGRAM
+      accounts.length === 0
     ) {
-      throw new Error(
-        `Owner inattendu: ${owner}`
+      console.log(
+        "❌ Aucun pool PumpSwap avec ce baseMint."
       );
+
+      return null;
     }
 
-    const decoded =
-      decodePool(account.data);
+    const candidates = [];
+
+    for (
+      const account of accounts
+    ) {
+      try {
+        const decoded =
+          decodePool(
+            account.account.data
+          );
+
+        const address =
+          account.pubkey.toBase58();
+
+        console.log(
+          `🔍 Pool ${shortMint(address)}`
+        );
+
+        console.log(
+          `   base : ${shortMint(
+            decoded.baseMint
+          )}`
+        );
+
+        console.log(
+          `   quote : ${shortMint(
+            decoded.quoteMint
+          )}`
+        );
+
+        if (
+          decoded.baseMint !==
+          mint
+        ) {
+          console.log(
+            "   ❌ baseMint différent"
+          );
+
+          continue;
+        }
+
+        if (
+          decoded.quoteMint !==
+          WSOL_MINT
+        ) {
+          console.log(
+            "   ❌ quote différent de WSOL"
+          );
+
+          continue;
+        }
+
+        if (
+          !decoded.baseVault ||
+          !decoded.quoteVault
+        ) {
+          console.log(
+            "   ❌ vault manquant"
+          );
+
+          continue;
+        }
+
+        /*
+         On lit la réserve quote
+         pour choisir le pool le plus
+         liquide si plusieurs existent.
+        */
+
+        let quoteReserve =
+          0n;
+
+        try {
+          const vault =
+            await connection.getAccountInfo(
+              new PublicKey(
+                decoded.quoteVault
+              ),
+              "processed"
+            );
+
+          if (
+            vault &&
+            vault.data.length >= 72
+          ) {
+            quoteReserve =
+              vault.data.readBigUInt64LE(
+                64
+              );
+          }
+        } catch {}
+
+        candidates.push({
+          address,
+          decoded,
+          quoteReserve
+        });
+
+        console.log(
+          "   ✅ CANDIDAT VALIDE"
+        );
+
+      } catch (error) {
+        console.log(
+          "   ❌ Pool illisible :",
+          error.message
+        );
+      }
+    }
 
     if (
-      decoded.baseMint !== mint
+      candidates.length === 0
     ) {
-      throw new Error(
-        "Le base mint du pool ne correspond pas au token."
+      console.log(
+        "❌ Aucun pool PumpSwap WSOL valide."
       );
+
+      return null;
     }
 
-    if (
-      decoded.quoteMint !== WSOL_MINT
-    ) {
-      throw new Error(
-        "Pool non pairé avec WSOL."
-      );
-    }
+    /*
+     Meilleur pool =
+     plus grosse réserve WSOL.
+    */
+
+    candidates.sort(
+      (a, b) => {
+        if (
+          a.quoteReserve ===
+          b.quoteReserve
+        ) {
+          return 0;
+        }
+
+        return a.quoteReserve >
+          b.quoteReserve
+          ? -1
+          : 1;
+      }
+    );
+
+    const selected =
+      candidates[0];
 
     poolAddress =
-      poolAddressCandidate;
-
-    baseVaultAddress =
-      decoded.baseVault;
-
-    quoteVaultAddress =
-      decoded.quoteVault;
+      selected.address;
 
     poolBaseMint =
-      decoded.baseMint;
+      selected.decoded.baseMint;
 
     poolQuoteMint =
-      decoded.quoteMint;
+      selected.decoded.quoteMint;
+
+    baseVaultAddress =
+      selected.decoded.baseVault;
+
+    quoteVaultAddress =
+      selected.decoded.quoteVault;
 
     virtualQuoteReserves =
-      decoded.virtualQuoteReserves;
+      selected.decoded
+        .virtualQuoteReserves;
+
+    selectedPoolQuoteReserve =
+      selected.quoteReserve;
 
     console.log(
-      "⛓️ Pool PumpSwap validé."
+      ""
     );
 
     console.log(
-      `Pool : ${poolAddress}`
+      "✅ POOL PUMPSWAP SÉLECTIONNÉ"
     );
 
     console.log(
-      `Base vault : ${baseVaultAddress}`
+      `⛓️ Pool : ${poolAddress}`
     );
 
     console.log(
-      `Quote vault : ${quoteVaultAddress}`
+      `🪙 Base : ${poolBaseMint}`
     );
 
     console.log(
-      `Virtual quote : ${virtualQuoteReserves.toString()}`
+      `💧 Base vault : ${baseVaultAddress}`
     );
 
-    return decoded;
+    console.log(
+      `💧 Quote vault : ${quoteVaultAddress}`
+    );
+
+    console.log(
+      `💧 Réserve quote : ${
+        Number(
+          selectedPoolQuoteReserve
+        ) / 1e9
+      } SOL`
+    );
+
+    console.log(
+      `🧮 Virtual quote : ${
+        virtualQuoteReserves.toString()
+      }`
+    );
+
+    return selected;
 
   } catch (error) {
     console.error(
-      "❌ Vérification pool:",
+      "❌ Recherche pools PumpSwap:",
       error.message
     );
 
@@ -1038,10 +1385,12 @@ async function loadPool(poolAddressCandidate) {
 }
 
 // ========================================================
-// TOKEN ACCOUNT DECODER
+// TOKEN ACCOUNT
 // ========================================================
 
-function decodeTokenAmount(base64) {
+function decodeTokenAmount(
+  base64
+) {
   try {
     const buffer =
       Buffer.from(
@@ -1065,30 +1414,123 @@ function decodeTokenAmount(base64) {
 }
 
 // ========================================================
-// ONCHAIN WS
+// INITIAL VAULT STATE
 // ========================================================
 
-function resetOnchainState() {
-  baseVaultState = {
-    amount: null,
-    slot: null,
-  };
+async function initializeVaultState() {
+  if (
+    !baseVaultAddress ||
+    !quoteVaultAddress
+  ) {
+    return false;
+  }
 
-  quoteVaultState = {
-    amount: null,
-    slot: null,
-  };
+  try {
+    const accounts =
+      await connection.getMultipleAccountsInfo(
+        [
+          new PublicKey(
+            baseVaultAddress
+          ),
 
-  lastProcessedVaults = {
-    base: null,
-    quote: null,
-  };
+          new PublicKey(
+            quoteVaultAddress
+          )
+        ],
+        "processed"
+      );
 
-  lastOnchainEvent = null;
+    if (
+      !accounts ||
+      accounts.length !== 2 ||
+      !accounts[0] ||
+      !accounts[1]
+    ) {
+      return false;
+    }
+
+    if (
+      accounts[0].data.length < 72 ||
+      accounts[1].data.length < 72
+    ) {
+      return false;
+    }
+
+    const baseAmount =
+      accounts[0].data.readBigUInt64LE(
+        64
+      );
+
+    const quoteAmount =
+      accounts[1].data.readBigUInt64LE(
+        64
+      );
+
+    const slot =
+      await connection.getSlot(
+        "processed"
+      );
+
+    baseVaultState = {
+      amount:
+        baseAmount,
+      slot
+    };
+
+    quoteVaultState = {
+      amount:
+        quoteAmount,
+      slot
+    };
+
+    lastProcessedVaults = {
+      base:
+        baseAmount,
+
+      quote:
+        quoteAmount
+    };
+
+    console.log(
+      "⛓️ Réserves initiales chargées."
+    );
+
+    console.log(
+      `   Base : ${
+        Number(
+          baseAmount
+        ) / 1e9
+      }`
+    );
+
+    console.log(
+      `   Quote : ${
+        Number(
+          quoteAmount
+        ) / 1e9
+      } SOL`
+    );
+
+    return true;
+
+  } catch (error) {
+    console.error(
+      "❌ Initialisation vaults:",
+      error.message
+    );
+
+    return false;
+  }
 }
 
+// ========================================================
+// WS CLOSE
+// ========================================================
+
 function closeOnchainWs() {
-  if (onchainBatchTimer) {
+  if (
+    onchainBatchTimer
+  ) {
     clearTimeout(
       onchainBatchTimer
     );
@@ -1104,30 +1546,53 @@ function closeOnchainWs() {
 
     ws = null;
   }
+
+  wsBaseSubscriptionId =
+    null;
+
+  wsQuoteSubscriptionId =
+    null;
+
+  wsPoolSubscriptionId =
+    null;
 }
 
+// ========================================================
+// WS BATCH
+// ========================================================
+
 function scheduleOnchainBatch() {
-  if (onchainBatchTimer) {
+  if (
+    onchainBatchTimer
+  ) {
     return;
   }
 
   onchainBatchTimer =
-    setTimeout(() => {
-      onchainBatchTimer = null;
+    setTimeout(
+      () => {
+        onchainBatchTimer =
+          null;
 
-      processOnchainBatch();
-
-    }, ONCHAIN_BATCH_MS);
+        processOnchainBatch();
+      },
+      ONCHAIN_BATCH_MS
+    );
 }
 
+// ========================================================
+// WS VAULT MESSAGE
+// ========================================================
+
 function handleVaultNotification(
-  vaultType,
+  type,
   result
 ) {
   try {
     const slot =
       Number(
-        result.context?.slot || 0
+        result.context?.slot ||
+        0
       );
 
     const value =
@@ -1136,38 +1601,39 @@ function handleVaultNotification(
     if (
       !value ||
       !value.data ||
-      !Array.isArray(value.data)
+      !Array.isArray(
+        value.data
+      )
     ) {
       return;
     }
 
-    const encoded =
-      value.data[0];
-
     const amount =
       decodeTokenAmount(
-        encoded
+        value.data[0]
       );
 
-    if (amount === null) {
+    if (
+      amount === null
+    ) {
       return;
     }
 
     if (
-      vaultType === "base"
+      type === "base"
     ) {
       baseVaultState = {
         amount,
-        slot,
+        slot
       };
     }
 
     if (
-      vaultType === "quote"
+      type === "quote"
     ) {
       quoteVaultState = {
         amount,
-        slot,
+        slot
       };
     }
 
@@ -1175,14 +1641,14 @@ function handleVaultNotification(
 
   } catch (error) {
     console.error(
-      "⚠️ Vault notification:",
+      "⚠️ Vault message:",
       error.message
     );
   }
 }
 
 // ========================================================
-// ONCHAIN CLASSIFICATION
+// CLASSIFICATION
 // ========================================================
 
 function classifyOnchainDelta(
@@ -1190,27 +1656,36 @@ function classifyOnchainDelta(
   deltaQuote
 ) {
   const baseSol =
-    Number(deltaBase) / 1e9;
+    Number(
+      deltaBase
+    ) / 1e9;
 
   const quoteSol =
-    Number(deltaQuote) / 1e9;
-
-  const absBase =
-    Math.abs(baseSol);
-
-  const absQuote =
-    Math.abs(quoteSol);
+    Number(
+      deltaQuote
+    ) / 1e9;
 
   if (
-    absBase < ONCHAIN_MIN_CHANGE_SOL &&
-    absQuote < ONCHAIN_MIN_CHANGE_SOL
+    Math.abs(
+      baseSol
+    ) < ONCHAIN_MIN_CHANGE_SOL &&
+    Math.abs(
+      quoteSol
+    ) < ONCHAIN_MIN_CHANGE_SOL
   ) {
     return {
       type: "SMALL",
       baseSol,
-      quoteSol,
+      quoteSol
     };
   }
+
+  /*
+   BUY :
+
+      pool token base augmente
+      pool WSOL quote diminue
+  */
 
   if (
     deltaBase > 0n &&
@@ -1219,9 +1694,16 @@ function classifyOnchainDelta(
     return {
       type: "BUY",
       baseSol,
-      quoteSol,
+      quoteSol
     };
   }
+
+  /*
+   SELL :
+
+      pool token base diminue
+      pool WSOL quote augmente
+  */
 
   if (
     deltaBase < 0n &&
@@ -1230,9 +1712,15 @@ function classifyOnchainDelta(
     return {
       type: "SELL",
       baseSol,
-      quoteSol,
+      quoteSol
     };
   }
+
+  /*
+   RETRAIT :
+
+      les deux réserves diminuent
+  */
 
   if (
     deltaBase < 0n &&
@@ -1241,9 +1729,15 @@ function classifyOnchainDelta(
     return {
       type: "WITHDRAWAL",
       baseSol,
-      quoteSol,
+      quoteSol
     };
   }
+
+  /*
+   AJOUT :
+
+      les deux réserves augmentent
+  */
 
   if (
     deltaBase > 0n &&
@@ -1252,16 +1746,20 @@ function classifyOnchainDelta(
     return {
       type: "ADD_LIQUIDITY",
       baseSol,
-      quoteSol,
+      quoteSol
     };
   }
 
   return {
     type: "OTHER",
     baseSol,
-    quoteSol,
+    quoteSol
   };
 }
+
+// ========================================================
+// PROCESS ONCHAIN
+// ========================================================
 
 function processOnchainBatch() {
   if (
@@ -1279,11 +1777,8 @@ function processOnchainBatch() {
   }
 
   /*
-   On ne classe que lorsque les deux
-   vaults appartiennent au même slot.
-
-   Cela évite de mélanger deux opérations
-   différentes.
+   On attend que les deux vaults
+   soient observés sur le même slot.
   */
 
   if (
@@ -1305,7 +1800,7 @@ function processOnchainBatch() {
   ) {
     lastProcessedVaults = {
       base,
-      quote,
+      quote
     };
 
     return;
@@ -1333,7 +1828,9 @@ function processOnchainBatch() {
     );
 
   const event = {
-    timestamp: Date.now(),
+    timestamp:
+      Date.now(),
+
     slot:
       baseVaultState.slot,
 
@@ -1365,7 +1862,7 @@ function processOnchainBatch() {
       (
         quote +
         virtualQuoteReserves
-      ).toString(),
+      ).toString()
   };
 
   onchainHistory.push(
@@ -1377,18 +1874,48 @@ function processOnchainBatch() {
 
   lastProcessedVaults = {
     base,
-    quote,
+    quote
   };
+
+  console.log(
+    `⛓️ ${event.type} | ` +
+    `base ${event.deltaBaseSOL.toFixed(4)} SOL | ` +
+    `quote ${event.deltaQuoteSOL.toFixed(4)} SOL`
+  );
 
   evaluateOnchainRisk(
     event
   );
+}
 
-  console.log(
-    `⛓️ ONCHAIN ${event.type} | ` +
-    `base ${event.deltaBaseSOL.toFixed(4)} SOL | ` +
-    `quote ${event.deltaQuoteSOL.toFixed(4)} SOL`
-  );
+// ========================================================
+// ONCHAIN PREVIOUS
+// ========================================================
+
+function getPreviousOnchain(
+  timestamp,
+  msAgo
+) {
+  const target =
+    timestamp -
+    msAgo;
+
+  for (
+    let i =
+      onchainHistory.length - 1;
+    i >= 0;
+    i--
+  ) {
+    if (
+      onchainHistory[i]
+        .timestamp <=
+      target
+    ) {
+      return onchainHistory[i];
+    }
+  }
+
+  return null;
 }
 
 // ========================================================
@@ -1401,6 +1928,10 @@ function evaluateOnchainRisk(
   const now =
     Date.now();
 
+  /*
+   RETRAIT DIRECT
+  */
+
   if (
     event.type ===
     "WITHDRAWAL"
@@ -1409,14 +1940,14 @@ function evaluateOnchainRisk(
       Math.max(
         onchainBlockedUntil,
         now +
-          ONCHAIN_WITHDRAWAL_BLOCK_MS
+          ONCHAIN_BLOCK_MS
       );
 
     lastOnchainRisk = {
       timestamp: now,
       level:
         "CRITICAL_WITHDRAWAL",
-      event,
+      event
     };
 
     console.log(
@@ -1424,13 +1955,13 @@ function evaluateOnchainRisk(
     );
 
     telegram(
-      `🚨 ANOMALIE ON-CHAIN
+`🚨 ANOMALIE ON-CHAIN
 
 Token :
 ${mint}
 
 Pool :
-${shortMint(poolAddress)}
+${poolAddress}
 
 ⚠️ RETRAIT DE LIQUIDITÉ DÉTECTÉ
 
@@ -1448,128 +1979,113 @@ Simulation uniquement.`
     return;
   }
 
-  if (
-    event.type ===
-    "ADD_LIQUIDITY"
-  ) {
-    lastOnchainRisk = {
-      timestamp: now,
-      level:
-        "LIQUIDITY_ADDED",
-      event,
-    };
+  /*
+   CHOC DES RÉSERVES
+  */
 
-    return;
-  }
-
-  // Vérification d'un choc de réserve
   const previous =
     getPreviousOnchain(
       event.timestamp,
       5000
     );
 
-  if (previous) {
-    const currentBase =
-      Number(event.baseReserve);
+  if (!previous) {
+    return;
+  }
 
-    const previousBase =
-      Number(previous.baseReserve);
+  const currentBase =
+    Number(
+      event.baseReserve
+    );
 
-    const currentQuote =
-      Number(event.quoteReserve);
+  const previousBase =
+    Number(
+      previous.baseReserve
+    );
 
-    const previousQuote =
-      Number(previous.quoteReserve);
+  const currentQuote =
+    Number(
+      event.quoteReserve
+    );
 
-    if (
-      previousBase > 0 &&
-      previousQuote > 0
-    ) {
-      const baseChange =
-        (currentBase -
-          previousBase) /
-        previousBase;
+  const previousQuote =
+    Number(
+      previous.quoteReserve
+    );
 
-      const quoteChange =
-        (currentQuote -
-          previousQuote) /
-        previousQuote;
+  if (
+    previousBase <= 0 ||
+    previousQuote <= 0
+  ) {
+    return;
+  }
 
-      if (
-        baseChange <=
-          ONCHAIN_RESERVE_SHOCK_5S &&
-        quoteChange <=
-          ONCHAIN_RESERVE_SHOCK_5S
-      ) {
-        onchainBlockedUntil =
-          Math.max(
-            onchainBlockedUntil,
-            now +
-              ONCHAIN_WITHDRAWAL_BLOCK_MS
-          );
+  const baseChange =
+    (
+      currentBase -
+      previousBase
+    ) /
+    previousBase;
 
-        lastOnchainRisk = {
-          timestamp: now,
-          level:
-            "RESERVE_SHOCK",
-          baseChange,
-          quoteChange,
-          event,
-        };
+  const quoteChange =
+    (
+      currentQuote -
+      previousQuote
+    ) /
+    previousQuote;
 
-        console.log(
-          "🚨 CHOC DES RÉSERVES ON-CHAIN"
-        );
+  if (
+    baseChange <=
+      ONCHAIN_RESERVE_SHOCK_5S &&
+    quoteChange <=
+      ONCHAIN_RESERVE_SHOCK_5S
+  ) {
+    onchainBlockedUntil =
+      Math.max(
+        onchainBlockedUntil,
+        now +
+          ONCHAIN_BLOCK_MS
+      );
 
-        telegram(
-          `🚨 CHOC DES RÉSERVES ON-CHAIN
+    lastOnchainRisk = {
+      timestamp: now,
+      level:
+        "RESERVE_SHOCK",
+
+      baseChange,
+
+      quoteChange,
+
+      event
+    };
+
+    console.log(
+      "🚨 CHOC DES RÉSERVES ON-CHAIN"
+    );
+
+    telegram(
+`🚨 CHOC DES RÉSERVES
 
 Token :
 ${mint}
 
 Base :
-${pct(baseChange * 100)}
+${pct(
+  baseChange * 100
+)}
 
 Quote :
-${pct(quoteChange * 100)}
+${pct(
+  quoteChange * 100
+)}
 
-⛔ Nouveau cycle temporairement bloqué.`
-        );
-      }
-    }
+⛔ Nouvel achat temporairement bloqué.`
+    );
   }
-}
-
-function getPreviousOnchain(
-  timestamp,
-  msAgo
-) {
-  const target =
-    timestamp - msAgo;
-
-  for (
-    let i =
-      onchainHistory.length - 1;
-    i >= 0;
-    i--
-  ) {
-    const point =
-      onchainHistory[i];
-
-    if (
-      point.timestamp <=
-      target
-    ) {
-      return point;
-    }
-  }
-
-  return null;
 }
 
 // ========================================================
-// CONNECT ONCHAIN
+// WS CONNECT
 // ========================================================
 
 async function connectOnchainMonitor() {
@@ -1582,20 +2098,21 @@ async function connectOnchainMonitor() {
   }
 
   closeOnchainWs();
-  resetOnchainState();
 
-  ws = new WebSocket(
-    WSS_URL
-  );
+  ws =
+    new WebSocket(
+      WSS_URL
+    );
 
   ws.on(
     "open",
     () => {
       console.log(
-        "⛓️ Helius WSS on-chain connecté."
+        "⛓️ Helius WSS connecté."
       );
 
-      wsReconnectAttempts = 0;
+      wsReconnectAttempts =
+        0;
 
       subscribeAccounts();
     }
@@ -1610,6 +2127,41 @@ async function connectOnchainMonitor() {
             raw.toString()
           );
 
+        /*
+         Réponses aux demandes
+         de subscription.
+        */
+
+        if (
+          message.id === 1001 &&
+          message.result
+        ) {
+          wsBaseSubscriptionId =
+            message.result;
+
+          return;
+        }
+
+        if (
+          message.id === 1002 &&
+          message.result
+        ) {
+          wsQuoteSubscriptionId =
+            message.result;
+
+          return;
+        }
+
+        if (
+          message.id === 1003 &&
+          message.result
+        ) {
+          wsPoolSubscriptionId =
+            message.result;
+
+          return;
+        }
+
         if (
           !message.params ||
           !message.params.result
@@ -1617,16 +2169,16 @@ async function connectOnchainMonitor() {
           return;
         }
 
-        const result =
-          message.params.result;
+        const subscription =
+          message.params
+            .subscription;
 
-        /*
-         Les IDs sont créés dans
-         subscribeAccounts().
-        */
+        const result =
+          message.params
+            .result;
 
         if (
-          message.params.subscription ===
+          subscription ===
           wsBaseSubscriptionId
         ) {
           handleVaultNotification(
@@ -1636,7 +2188,7 @@ async function connectOnchainMonitor() {
         }
 
         if (
-          message.params.subscription ===
+          subscription ===
           wsQuoteSubscriptionId
         ) {
           handleVaultNotification(
@@ -1646,7 +2198,7 @@ async function connectOnchainMonitor() {
         }
 
         if (
-          message.params.subscription ===
+          subscription ===
           wsPoolSubscriptionId
         ) {
           handlePoolUpdate(
@@ -1656,7 +2208,7 @@ async function connectOnchainMonitor() {
 
       } catch (error) {
         console.error(
-          "⚠️ WSS message:",
+          "⚠️ Message WSS:",
           error.message
         );
       }
@@ -1689,9 +2241,9 @@ async function connectOnchainMonitor() {
   );
 }
 
-let wsBaseSubscriptionId = null;
-let wsQuoteSubscriptionId = null;
-let wsPoolSubscriptionId = null;
+// ========================================================
+// SUBSCRIPTIONS
+// ========================================================
 
 function subscribeAccounts() {
   if (
@@ -1702,75 +2254,81 @@ function subscribeAccounts() {
     return;
   }
 
-  const baseId =
-    1001;
-
-  const quoteId =
-    1002;
-
-  const poolId =
-    1003;
-
   ws.send(
     JSON.stringify({
       jsonrpc: "2.0",
-      id: baseId,
+      id: 1001,
+
       method:
         "accountSubscribe",
+
       params: [
         baseVaultAddress,
+
         {
           encoding:
             "base64",
+
           commitment:
-            "processed",
-        },
-      ],
+            "processed"
+        }
+      ]
     })
   );
 
   ws.send(
     JSON.stringify({
       jsonrpc: "2.0",
-      id: quoteId,
+      id: 1002,
+
       method:
         "accountSubscribe",
+
       params: [
         quoteVaultAddress,
+
         {
           encoding:
             "base64",
+
           commitment:
-            "processed",
-        },
-      ],
+            "processed"
+        }
+      ]
     })
   );
 
   /*
-   On surveille aussi le compte Pool lui-même.
-   Cela permet de récupérer une éventuelle
-   évolution de virtual_quote_reserves.
+   Pool lui-même :
+   utile pour virtual_quote_reserves.
   */
 
   ws.send(
     JSON.stringify({
       jsonrpc: "2.0",
-      id: poolId,
+      id: 1003,
+
       method:
         "accountSubscribe",
+
       params: [
         poolAddress,
+
         {
           encoding:
             "base64",
+
           commitment:
-            "processed",
-        },
-      ],
+            "processed"
+        }
+      ]
     })
   );
 }
+
+// ========================================================
+// POOL UPDATE
+// ========================================================
 
 function handlePoolUpdate(
   result
@@ -1782,7 +2340,9 @@ function handlePoolUpdate(
     if (
       !value ||
       !value.data ||
-      !Array.isArray(value.data)
+      !Array.isArray(
+        value.data
+      )
     ) {
       return;
     }
@@ -1793,15 +2353,10 @@ function handlePoolUpdate(
         "base64"
       );
 
-    if (
-      buffer.length <
-      203
-    ) {
-      return;
-    }
-
     const decoded =
-      decodePool(buffer);
+      decodePool(
+        buffer
+      );
 
     if (
       decoded.baseMint !==
@@ -1819,7 +2374,12 @@ function handlePoolUpdate(
 
     if (
       decoded.baseVault !==
-      baseVaultAddress ||
+      baseVaultAddress
+    ) {
+      return;
+    }
+
+    if (
       decoded.quoteVault !==
       quoteVaultAddress
     ) {
@@ -1836,6 +2396,10 @@ function handlePoolUpdate(
     );
   }
 }
+
+// ========================================================
+// RECONNECT
+// ========================================================
 
 function scheduleReconnect() {
   if (
@@ -1863,14 +2427,15 @@ function scheduleReconnect() {
   wsReconnectTimer =
     setTimeout(
       async () => {
-        wsReconnectTimer = null;
+        wsReconnectTimer =
+          null;
 
         if (!running) {
           return;
         }
 
         console.log(
-          `🔄 Reconnexion Helius dans ${delay} ms`
+          "🔄 Reconnexion Helius..."
         );
 
         await connectOnchainMonitor();
@@ -1881,86 +2446,223 @@ function scheduleReconnect() {
 }
 
 // ========================================================
-// INITIAL ONCHAIN SNAPSHOT
+// BUY
 // ========================================================
 
-async function initializeVaultState() {
-  try {
-    const accounts =
-      await connection.getMultipleAccountsInfo(
-        [
-          new PublicKey(
-            baseVaultAddress
-          ),
-          new PublicKey(
-            quoteVaultAddress
-          ),
-        ],
-        "processed"
-      );
-
-    if (
-      !accounts ||
-      accounts.length !== 2 ||
-      !accounts[0] ||
-      !accounts[1]
-    ) {
-      return;
-    }
-
-    const baseBuffer =
-      accounts[0].data;
-
-    const quoteBuffer =
-      accounts[1].data;
-
-    if (
-      baseBuffer.length < 72 ||
-      quoteBuffer.length < 72
-    ) {
-      return;
-    }
-
-    const baseAmount =
-      baseBuffer.readBigUInt64LE(
-        64
-      );
-
-    const quoteAmount =
-      quoteBuffer.readBigUInt64LE(
-        64
-      );
-
-    const slot =
-      await connection.getSlot(
-        "processed"
-      );
-
-    baseVaultState = {
-      amount: baseAmount,
-      slot,
-    };
-
-    quoteVaultState = {
-      amount: quoteAmount,
-      slot,
-    };
-
-    lastProcessedVaults = {
-      base: baseAmount,
-      quote: quoteAmount,
-    };
-
-    console.log(
-      "⛓️ Réserves initiales chargées."
-    );
-
-  } catch (error) {
-    console.error(
-      "⚠️ Initialisation vaults:",
-      error.message
-    );
+async function simulateBuy() {
+  if (position) {
+    return;
   }
+
+  if (
+    !entryHealthy()
+  ) {
+    return;
+  }
+
+  cycleNumber++;
+
+  const entryPrice =
+    currentPrice;
+
+  const tokens =
+    CAPITAL_USD /
+    entryPrice;
+
+  const targetPrice =
+    entryPrice *
+    (
+      1 +
+      TARGET_PROFIT
+    );
+
+  position = {
+    cycle:
+      cycleNumber,
+
+    mint,
+
+    entryPrice,
+
+    tokens,
+
+    capital:
+      CAPITAL_USD,
+
+    targetPrice,
+
+    timestamp:
+      Date.now()
+  };
+
+  await telegram(
+`🟢 ACHAT TEST V5.3 #${cycleNumber}
+
+Token :
+${mint}
+
+Mise fixe :
+${money(CAPITAL_USD)}
+
+Prix :
+${formatPrice(
+  entryPrice
+)}
+
+Tokens :
+${tokens.toFixed(8)}
+
+🎯 Objectif :
++${(
+  TARGET_PROFIT *
+  100
+).toFixed(2)}%
+
+Prix cible :
+${formatPrice(
+  targetPrice
+)}
+
+💧 Liquidité :
+${money(
+  currentLiquidity
+)}
+
+🧠 Score :
+${healthScore}/100
+
+⛓️ Pool PumpSwap :
+${poolAddress}
+
+🛡️ Confirmation :
+${favorableConfirmations}/${REQUIRED_CONFIRMATIONS}
+
+Simulation uniquement.`
+  );
+}
+
+// ========================================================
+// SELL
+// ========================================================
+
+async function simulateSell(
+  reason = "TARGET"
+) {
+  if (!position) {
+    return;
+  }
+
+  if (
+    currentLiquidity <=
+      CRASH_MIN_LIQUIDITY ||
+    healthScore <= 20
+  ) {
+    return;
+  }
+
+  const entryPrice =
+    position.entryPrice;
+
+  const targetPrice =
+    entryPrice *
+    (
+      1 +
+      TARGET_PROFIT
+    );
+
+  const exitPrice =
+    reason === "TARGET"
+      ? targetPrice
+      : currentPrice;
+
+  const exitAmount =
+    position.tokens *
+    exitPrice;
+
+  const profit =
+    exitAmount -
+    position.capital;
+
+  totalProfit +=
+    profit;
+
+  tradeHistory.push({
+    timestamp:
+      new Date().toISOString(),
+
+    cycle:
+      position.cycle,
+
+    mint,
+
+    entryPrice,
+
+    exitPrice,
+
+    capital:
+      position.capital,
+
+    exitAmount,
+
+    profit,
+
+    reason
+  });
+
+  saveJson(
+    TRADES_FILE,
+    tradeHistory
+  );
+
+  await telegram(
+`🔴 VENTE TEST V5.3 #${position.cycle}
+
+Prix :
+${formatPrice(
+  exitPrice
+)}
+
+Montant simulé :
+${money(
+  exitAmount
+)}
+
+Résultat :
+${pct(
+  (
+    profit /
+    position.capital
+  ) * 100
+)}
+
+Bénéfice :
+${profit >= 0 ? "+" : ""}${money(
+  profit
+)}
+
+💰 Bénéfices cumulés :
+${money(
+  totalProfit
+)}
+
+🛡️ PHASE DE SÉCURITÉ
+
+⏳ Observation :
+30 secondes
+
+❌ Aucun rachat immédiat.`
+  );
+
+  position = null;
+
+  observationUntil =
+    Date.now() +
+    OBSERVATION_AFTER_SELL_MS;
+
+  favorableConfirmations =
+    0;
+
+  saveSummary();
 }
 
 // ========================================================
@@ -1985,7 +2687,7 @@ function getLast60Seconds() {
         x =>
           x.timestamp >=
           cutoff
-      ),
+      )
   };
 }
 
@@ -2012,6 +2714,26 @@ async function saveCrashReport(
     sessionProfit:
       totalProfit,
 
+    pool: {
+      address:
+        poolAddress,
+
+      baseMint:
+        poolBaseMint,
+
+      quoteMint:
+        poolQuoteMint,
+
+      baseVault:
+        baseVaultAddress,
+
+      quoteVault:
+        quoteVaultAddress,
+
+      virtualQuoteReserves:
+        virtualQuoteReserves.toString()
+    },
+
     crashMarket: {
       price:
         currentPrice,
@@ -2020,35 +2742,26 @@ async function saveCrashReport(
         currentLiquidity,
 
       priceChange10s:
-        crashInfo.metrics.price10 !== null
-          ? crashInfo.metrics.price10 * 100
+        crashInfo.metrics
+          .price10 !== null
+          ? crashInfo.metrics
+              .price10 * 100
           : null,
 
       liquidityChange10s:
-        crashInfo.metrics.liquidity10 !== null
-          ? crashInfo.metrics.liquidity10 * 100
+        crashInfo.metrics
+          .liquidity10 !== null
+          ? crashInfo.metrics
+              .liquidity10 * 100
           : null,
 
       score:
-        healthScore,
+        healthScore
     },
 
-    onchain: {
-      poolAddress,
+    lastOnchainEvent,
 
-      baseVaultAddress,
-
-      quoteVaultAddress,
-
-      virtualQuoteReserves:
-        virtualQuoteReserves.toString(),
-
-      lastEvent:
-        lastOnchainEvent,
-
-      lastRisk:
-        lastOnchainRisk,
-    },
+    lastOnchainRisk,
 
     reasons:
       crashInfo.reasons,
@@ -2057,7 +2770,7 @@ async function saveCrashReport(
       position,
 
     last60Seconds:
-      snapshot,
+      snapshot
   };
 
   crashReports.push(
@@ -2073,395 +2786,79 @@ async function saveCrashReport(
     `🚨 CRASH enregistré : ${report.id}`
   );
 
-  await sendCrashTelegram(
-    report
-  );
-}
-
-async function sendCrashTelegram(
-  report
-) {
-  const lastOnchain =
-    report.onchain?.lastEvent;
-
-  let onchainText =
-    "Aucun événement on-chain récent.";
-
-  if (lastOnchain) {
-    onchainText =
-      `Dernier événement :
-${lastOnchain.type}
-
-Base :
-${Number(
-  lastOnchain.deltaBaseSOL
-).toFixed(4)} SOL
-
-Quote :
-${Number(
-  lastOnchain.deltaQuoteSOL
-).toFixed(4)} SOL`;
-  }
-
-  const message =
-`🚨 STOP CRASH - V5.2
+  await telegram(
+`🚨 STOP CRASH - V5.3
 
 Token :
-${report.mint}
+${mint}
 
 Prix :
 ${formatPrice(
-  report.crashMarket.price
+  currentPrice
 )}
 
 Liquidité :
 ${money(
-  report.crashMarket.liquidity
+  currentLiquidity
 )}
 
 Prix / 10s :
 ${pct(
-  report.crashMarket.priceChange10s
+  crashInfo.metrics
+    .price10 !== null
+    ? crashInfo.metrics
+        .price10 * 100
+    : null
 )}
 
 Liquidité / 10s :
 ${pct(
-  report.crashMarket.liquidityChange10s
+  crashInfo.metrics
+    .liquidity10 !== null
+    ? crashInfo.metrics
+        .liquidity10 * 100
+    : null
 )}
-
-🧠 Score :
-${report.crashMarket.score}/100
-
-⛓️ ON-CHAIN
-${onchainText}
-
-⚠️ Signaux :
-${report.reasons
-  .map(x => `• ${x}`)
-  .join("\n")}
-
-⚠️ Position restante :
-${
-  report.openPosition
-    ? report.openPosition.tokens
-    : "Aucune"
-} tokens
-
-⚠️ Prix de sortie NON considéré fiable.
-
-📊 Données des 60 dernières secondes :
-sauvegardées dans crash_reports.json
-
-💰 Bénéfices simulés :
-${money(report.sessionProfit)}
-
-⛔ Radar arrêté.
-
-Simulation uniquement.`;
-
-  await telegram(
-    message
-  );
-}
-
-// ========================================================
-// TRADE HISTORY
-// ========================================================
-
-function saveTrade(
-  trade
-) {
-  tradeHistory.push(
-    trade
-  );
-
-  saveJson(
-    TRADES_FILE,
-    tradeHistory
-  );
-
-  saveSummary();
-}
-
-// ========================================================
-// BUY
-// ========================================================
-
-async function simulateBuy() {
-  if (
-    position
-  ) {
-    return;
-  }
-
-  if (
-    !entryHealthy()
-  ) {
-    return;
-  }
-
-  cycleNumber++;
-
-  const entryPrice =
-    currentPrice;
-
-  const tokens =
-    CAPITAL_USD /
-    entryPrice;
-
-  const targetPrice =
-    entryPrice *
-    (1 + TARGET_PROFIT);
-
-  position = {
-    cycle:
-      cycleNumber,
-
-    mint,
-
-    entryPrice,
-
-    tokens,
-
-    capital:
-      CAPITAL_USD,
-
-    targetPrice,
-
-    timestamp:
-      Date.now(),
-  };
-
-  await telegram(
-`🟢 ACHAT TEST V5.2 #${cycleNumber}
-
-Token :
-${mint}
-
-Mise fixe :
-${money(CAPITAL_USD)}
-
-Prix :
-${formatPrice(entryPrice)}
-
-Tokens :
-${tokens.toFixed(8)}
-
-🎯 Objectif :
-+${(
-  TARGET_PROFIT *
-  100
-).toFixed(2)}%
-
-Prix cible :
-${formatPrice(targetPrice)}
-
-💧 Liquidité :
-${money(currentLiquidity)}
 
 🧠 Score :
 ${healthScore}/100
 
-⛓️ Pool PumpSwap :
-${shortMint(poolAddress)}
+⛓️ Pool :
+${poolAddress}
 
-🛡️ Entrée :
-${favorableConfirmations}/${REQUIRED_CONFIRMATIONS}
+⛓️ Dernier événement :
+${
+  lastOnchainEvent
+    ? lastOnchainEvent.type
+    : "aucun"
+}
+
+⚠️ Signaux :
+${crashInfo.reasons
+  .map(
+    x =>
+      "• " + x
+  )
+  .join("\n")}
+
+⚠️ Position restante :
+${
+  position
+    ? position.tokens
+    : "aucune"
+}
+
+📊 60 secondes sauvegardées.
+
+💰 Bénéfices simulés :
+${money(
+  totalProfit
+)}
+
+⛔ RADAR ARRÊTÉ
 
 Simulation uniquement.`
   );
-}
-
-// ========================================================
-// SELL
-// ========================================================
-
-async function simulateSell(
-  reason = "TARGET"
-) {
-  if (
-    !position
-  ) {
-    return;
-  }
-
-  /*
-   On ne simule pas une vente pendant
-   une situation de liquidité critique.
-  */
-
-  if (
-    currentLiquidity <=
-      CRASH_MIN_LIQUIDITY ||
-    healthScore <= 20
-  ) {
-    return;
-  }
-
-  const entryPrice =
-    position.entryPrice;
-
-  const targetPrice =
-    entryPrice *
-    (1 + TARGET_PROFIT);
-
-  /*
-   Pour le test, on ne prétend pas avoir
-   vendu à un prix meilleur que celui observé.
-  */
-
-  const exitPrice =
-    reason === "TARGET"
-      ? targetPrice
-      : currentPrice;
-
-  const exitAmount =
-    position.tokens *
-    exitPrice;
-
-  const profit =
-    exitAmount -
-    position.capital;
-
-  totalProfit +=
-    profit;
-
-  saveTrade({
-    timestamp:
-      new Date().toISOString(),
-
-    cycle:
-      position.cycle,
-
-    mint,
-
-    entryPrice,
-
-    exitPrice,
-
-    capital:
-      position.capital,
-
-    exitAmount,
-
-    profit,
-
-    reason,
-  });
-
-  await telegram(
-`🔴 VENTE TEST V5.2 #${position.cycle}
-
-Prix :
-${formatPrice(exitPrice)}
-
-Montant simulé :
-${money(exitAmount)}
-
-Résultat :
-${pct(
-  (profit /
-    position.capital) *
-    100
-)}
-
-Bénéfice réalisé :
-${profit >= 0 ? "+" : ""}${money(profit)}
-
-💰 Bénéfices cumulés :
-${money(totalProfit)}
-
-🛡️ NOUVELLE PHASE DE SÉCURITÉ
-
-⏳ Observation du marché :
-30 secondes
-
-❌ Aucun rachat immédiat.`
-  );
-
-  position = null;
-
-  observationUntil =
-    Date.now() +
-    OBSERVATION_AFTER_SELL_MS;
-
-  favorableConfirmations = 0;
-
-  saveSummary();
-}
-
-// ========================================================
-// SESSION END
-// ========================================================
-
-async function stopSession(
-  reason
-) {
-  if (!running) {
-    return;
-  }
-
-  running = false;
-
-  if (marketTimer) {
-    clearInterval(
-      marketTimer
-    );
-
-    marketTimer = null;
-  }
-
-  if (sessionTimer) {
-    clearTimeout(
-      sessionTimer
-    );
-
-    sessionTimer = null;
-  }
-
-  closeOnchainWs();
-
-  if (
-    wsReconnectTimer
-  ) {
-    clearTimeout(
-      wsReconnectTimer
-    );
-
-    wsReconnectTimer = null;
-  }
-
-  const openPosition =
-    position;
-
-  await telegram(
-`⛔ SESSION V5.2 ARRÊTÉE
-
-Token :
-${mint}
-
-Raison :
-${reason}
-
-Cycles terminés :
-${cycleNumber}
-
-💰 Bénéfices simulés :
-${money(totalProfit)}
-
-${
-  openPosition
-    ? `⚠️ Position ouverte :
-${openPosition.tokens.toFixed(8)} tokens
-
-⚠️ Cette position n'est PAS considérée comme vendue.`
-    : "Aucune position ouverte."
-}
-
-🧪 Simulation uniquement.`
-  );
-
-  saveSummary();
 }
 
 // ========================================================
@@ -2495,26 +2892,14 @@ async function crashStop(
 
   closeOnchainWs();
 
-  if (
-    wsReconnectTimer
-  ) {
-    clearTimeout(
-      wsReconnectTimer
-    );
-
-    wsReconnectTimer = null;
-  }
-
   await saveCrashReport(
     crashInfo
   );
 
-  position = null;
-
   saveSummary();
 
   console.log(
-    "⛔ Radar arrêté après crash."
+    "⛔ Radar arrêté."
   );
 }
 
@@ -2531,9 +2916,13 @@ async function marketTick() {
     await getMarketData();
 
   if (!data) {
+    console.log(
+      "⚠️ Aucune donnée DEX disponible."
+    );
+
     return;
   }
-lastMarketData = data;
+
   currentPrice =
     data.price;
 
@@ -2542,6 +2931,8 @@ lastMarketData = data;
 
   const point = {
     ...data,
+
+    poolAddress,
 
     onchainEvent:
       lastOnchainEvent
@@ -2552,8 +2943,7 @@ lastMarketData = data;
       Date.now() <
       onchainBlockedUntil,
 
-    healthScore:
-      healthScore,
+    healthScore
   };
 
   marketHistory.push(
@@ -2567,23 +2957,46 @@ lastMarketData = data;
   );
 
   /*
-   Si le pool a changé,
-   on reconstruit le monitoring.
+   Si aucun pool n'est encore trouvé,
+   on lance la découverte directement
+   depuis PumpSwap.
   */
 
-  if (
-    data.pairAddress &&
-    data.pairAddress !==
-      poolAddress
-  ) {
-    const loaded =
-      await loadPool(
-        data.pairAddress
-      );
+  if (!poolAddress) {
+    const pool =
+      await discoverPumpSwapPools();
 
-    if (loaded) {
+    if (pool) {
       await initializeVaultState();
+
       await connectOnchainMonitor();
+
+      await telegram(
+`⛓️ POOL PUMPSWAP TROUVÉ
+
+Token :
+${mint}
+
+Pool :
+${poolAddress}
+
+Base vault :
+${baseVaultAddress}
+
+Quote vault :
+${quoteVaultAddress}
+
+💧 Réserve quote :
+${
+  (
+    Number(
+      selectedPoolQuoteReserve
+    ) / 1e9
+  ).toFixed(4)
+} SOL
+
+🟢 Surveillance on-chain active.`
+      );
     }
   }
 
@@ -2591,25 +3004,30 @@ lastMarketData = data;
     calculateHealthScore();
 
   /*
-   Confirmation d'entrée
+   Confirmation entrée
   */
 
   if (
     currentLiquidity >=
       MIN_LIQUIDITY_USD &&
+
     healthScore >=
       MIN_HEALTH_SCORE &&
+
     Date.now() >=
       observationUntil &&
+
     Date.now() >=
       noNewBuyUntil &&
+
     Date.now() >=
       onchainBlockedUntil
   ) {
     favorableConfirmations =
       Math.min(
         REQUIRED_CONFIRMATIONS,
-        favorableConfirmations + 1
+        favorableConfirmations +
+          1
       );
   } else {
     favorableConfirmations =
@@ -2617,7 +3035,7 @@ lastMarketData = data;
   }
 
   /*
-   CRASH
+   Crash
   */
 
   const crash =
@@ -2632,7 +3050,7 @@ lastMarketData = data;
   }
 
   /*
-   POSITION OUVERTE
+   Position ouverte
   */
 
   if (position) {
@@ -2643,26 +3061,50 @@ lastMarketData = data;
       await simulateSell(
         "TARGET"
       );
-
-      return;
     }
 
     return;
   }
 
   /*
-   PAS DE POSITION
+   Pas de position
   */
 
   if (
     entryHealthy()
   ) {
     await simulateBuy();
+  } else {
+    /*
+     Affichage de diagnostic,
+     mais seulement toutes les ~10 secondes.
+    */
+
+    if (
+      marketHistory.length %
+        5 ===
+      0
+    ) {
+      console.log(
+        `🔎 Entrée refusée | ` +
+        `liq=${money(
+          currentLiquidity
+        )} | ` +
+        `score=${healthScore}/100 | ` +
+        `confirm=${favorableConfirmations}/${REQUIRED_CONFIRMATIONS} | ` +
+        `onchain=${
+          Date.now() <
+          onchainBlockedUntil
+            ? "BLOQUÉ"
+            : "OK"
+        }`
+      );
+    }
   }
 }
 
 // ========================================================
-// SESSION START
+// START SESSION
 // ========================================================
 
 async function startSession(
@@ -2681,7 +3123,9 @@ async function startSession(
     DEFAULT_MINT;
 
   try {
-    new PublicKey(mint);
+    new PublicKey(
+      mint
+    );
   } catch {
     await telegram(
       "❌ Mint Solana invalide."
@@ -2696,19 +3140,16 @@ async function startSession(
     new Date().toISOString();
 
   cycleNumber = 0;
-
   totalProfit = 0;
 
   position = null;
 
   marketHistory = [];
-
   onchainHistory = [];
 
   favorableConfirmations = 0;
 
-  observationUntil =
-    0;
+  observationUntil = 0;
 
   noNewBuyUntil =
     Date.now() +
@@ -2719,19 +3160,28 @@ async function startSession(
   poolAddress = null;
 
   baseVaultAddress = null;
-
   quoteVaultAddress = null;
 
-  resetOnchainState();
+  poolBaseMint = null;
+  poolQuoteMint = null;
+
+  virtualQuoteReserves = 0n;
+
+  selectedPoolQuoteReserve =
+    0n;
+
+  resetVaultState();
 
   await telegram(
-`🚀 V5.2 DÉMARRÉE
+`🚀 V5.3 DÉMARRÉE
 
 Token :
 ${mint}
 
-💵 Capital fixe :
-${money(CAPITAL_USD)}
+💵 Capital :
+${money(
+  CAPITAL_USD
+)}
 
 🎯 Objectif :
 +${(
@@ -2739,57 +3189,31 @@ ${money(CAPITAL_USD)}
   100
 ).toFixed(2)}%
 
+🔎 Recherche directe :
+PumpSwap Pool accounts
+
 ⛓️ Surveillance :
-PumpSwap on-chain
+vaults base + quote
 
-📡 Source secondaire :
-DEX Screener
-
-🧠 Protection :
-retraits de liquidité
-+
-chocs de réserves
+💧 Détection :
+retrait de liquidité
 
 ⏳ Observation après vente :
 30 secondes
 
-⏱️ Aucun nouvel achat après :
+⏱️ Pas de nouvel achat après :
 43 minutes
 
-🛑 Fin de session :
+🛑 Session maximale :
 45 minutes
 
 🧪 SIMULATION UNIQUEMENT`
   );
 
-  /*
-   Premier tick immédiat
-  */
-
   await marketTick();
 
   if (!running) {
     return;
-  }
-
-  /*
-   Recherche du pool après le premier
-   résultat DEX.
-  */
-
-  if (
-    !poolAddress &&
-    lastMarketData?.pairAddress
-  ) {
-    const loaded =
-      await loadPool(
-        lastMarketData.pairAddress
-      );
-
-    if (loaded) {
-      await initializeVaultState();
-      await connectOnchainMonitor();
-    }
   }
 
   marketTimer =
@@ -2801,16 +3225,9 @@ chocs de réserves
   sessionTimer =
     setTimeout(
       async () => {
-
         if (!running) {
           return;
         }
-
-        /*
-         Si une position est ouverte,
-         on ne fabrique pas un prix de vente
-         si le marché est mauvais.
-        */
 
         if (
           position &&
@@ -2826,10 +3243,95 @@ chocs de réserves
         await stopSession(
           "limite de session 45 minutes"
         );
-
       },
       MAX_SESSION_MS
     );
+}
+
+// ========================================================
+// RESET VAULT
+// ========================================================
+
+function resetVaultState() {
+  baseVaultState = {
+    amount: null,
+    slot: null
+  };
+
+  quoteVaultState = {
+    amount: null,
+    slot: null
+  };
+
+  lastProcessedVaults = {
+    base: null,
+    quote: null
+  };
+
+  lastOnchainEvent = null;
+  lastOnchainRisk = null;
+
+  onchainBlockedUntil = 0;
+}
+
+// ========================================================
+// STOP
+// ========================================================
+
+async function stopSession(
+  reason
+) {
+  if (!running) {
+    return;
+  }
+
+  running = false;
+
+  if (marketTimer) {
+    clearInterval(
+      marketTimer
+    );
+
+    marketTimer = null;
+  }
+
+  if (sessionTimer) {
+    clearTimeout(
+      sessionTimer
+    );
+
+    sessionTimer = null;
+  }
+
+  closeOnchainWs();
+
+  await telegram(
+`⛔ SESSION V5.3 ARRÊTÉE
+
+Token :
+${mint}
+
+Raison :
+${reason}
+
+Cycles :
+${cycleNumber}
+
+💰 Bénéfices :
+${money(
+  totalProfit
+)}
+
+${
+  position
+    ? "⚠️ Position ouverte non vendue."
+    : "⚪ Aucune position ouverte."
+}
+
+Simulation uniquement.`
+  );
+
+  saveSummary();
 }
 
 // ========================================================
@@ -2839,15 +3341,20 @@ chocs de réserves
 async function sendStatus() {
   if (!running) {
     await telegram(
-`⚪ V5.2 inactive
+`⚪ V5.3 inactive
 
-💰 Bénéfices cumulés :
-${money(totalProfit)}
+Profit :
+${money(
+  totalProfit
+)}
 
 Cycles :
 ${cycleNumber}
 
-Dernier crash :
+Pool :
+${poolAddress || "aucun"}
+
+Crash :
 ${
   crashReports.length
     ? crashReports[
@@ -2860,55 +3367,58 @@ ${
     return;
   }
 
-  const remainingNoBuy =
-    Math.max(
-      0,
-      noNewBuyUntil -
-        Date.now()
-    );
-
-  const remainingObservation =
+  const observation =
     Math.max(
       0,
       observationUntil -
         Date.now()
     );
 
-  const remainingSession =
+  const noBuy =
     Math.max(
       0,
-      MAX_SESSION_MS -
-        (
-          Date.now() -
-          new Date(
-            sessionStart
-          ).getTime()
-        )
+      noNewBuyUntil -
+        Date.now()
     );
 
   await telegram(
-`📊 STATUS V5.2
+`📊 STATUS V5.3
 
 Token :
 ${mint}
 
 Prix :
-${formatPrice(currentPrice)}
+${formatPrice(
+  currentPrice
+)}
 
 Liquidité :
-${money(currentLiquidity)}
+${money(
+  currentLiquidity
+)}
 
 🧠 Score :
 ${healthScore}/100
 
+🛡️ Confirmation :
+${favorableConfirmations}/${REQUIRED_CONFIRMATIONS}
+
 💰 Profit :
-${money(totalProfit)}
+${money(
+  totalProfit
+)}
 
 Cycles :
 ${cycleNumber}
 
 ⛓️ Pool :
-${poolAddress || "non détecté"}
+${poolAddress || "recherche..."}
+
+⛓️ Base vault :
+${baseVaultAddress || "..."}
+
+⛓️ Quote vault :
+${quoteVaultAddress || "..."}
 
 ⛓️ Dernier événement :
 ${
@@ -2927,38 +3437,35 @@ ${
 
 ⏳ Observation :
 ${
-  remainingObservation > 0
+  observation > 0
     ? Math.ceil(
-        remainingObservation /
-          1000
+        observation / 1000
       ) + "s"
     : "terminée"
 }
 
 ⛔ Nouvel achat :
 ${
-  remainingNoBuy > 0
+  noBuy > 0
     ? Math.ceil(
-        remainingNoBuy /
-          60000
+        noBuy / 60000
       ) + " min"
     : "autorisé"
 }
 
-⏱️ Session restante :
-${Math.ceil(
-  remainingSession /
-    60000
-)} min
-
 ${
   position
     ? `🟢 Position #${position.cycle}
+
 Entrée :
-${formatPrice(position.entryPrice)}
+${formatPrice(
+  position.entryPrice
+)}
 
 Cible :
-${formatPrice(position.targetPrice)}`
+${formatPrice(
+  position.targetPrice
+)}`
     : "⚪ Aucune position"
 }`
   );
@@ -2984,11 +3491,8 @@ async function sendLastCrash() {
       crashReports.length - 1
     ];
 
-  const event =
-    report.onchain?.lastEvent;
-
   await telegram(
-`📋 DERNIER CRASH V5.2
+`📋 DERNIER CRASH V5.3
 
 Token :
 ${report.mint}
@@ -3008,25 +3512,30 @@ ${money(
 
 Prix / 10s :
 ${pct(
-  report.crashMarket.priceChange10s
+  report.crashMarket
+    .priceChange10s
 )}
 
 Liquidité / 10s :
 ${pct(
-  report.crashMarket.liquidityChange10s
+  report.crashMarket
+    .liquidityChange10s
 )}
 
-Score :
+🧠 Score :
 ${report.crashMarket.score}/100
+
+⛓️ Pool :
+${report.pool?.address || "N/A"}
 
 ⛓️ Dernier événement :
 ${
-  event
-    ? event.type
+  report.lastOnchainEvent
+    ? report.lastOnchainEvent.type
     : "aucun"
 }
 
-💰 Profit avant crash :
+💰 Profit :
 ${money(
   report.sessionProfit
 )}
@@ -3034,7 +3543,7 @@ ${money(
 Cycles :
 ${report.cyclesCompleted}
 
-⚠️ Le rapport complet est sauvegardé dans :
+📁 Rapport complet :
 crash_reports.json`
   );
 }
@@ -3088,27 +3597,22 @@ bot.command(
   "help",
   async () => {
     await telegram(
-`🤖 COMMANDES V5.2
-
-/starttrade
-Démarrer avec le token par défaut
+`🤖 V5.3
 
 /starttrade MINT
-Démarrer avec un token précis
+Démarrer un test
 
 /status
-Voir l'état du test
+État actuel
 
 /stoptrade
-Arrêter le test
+Arrêter
 
 /lastcrash
-Voir le dernier rapport de crash
+Dernier crash
 
 /help
-Afficher cette aide
-
-🧪 Tout est encore en simulation.
+Aide
 
 💵 Capital :
 10 $
@@ -3116,39 +3620,25 @@ Afficher cette aide
 🎯 Objectif :
 +5 %
 
-⛓️ Surveillance :
-PumpSwap on-chain`
+🧪 Simulation uniquement.`
     );
   }
 );
 
 // ========================================================
-// BOT ERRORS
-// ========================================================
-
-bot.catch(
-  error => {
-    console.error(
-      "❌ Erreur Telegram:",
-      error
-    );
-  }
-);
-
-// ========================================================
-// START BOT
+// TELEGRAM START
 // ========================================================
 
 bot.launch()
   .then(() => {
     console.log(
-      "🤖 Bot Telegram V5.2 prêt."
+      "🤖 Bot Telegram V5.3 prêt."
     );
   })
   .catch(error => {
     console.error(
-      "❌ Impossible de lancer Telegram:",
-      error
+      "❌ Telegram:",
+      error.message
     );
 
     process.exit(1);
@@ -3160,7 +3650,7 @@ bot.launch()
 
 async function shutdown() {
   console.log(
-    "🛑 Arrêt du bot..."
+    "🛑 Arrêt..."
   );
 
   running = false;
