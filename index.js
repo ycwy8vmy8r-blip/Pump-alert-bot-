@@ -41,8 +41,8 @@ const bot = new Telegraf(BOT_TOKEN);
 // PARAMÈTRES DE LA STRATÉGIE
 // ------------------------------------------------------------
 
-const CAPITAL_PER_CYCLE_USD = 1.00;
-const TARGET_NET_PERCENT = 50.00;
+const CAPITAL_PER_CYCLE_USD = 10.00;
+const TARGET_NET_PERCENT = 5.00;
 
 // ------------------------------------------------------------
 // PROTECTION LIQUIDITÉ
