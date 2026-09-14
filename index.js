@@ -1,12 +1,9 @@
 const { Telegraf } = require("telegraf");
-const fetch = global.fetch;
-
-/* =========================================================
-   CONFIGURATION
-   ========================================================= */
+const WebSocket = require("ws");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 
 if (!BOT_TOKEN || !CHAT_ID) {
   console.error("❌ BOT_TOKEN ou CHAT_ID manquant");
@@ -15,41 +12,55 @@ if (!BOT_TOKEN || !CHAT_ID) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// ===== STRATÉGIE TEST =====
+/* =========================================================
+   CONFIGURATION V4 TEST
+   ========================================================= */
+
 const CAPITAL_PER_CYCLE_USD = 10.00;
 const TARGET_NET_PERCENT = 5.00;
 
-// ===== SURVEILLANCE =====
 const POLL_INTERVAL_MS = 2000;
+
+const ENTRY_COOLDOWN_MS = 30000;
+
+// Il faut plusieurs confirmations favorables
+const REQUIRED_HEALTHY_READINGS = 4;
+
+// Historique local
 const HISTORY_MS = 120000;
 
-// Temps minimum d'observation après une vente
-const ENTRY_COOLDOWN_MS = 15000;
-
-// ===== FILTRES D'ENTRÉE =====
-
-// On refuse une entrée si la liquidité baisse trop vite
-const ENTRY_MAX_LIQ_DROP_10S = -12;
-
-// On refuse une entrée si le prix baisse trop vite
-const ENTRY_MAX_PRICE_DROP_10S = -5;
-
-// On refuse une entrée si la liquidité baisse fortement
-// sur une fenêtre plus longue
-const ENTRY_MAX_LIQ_DROP_30S = -20;
-
-// Liquidité minimale absolue
+// Liquidité minimale
 const MIN_LIQUIDITY_USD = 3000;
 
-// ===== CRASH =====
+// =========================================================
+// SEUILS D'ENTRÉE
+// =========================================================
 
-const CRASH_LIQ_DROP_10S = -50;
+const ENTRY_MAX_PRICE_DROP_10S = -4;
+const ENTRY_MAX_LIQ_DROP_10S = -10;
+const ENTRY_MAX_LIQ_DROP_30S = -15;
+
+// Score minimum
+const MIN_ENTRY_SCORE = 80;
+
+// =========================================================
+// SEUILS CRASH
+// =========================================================
+
 const CRASH_PRICE_DROP_10S = -20;
+const CRASH_LIQ_DROP_10S = -50;
 const CRASH_MIN_LIQUIDITY_USD = 1;
 
 // =========================================================
-// ÉTAT DU BOT
+// PUMP SWAP
 // =========================================================
+
+const PUMPSWAP_PROGRAM =
+  "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+
+/* =========================================================
+   ÉTAT
+   ========================================================= */
 
 let running = false;
 let crashed = false;
@@ -63,126 +74,66 @@ let completedCycles = 0;
 
 let cumulativeProfit = 0;
 
-let lastPrice = null;
-let lastLiquidity = null;
-
 let history = [];
 
 let cooldownUntil = 0;
 
+let healthyReadings = 0;
+
+let lastEntryWarning = 0;
+
 let pollTimer = null;
+
+let heliusWs = null;
+
+let heliusConnected = false;
+
+let onchainStats = {
+  buys: 0,
+  sells: 0,
+  buyVolumeSol: 0,
+  sellVolumeSol: 0,
+  lastActivity: 0
+};
+
+/* =========================================================
+   TELEGRAM
+   ========================================================= */
+
+async function sendTelegram(message) {
+  try {
+    await bot.telegram.sendMessage(
+      CHAT_ID,
+      message
+    );
+  } catch (err) {
+    console.error(
+      "Erreur Telegram :",
+      err.message
+    );
+  }
+}
 
 /* =========================================================
    OUTILS
    ========================================================= */
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function shortToken(mint) {
-  if (!mint) return "???";
-  return mint.slice(0, 6) + "..." + mint.slice(-6);
-}
-
 function now() {
   return Date.now();
 }
 
-async function sendTelegram(message) {
-  try {
-    await bot.telegram.sendMessage(CHAT_ID, message);
-  } catch (err) {
-    console.error("Erreur Telegram :", err.message);
-  }
-}
+function shortToken(mint) {
+  if (!mint) return "???";
 
-/* =========================================================
-   DEXSCREENER
-   ========================================================= */
-
-async function getTokenData(mint) {
-  try {
-    const response = await fetch(
-      `https://api.dexscreener.com/latest/dex/tokens/${mint}`
-    );
-
-    if (!response.ok) {
-      throw new Error(`DexScreener HTTP ${response.status}`);
-    }
-
-    const data = await response.json();
-
-    if (!data.pairs || data.pairs.length === 0) {
-      return null;
-    }
-
-    // On privilégie PumpSwap
-    let pair =
-      data.pairs.find(p => {
-        return (
-          p.dexId &&
-          p.dexId.toLowerCase().includes("pump")
-        );
-      }) || data.pairs[0];
-
-    const price = Number(pair.priceUsd);
-    const liquidity = Number(pair.liquidity?.usd);
-
-    if (!Number.isFinite(price) || price <= 0) {
-      return null;
-    }
-
-    if (!Number.isFinite(liquidity)) {
-      return null;
-    }
-
-    return {
-      price,
-      liquidity,
-      dexId: pair.dexId || "unknown",
-      pairAddress: pair.pairAddress || null
-    };
-
-  } catch (err) {
-    console.error("DexScreener :", err.message);
-    return null;
-  }
-}
-
-/* =========================================================
-   HISTORIQUE
-   ========================================================= */
-
-function addHistory(data) {
-  const timestamp = now();
-
-  history.push({
-    timestamp,
-    price: data.price,
-    liquidity: data.liquidity
-  });
-
-  const cutoff = timestamp - HISTORY_MS;
-
-  history = history.filter(x => x.timestamp >= cutoff);
-}
-
-function getValueAgo(field, milliseconds) {
-  const target = now() - milliseconds;
-
-  let candidate = null;
-
-  for (const item of history) {
-    if (item.timestamp <= target) {
-      candidate = item;
-    }
-  }
-
-  return candidate ? candidate[field] : null;
+  return (
+    mint.slice(0, 6) +
+    "..." +
+    mint.slice(-6)
+  );
 }
 
 function percentageChange(current, old) {
+
   if (
     old === null ||
     old === undefined ||
@@ -192,85 +143,373 @@ function percentageChange(current, old) {
     return null;
   }
 
-  return ((current - old) / old) * 100;
+  return (
+    ((current - old) / old) *
+    100
+  );
+}
+
+/* =========================================================
+   DEXSCREENER
+   ========================================================= */
+
+async function getTokenData(mint) {
+
+  try {
+
+    const response =
+      await fetch(
+        `https://api.dexscreener.com/latest/dex/tokens/${mint}`
+      );
+
+    if (!response.ok) {
+      throw new Error(
+        `HTTP ${response.status}`
+      );
+    }
+
+    const data =
+      await response.json();
+
+    if (
+      !data.pairs ||
+      data.pairs.length === 0
+    ) {
+      return null;
+    }
+
+    // PumpSwap prioritaire
+    const pumpPair =
+      data.pairs.find(pair =>
+        pair.dexId &&
+        pair.dexId
+          .toLowerCase()
+          .includes("pump")
+      );
+
+    const pair =
+      pumpPair || data.pairs[0];
+
+    const price =
+      Number(pair.priceUsd);
+
+    const liquidity =
+      Number(pair.liquidity?.usd);
+
+    const volume24h =
+      Number(pair.volume?.h24 || 0);
+
+    if (
+      !Number.isFinite(price) ||
+      price <= 0
+    ) {
+      return null;
+    }
+
+    if (
+      !Number.isFinite(liquidity)
+    ) {
+      return null;
+    }
+
+    return {
+      price,
+      liquidity,
+      volume24h,
+      dexId:
+        pair.dexId || "unknown",
+      pairAddress:
+        pair.pairAddress || null
+    };
+
+  } catch (err) {
+
+    console.error(
+      "DexScreener :",
+      err.message
+    );
+
+    return null;
+  }
+}
+
+/* =========================================================
+   HISTORIQUE
+   ========================================================= */
+
+function addHistory(data) {
+
+  history.push({
+    timestamp: now(),
+    price: data.price,
+    liquidity: data.liquidity
+  });
+
+  const cutoff =
+    now() - HISTORY_MS;
+
+  history =
+    history.filter(
+      item =>
+        item.timestamp >= cutoff
+    );
+}
+
+function getValueAgo(
+  field,
+  milliseconds
+) {
+
+  const target =
+    now() - milliseconds;
+
+  let candidate = null;
+
+  for (
+    const item of history
+  ) {
+
+    if (
+      item.timestamp <= target
+    ) {
+      candidate = item;
+    }
+  }
+
+  return candidate
+    ? candidate[field]
+    : null;
 }
 
 function getMetrics(data) {
-  const liq10 = getValueAgo("liquidity", 10000);
-  const liq30 = getValueAgo("liquidity", 30000);
-  const price10 = getValueAgo("price", 10000);
+
+  const price10 =
+    getValueAgo(
+      "price",
+      10000
+    );
+
+  const liq10 =
+    getValueAgo(
+      "liquidity",
+      10000
+    );
+
+  const liq30 =
+    getValueAgo(
+      "liquidity",
+      30000
+    );
 
   return {
-    liquidity10s: percentageChange(
-      data.liquidity,
-      liq10
-    ),
 
-    liquidity30s: percentageChange(
-      data.liquidity,
-      liq30
-    ),
+    price10s:
+      percentageChange(
+        data.price,
+        price10
+      ),
 
-    price10s: percentageChange(
-      data.price,
-      price10
-    )
+    liquidity10s:
+      percentageChange(
+        data.liquidity,
+        liq10
+      ),
+
+    liquidity30s:
+      percentageChange(
+        data.liquidity,
+        liq30
+      )
   };
 }
 
 /* =========================================================
-   ANALYSE DU MARCHÉ
+   SCORE DE SANTÉ
    ========================================================= */
 
-function analyzeEntry(data) {
-  const metrics = getMetrics(data);
+function calculateHealthScore(data) {
+
+  const metrics =
+    getMetrics(data);
+
+  let score = 100;
 
   const reasons = [];
 
-  if (data.liquidity < MIN_LIQUIDITY_USD) {
+  // -------------------------------------------------------
+  // LIQUIDITÉ
+  // -------------------------------------------------------
+
+  if (
+    data.liquidity < MIN_LIQUIDITY_USD
+  ) {
+
+    score -= 30;
+
     reasons.push(
-      `liquidité trop faible : $${data.liquidity.toFixed(2)}`
+      "liquidité faible"
     );
   }
 
   if (
-    metrics.liquidity10s !== null &&
-    metrics.liquidity10s <= ENTRY_MAX_LIQ_DROP_10S
+    metrics.liquidity10s !== null
   ) {
-    reasons.push(
-      `liquidité ${metrics.liquidity10s.toFixed(2)}% / 10s`
-    );
+
+    if (
+      metrics.liquidity10s <= -20
+    ) {
+
+      score -= 35;
+
+      reasons.push(
+        `liquidité ${metrics.liquidity10s.toFixed(1)}% / 10s`
+      );
+
+    } else if (
+      metrics.liquidity10s <= -10
+    ) {
+
+      score -= 20;
+
+      reasons.push(
+        `liquidité ${metrics.liquidity10s.toFixed(1)}% / 10s`
+      );
+
+    } else if (
+      metrics.liquidity10s >= 5
+    ) {
+
+      score += 5;
+    }
   }
+
+  // -------------------------------------------------------
+  // LIQUIDITÉ 30s
+  // -------------------------------------------------------
 
   if (
-    metrics.liquidity30s !== null &&
-    metrics.liquidity30s <= ENTRY_MAX_LIQ_DROP_30S
+    metrics.liquidity30s !== null
   ) {
-    reasons.push(
-      `liquidité ${metrics.liquidity30s.toFixed(2)}% / 30s`
-    );
+
+    if (
+      metrics.liquidity30s <= -25
+    ) {
+
+      score -= 30;
+
+      reasons.push(
+        `liquidité ${metrics.liquidity30s.toFixed(1)}% / 30s`
+      );
+
+    } else if (
+      metrics.liquidity30s <= -15
+    ) {
+
+      score -= 15;
+    }
   }
+
+  // -------------------------------------------------------
+  // PRIX
+  // -------------------------------------------------------
 
   if (
-    metrics.price10s !== null &&
-    metrics.price10s <= ENTRY_MAX_PRICE_DROP_10S
+    metrics.price10s !== null
   ) {
-    reasons.push(
-      `prix ${metrics.price10s.toFixed(2)}% / 10s`
+
+    if (
+      metrics.price10s <= -10
+    ) {
+
+      score -= 30;
+
+      reasons.push(
+        `prix ${metrics.price10s.toFixed(1)}% / 10s`
+      );
+
+    } else if (
+      metrics.price10s <= -4
+    ) {
+
+      score -= 15;
+
+      reasons.push(
+        `prix ${metrics.price10s.toFixed(1)}% / 10s`
+      );
+
+    } else if (
+      metrics.price10s > 2
+    ) {
+
+      score += 5;
+    }
+  }
+
+  // -------------------------------------------------------
+  // ACTIVITÉ ON-CHAIN
+  // -------------------------------------------------------
+
+  const buys =
+    onchainStats.buys;
+
+  const sells =
+    onchainStats.sells;
+
+  if (
+    buys > 0 ||
+    sells > 0
+  ) {
+
+    if (
+      buys > sells
+    ) {
+
+      score += 10;
+
+    } else if (
+      sells > buys * 1.5
+    ) {
+
+      score -= 20;
+
+      reasons.push(
+        "pression vendeuse élevée"
+      );
+    }
+  }
+
+  // -------------------------------------------------------
+  // ABSENCE D'ACTIVITÉ
+  // -------------------------------------------------------
+
+  if (
+    onchainStats.lastActivity > 0
+  ) {
+
+    const age =
+      now() -
+      onchainStats.lastActivity;
+
+    if (
+      age > 30000
+    ) {
+
+      score -= 5;
+    }
+  }
+
+  // Bornes
+  score =
+    Math.max(
+      0,
+      Math.min(
+        100,
+        score
+      )
     );
-  }
-
-  // Il faut suffisamment de données pour éviter
-  // d'acheter immédiatement sur une information incomplète.
-  const enoughHistory =
-    history.length >= 8;
-
-  if (!enoughHistory) {
-    reasons.push("historique encore insuffisant");
-  }
 
   return {
-    healthy: reasons.length === 0,
+    score,
     reasons,
     metrics
   };
@@ -281,20 +520,28 @@ function analyzeEntry(data) {
    ========================================================= */
 
 function analyzeCrash(data) {
-  const metrics = getMetrics(data);
+
+  const metrics =
+    getMetrics(data);
 
   const reasons = [];
 
-  if (data.liquidity <= CRASH_MIN_LIQUIDITY_USD) {
+  if (
+    data.liquidity <=
+    CRASH_MIN_LIQUIDITY_USD
+  ) {
+
     reasons.push(
-      `liquidité quasi nulle : $${data.liquidity.toFixed(2)}`
+      "liquidité quasi nulle"
     );
   }
 
   if (
     metrics.liquidity10s !== null &&
-    metrics.liquidity10s <= CRASH_LIQ_DROP_10S
+    metrics.liquidity10s <=
+      CRASH_LIQ_DROP_10S
   ) {
+
     reasons.push(
       `liquidité ${metrics.liquidity10s.toFixed(2)}% / 10s`
     );
@@ -302,43 +549,267 @@ function analyzeCrash(data) {
 
   if (
     metrics.price10s !== null &&
-    metrics.price10s <= CRASH_PRICE_DROP_10S
+    metrics.price10s <=
+      CRASH_PRICE_DROP_10S
   ) {
+
     reasons.push(
       `prix ${metrics.price10s.toFixed(2)}% / 10s`
     );
   }
 
   return {
-    crash: reasons.length > 0,
+    crash:
+      reasons.length > 0,
+
     reasons,
+
     metrics
   };
+}
+
+/* =========================================================
+   HELIUS WEBSOCKET
+   ========================================================= */
+
+function connectHelius() {
+
+  if (!HELIUS_API_KEY) {
+
+    console.log(
+      "⚠️ HELIUS_API_KEY absente"
+    );
+
+    return;
+  }
+
+  if (!currentToken) {
+    return;
+  }
+
+  try {
+
+    if (heliusWs) {
+      try {
+        heliusWs.close();
+      } catch {}
+    }
+
+    const url =
+      `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+
+    heliusWs =
+      new WebSocket(url);
+
+    heliusWs.on(
+      "open",
+      () => {
+
+        heliusConnected = true;
+
+        console.log(
+          "🟢 Helius WSS connecté"
+        );
+
+        /*
+         * On écoute les transactions PumpSwap.
+         *
+         * L'objectif V4 est d'obtenir un signal
+         * supplémentaire d'activité on-chain.
+         */
+
+        heliusWs.send(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "logsSubscribe",
+            params: [
+              {
+                mentions: [
+                  PUMPSWAP_PROGRAM
+                ]
+              },
+              {
+                commitment: "processed"
+              }
+            ]
+          })
+        );
+      }
+    );
+
+    heliusWs.on(
+      "message",
+      raw => {
+
+        try {
+
+          const msg =
+            JSON.parse(
+              raw.toString()
+            );
+
+          if (
+            !msg.params ||
+            !msg.params.result
+          ) {
+            return;
+          }
+
+          const value =
+            msg.params.result.value;
+
+          if (!value) {
+            return;
+          }
+
+          const logs =
+            value.logs || [];
+
+          /*
+           * On utilise les logs uniquement
+           * comme indicateur d'activité.
+           *
+           * On ne prétend PAS décoder ici
+           * BUY/SELL avec certitude.
+           */
+
+          const text =
+            logs.join(" ").toLowerCase();
+
+          onchainStats.lastActivity =
+            now();
+
+          if (
+            text.includes("buy")
+          ) {
+
+            onchainStats.buys++;
+
+          } else if (
+            text.includes("sell")
+          ) {
+
+            onchainStats.sells++;
+
+          }
+
+          // Empêche les compteurs de grossir
+          // indéfiniment
+          if (
+            onchainStats.buys +
+            onchainStats.sells >
+            100
+          ) {
+
+            onchainStats.buys =
+              Math.floor(
+                onchainStats.buys / 2
+              );
+
+            onchainStats.sells =
+              Math.floor(
+                onchainStats.sells / 2
+              );
+          }
+
+        } catch (err) {
+
+          console.error(
+            "Helius message :",
+            err.message
+          );
+        }
+      }
+    );
+
+    heliusWs.on(
+      "close",
+      () => {
+
+        heliusConnected = false;
+
+        console.log(
+          "🔴 Helius WSS déconnecté"
+        );
+
+        if (running) {
+
+          setTimeout(
+            () => {
+
+              if (running) {
+                connectHelius();
+              }
+
+            },
+            5000
+          );
+        }
+      }
+    );
+
+    heliusWs.on(
+      "error",
+      err => {
+
+        console.error(
+          "Helius WSS :",
+          err.message
+        );
+      }
+    );
+
+  } catch (err) {
+
+    console.error(
+      "Erreur Helius :",
+      err.message
+    );
+  }
 }
 
 /* =========================================================
    ACHAT TEST
    ========================================================= */
 
-async function simulatedBuy(data) {
+async function simulatedBuy(
+  data,
+  health
+) {
 
   cycleNumber++;
 
-  const amount = CAPITAL_PER_CYCLE_USD;
+  const amount =
+    CAPITAL_PER_CYCLE_USD;
 
-  const tokens = amount / data.price;
+  const tokens =
+    amount / data.price;
 
   const targetPrice =
     data.price *
-    (1 + TARGET_NET_PERCENT / 100);
+    (
+      1 +
+      TARGET_NET_PERCENT / 100
+    );
 
   position = {
-    cycle: cycleNumber,
-    invested: amount,
-    entryPrice: data.price,
+
+    cycle:
+      cycleNumber,
+
+    invested:
+      amount,
+
+    entryPrice:
+      data.price,
+
     tokens,
+
     targetPrice,
-    entryLiquidity: data.liquidity
+
+    entryLiquidity:
+      data.liquidity
   };
 
   await sendTelegram(
@@ -347,15 +818,28 @@ async function simulatedBuy(data) {
 Token : ${shortToken(currentToken)}
 
 Mise fixe : $${amount.toFixed(4)}
-Prix simulé : $${data.price.toFixed(8)}
+
+Prix : $${data.price.toFixed(8)}
+
 Tokens : ${tokens.toFixed(8)}
 
-🎯 Objectif : +${TARGET_NET_PERCENT.toFixed(2)}%
-Prix cible : $${targetPrice.toFixed(8)}
+🎯 Objectif :
++${TARGET_NET_PERCENT.toFixed(2)}%
 
-💧 Liquidité : $${data.liquidity.toFixed(2)}
+Prix cible :
+$${targetPrice.toFixed(8)}
 
-🛡️ Filtre d'entrée : OK`
+💧 Liquidité :
+$${data.liquidity.toFixed(2)}
+
+🧠 SCORE DE SANTÉ :
+${health.score}/100
+
+🛡️ Entrée confirmée :
+${REQUIRED_HEALTHY_READINGS}/${REQUIRED_HEALTHY_READINGS}
+
+⛓️ Helius :
+${heliusConnected ? "🟢 connecté" : "🟠 non connecté"}`
   );
 }
 
@@ -365,54 +849,70 @@ Prix cible : $${targetPrice.toFixed(8)}
 
 async function simulatedSell() {
 
-  if (!position) return;
+  if (!position) {
+    return;
+  }
 
-  /*
-    IMPORTANT :
-
-    On vend au prix cible exact.
-
-    Cela évite de transformer un polling toutes les 2 secondes
-    en bénéfice artificiellement supérieur à l'objectif.
-  */
-
-  const executionPrice = position.targetPrice;
+  // Prix cible exact
+  const executionPrice =
+    position.targetPrice;
 
   const amountReceived =
-    position.tokens * executionPrice;
+    position.tokens *
+    executionPrice;
 
   const profit =
-    amountReceived - position.invested;
+    amountReceived -
+    position.invested;
 
   const percent =
-    (profit / position.invested) * 100;
+    (
+      profit /
+      position.invested
+    ) * 100;
 
-  cumulativeProfit += profit;
+  cumulativeProfit +=
+    profit;
+
   completedCycles++;
 
-  const cycle = position.cycle;
+  const cycle =
+    position.cycle;
 
   position = null;
 
   cooldownUntil =
-    now() + ENTRY_COOLDOWN_MS;
+    now() +
+    ENTRY_COOLDOWN_MS;
+
+  healthyReadings = 0;
 
   await sendTelegram(
 `🔴 VENTE TEST #${cycle}
 
 Token : ${shortToken(currentToken)}
 
-Prix de vente : $${executionPrice.toFixed(8)}
+Prix de vente :
+$${executionPrice.toFixed(8)}
 
-Montant simulé : $${amountReceived.toFixed(4)}
+Montant simulé :
+$${amountReceived.toFixed(4)}
 
-Résultat : +${percent.toFixed(2)}%
-Bénéfice réalisé : $${profit.toFixed(4)}
+Résultat :
++${percent.toFixed(2)}%
 
-💰 Bénéfices cumulés : $${cumulativeProfit.toFixed(4)}
+Bénéfice réalisé :
+$${profit.toFixed(4)}
 
-⏳ PAUSE AVANT NOUVEL ACHAT
-Observation du marché pendant ${ENTRY_COOLDOWN_MS / 1000}s`
+💰 Bénéfices cumulés :
+$${cumulativeProfit.toFixed(4)}
+
+🛡️ NOUVELLE PHASE DE SÉCURITÉ
+
+⏳ Observation :
+30 secondes minimum
+
+❌ Aucun rachat immédiat.`
   );
 }
 
@@ -420,23 +920,39 @@ Observation du marché pendant ${ENTRY_COOLDOWN_MS / 1000}s`
    STOP CRASH
    ========================================================= */
 
-async function emergencyStop(data, crashAnalysis) {
+async function emergencyStop(
+  data,
+  crash
+) {
 
-  if (crashed) return;
+  if (crashed) {
+    return;
+  }
 
   crashed = true;
   running = false;
 
   if (pollTimer) {
-    clearInterval(pollTimer);
+
+    clearInterval(
+      pollTimer
+    );
+
     pollTimer = null;
   }
 
-  let positionMessage = "";
+  if (heliusWs) {
+
+    try {
+      heliusWs.close();
+    } catch {}
+  }
+
+  let positionText;
 
   if (position) {
 
-    positionMessage =
+    positionText =
 `⚠️ Position restante :
 ${position.tokens.toFixed(8)} tokens
 
@@ -445,110 +961,193 @@ ${position.tokens.toFixed(8)} tokens
 
   } else {
 
-    positionMessage =
-`✅ Aucune position ouverte au moment du crash.`;
+    positionText =
+      "✅ Aucune position ouverte.";
   }
 
   await sendTelegram(
-`🚨 STOP CRASH - MODE TEST
+`🚨 STOP CRASH - MODE TEST V4
 
-Token : ${shortToken(currentToken)}
+Token :
+${shortToken(currentToken)}
 
-Prix : $${data.price.toFixed(8)}
+Prix :
+$${data.price.toFixed(8)}
 
 Variation prix ~10s :
-${crashAnalysis.metrics.price10s !== null
-  ? crashAnalysis.metrics.price10s.toFixed(2) + "%"
-  : "N/D"}
+${
+  crash.metrics.price10s !== null
+    ? crash.metrics.price10s.toFixed(2) + "%"
+    : "N/D"
+}
 
 Liquidité :
 $${data.liquidity.toFixed(2)}
 
 Variation liquidité ~10s :
-${crashAnalysis.metrics.liquidity10s !== null
-  ? crashAnalysis.metrics.liquidity10s.toFixed(2) + "%"
-  : "N/D"}
+${
+  crash.metrics.liquidity10s !== null
+    ? crash.metrics.liquidity10s.toFixed(2) + "%"
+    : "N/D"
+}
 
 ⚠️ Signaux :
-• ${crashAnalysis.reasons.join("\n• ")}
+• ${crash.reasons.join("\n• ")}
 
-${positionMessage}
+${positionText}
 
 ⛔ NOUVEAU CYCLE BLOQUÉ
 ⛔ RADAR ARRÊTÉ
 
-Cycles terminés : ${completedCycles}
+Cycles terminés :
+${completedCycles}
 
-💰 Bénéfices réellement simulés :
+💰 Bénéfices simulés :
 $${cumulativeProfit.toFixed(4)}
 
-⚠️ Ceci reste une simulation.`
+⚠️ Simulation uniquement.`
   );
 }
 
 /* =========================================================
-   AUTORISATION D'ACHAT
+   TEST D'ENTRÉE
    ========================================================= */
 
-async function tryEntry(data) {
+async function tryEntry(
+  data
+) {
 
-  if (!running || crashed) return;
-
-  if (position) return;
-
-  // Cooldown après vente
-  if (now() < cooldownUntil) {
+  if (!running || crashed) {
     return;
   }
 
-  const analysis = analyzeEntry(data);
+  if (position) {
+    return;
+  }
 
-  if (!analysis.healthy) {
+  // Cooldown
+  if (
+    now() <
+    cooldownUntil
+  ) {
+    return;
+  }
 
-    // On évite de spammer Telegram à chaque passage.
-    if (!tryEntry.lastWarning ||
-        now() - tryEntry.lastWarning > 10000) {
+  const health =
+    calculateHealthScore(data);
 
-      tryEntry.lastWarning = now();
+  /*
+   * Si le score est insuffisant,
+   * on remet le compteur à zéro.
+   */
+
+  if (
+    health.score <
+    MIN_ENTRY_SCORE
+  ) {
+
+    healthyReadings = 0;
+
+    if (
+      now() -
+      lastEntryWarning >
+      10000
+    ) {
+
+      lastEntryWarning =
+        now();
 
       await sendTelegram(
-`⛔ ACHAT REFUSÉ
+`🟠 ACHAT REFUSÉ
 
-Token : ${shortToken(currentToken)}
+Token :
+${shortToken(currentToken)}
 
-Le marché n'est pas suffisamment sain.
+🧠 Score santé :
+${health.score}/100
 
-⚠️ Raisons :
-• ${analysis.reasons.join("\n• ")}
+🎯 Minimum requis :
+${MIN_ENTRY_SCORE}/100
 
-💧 Liquidité :
-$${data.liquidity.toFixed(2)}
+⚠️ Signaux :
+${
+  health.reasons.length
+    ? "• " +
+      health.reasons.join(
+        "\n• "
+      )
+    : "• conditions insuffisantes"
+}
 
-📊 Prix :
-$${data.price.toFixed(8)}
-
-⏳ Surveillance en cours...`
+⏳ Le bot continue d'observer.`
       );
     }
 
     return;
   }
 
-  await simulatedBuy(data);
+  /*
+   * Score suffisant.
+   *
+   * Mais on exige plusieurs lectures
+   * consécutives favorables.
+   */
+
+  healthyReadings++;
+
+  if (
+    healthyReadings <
+    REQUIRED_HEALTHY_READINGS
+  ) {
+
+    if (
+      healthyReadings === 1
+    ) {
+
+      await sendTelegram(
+`🟡 MARCHÉ FAVORABLE
+
+Score :
+${health.score}/100
+
+Confirmation :
+1/${REQUIRED_HEALTHY_READINGS}
+
+⏳ Pas encore d'achat.
+
+Le bot veut confirmer que la situation reste saine.`
+      );
+    }
+
+    return;
+  }
+
+  await simulatedBuy(
+    data,
+    health
+  );
+
+  healthyReadings = 0;
 }
 
 /* =========================================================
-   BOUCLE PRINCIPALE
+   MONITORING
    ========================================================= */
 
 async function monitor() {
 
-  if (!running || crashed || !currentToken) {
+  if (
+    !running ||
+    crashed ||
+    !currentToken
+  ) {
     return;
   }
 
   const data =
-    await getTokenData(currentToken);
+    await getTokenData(
+      currentToken
+    );
 
   if (!data) {
     return;
@@ -556,62 +1155,66 @@ async function monitor() {
 
   addHistory(data);
 
-  lastPrice = data.price;
-  lastLiquidity = data.liquidity;
+  // -------------------------------------------------------
+  // CRASH
+  // -------------------------------------------------------
 
-  // =========================================
-  // CRASH PRIORITAIRE
-  // =========================================
-
-  const crashAnalysis =
+  const crash =
     analyzeCrash(data);
 
-  if (crashAnalysis.crash) {
+  if (crash.crash) {
 
     await emergencyStop(
       data,
-      crashAnalysis
+      crash
     );
 
     return;
   }
 
-  // =========================================
+  // -------------------------------------------------------
   // POSITION OUVERTE
-  // =========================================
+  // -------------------------------------------------------
 
   if (position) {
 
     if (
-      data.price >= position.targetPrice
+      data.price >=
+      position.targetPrice
     ) {
+
       await simulatedSell();
     }
 
     return;
   }
 
-  // =========================================
-  // PAS DE POSITION
-  // =========================================
+  // -------------------------------------------------------
+  // NOUVELLE ENTRÉE
+  // -------------------------------------------------------
 
   await tryEntry(data);
 }
 
 /* =========================================================
-   START TRADE
+   START
    ========================================================= */
 
-async function startTrade(mint) {
+async function startTrade(
+  mint
+) {
 
   if (running) {
+
     await sendTelegram(
       "⚠️ Un test est déjà en cours."
     );
+
     return;
   }
 
   if (!mint) {
+
     await sendTelegram(
 `❌ Mint manquant.
 
@@ -619,10 +1222,12 @@ Utilisation :
 
 /starttrade ADRESSE_DU_TOKEN`
     );
+
     return;
   }
 
-  currentToken = mint.trim();
+  currentToken =
+    mint.trim();
 
   running = true;
   crashed = false;
@@ -631,42 +1236,56 @@ Utilisation :
 
   cycleNumber = 0;
   completedCycles = 0;
+
   cumulativeProfit = 0;
 
   history = [];
 
-  lastPrice = null;
-  lastLiquidity = null;
-
   cooldownUntil = 0;
 
-  tryEntry.lastWarning = 0;
+  healthyReadings = 0;
+
+  lastEntryWarning = 0;
+
+  onchainStats = {
+    buys: 0,
+    sells: 0,
+    buyVolumeSol: 0,
+    sellVolumeSol: 0,
+    lastActivity: 0
+  };
 
   await sendTelegram(
-`🚀 TEST V3 DÉMARRÉ
+`🚀 TEST V4 DÉMARRÉ
 
 Token :
 ${shortToken(currentToken)}
 
-💵 Capital par cycle :
+💵 Capital :
 $${CAPITAL_PER_CYCLE_USD.toFixed(2)}
 
 🎯 Objectif :
 +${TARGET_NET_PERCENT.toFixed(2)}%
 
-⏳ Cooldown après vente :
+⏳ Cooldown :
 ${ENTRY_COOLDOWN_MS / 1000}s
 
-🛡️ Nouveau filtre :
-Le bot ne rachète PAS automatiquement.
+🧠 Score minimum :
+${MIN_ENTRY_SCORE}/100
 
-Il attend que le marché soit suffisamment sain.
+🛡️ Confirmations nécessaires :
+${REQUIRED_HEALTHY_READINGS}
 
-⛔ Crash :
-arrêt définitif du test.
+📡 Sources :
+• DEX Screener
+• Helius on-chain
 
-📡 Surveillance en cours...`
+⛔ Crash = arrêt définitif
+
+⚠️ Simulation uniquement.`
   );
+
+  connectHelius();
 
   pollTimer =
     setInterval(
@@ -674,42 +1293,56 @@ arrêt définitif du test.
       POLL_INTERVAL_MS
     );
 
-  // Premier passage immédiat
   await monitor();
 }
 
 /* =========================================================
-   STOP MANUEL
+   STOP
    ========================================================= */
 
 async function stopTrade() {
 
   if (!running) {
+
     await sendTelegram(
       "ℹ️ Aucun test en cours."
     );
+
     return;
   }
 
   running = false;
 
   if (pollTimer) {
-    clearInterval(pollTimer);
+
+    clearInterval(
+      pollTimer
+    );
+
     pollTimer = null;
   }
 
+  if (heliusWs) {
+
+    try {
+      heliusWs.close();
+    } catch {}
+  }
+
   await sendTelegram(
-`🛑 TEST ARRÊTÉ MANUELLEMENT
+`🛑 TEST ARRÊTÉ
 
 Cycles terminés :
 ${completedCycles}
 
-💰 Bénéfices simulés :
+💰 Bénéfices :
 $${cumulativeProfit.toFixed(4)}
 
-${position
-  ? "⚠️ Une position simulée était encore ouverte."
-  : "✅ Aucune position ouverte."}`
+${
+  position
+    ? "⚠️ Position simulée encore ouverte."
+    : "✅ Aucune position."
+}`
   );
 }
 
@@ -720,25 +1353,24 @@ ${position
 async function status() {
 
   if (!currentToken) {
+
     await sendTelegram(
       "ℹ️ Aucun token chargé."
     );
+
     return;
   }
 
-  let positionText =
-    "Aucune position";
-
-  if (position) {
-    positionText =
-`Position #${position.cycle}
-Mise : $${position.invested.toFixed(2)}
+  const positionText =
+    position
+      ? `Position #${position.cycle}
 Entrée : $${position.entryPrice.toFixed(8)}
-Cible : $${position.targetPrice.toFixed(8)}`
-  }
+Cible : $${position.targetPrice.toFixed(8)}
+Mise : $${position.invested.toFixed(2)}`
+      : "Aucune position";
 
   await sendTelegram(
-`📊 STATUS TEST V3
+`📊 STATUS V4
 
 Token :
 ${shortToken(currentToken)}
@@ -746,74 +1378,105 @@ ${shortToken(currentToken)}
 Radar :
 ${running ? "🟢 ACTIF" : "🔴 ARRÊTÉ"}
 
-Cycles terminés :
+Helius :
+${heliusConnected ? "🟢 connecté" : "🔴 déconnecté"}
+
+Cycles :
 ${completedCycles}
 
 💰 Bénéfices :
 $${cumulativeProfit.toFixed(4)}
 
-${positionText}
+🧠 Confirmations :
+${healthyReadings}/${REQUIRED_HEALTHY_READINGS}
 
-💵 Capital/cycle :
-$${CAPITAL_PER_CYCLE_USD.toFixed(2)}
+⛓️ Activité :
+${onchainStats.buys} achats détectés
+${onchainStats.sells} ventes détectées
 
-🎯 Objectif :
-+${TARGET_NET_PERCENT.toFixed(2)}%`
+${positionText}`
   );
 }
 
 /* =========================================================
-   COMMANDES TELEGRAM
+   HELP
    ========================================================= */
 
-bot.command("starttrade", async ctx => {
-
-  const text = ctx.message.text || "";
-
-  const parts =
-    text.split(/\s+/);
-
-  const mint = parts[1];
-
-  await startTrade(mint);
-});
-
-bot.command("stoptrade", async ctx => {
-  await stopTrade();
-});
-
-bot.command("status", async ctx => {
-  await status();
-});
-
-bot.command("help", async ctx => {
+async function help() {
 
   await sendTelegram(
-`🤖 TEST V3
+`🤖 TEST V4
 
 /starttrade MINT
 ➡️ démarre un test
 
+/status
+➡️ état du bot
+
 /stoptrade
 ➡️ arrête le test
 
-/status
-➡️ affiche l'état
-
 💵 Capital :
-$${CAPITAL_PER_CYCLE_USD.toFixed(2)} par cycle
+$10 par cycle
 
 🎯 Objectif :
-+${TARGET_NET_PERCENT.toFixed(2)}%
++5%
 
-🛡️ Particularité V3 :
-Après une vente, le bot ne rachète plus immédiatement.
+🧠 Score santé :
+minimum 80/100
 
-Il observe le marché et bloque l'entrée si les conditions deviennent mauvaises.
+⏳ Après chaque vente :
+30 secondes minimum
+
+🛡️ Avant chaque achat :
+4 confirmations favorables
+
+📡 Sources :
+DEX Screener + Helius
 
 ⚠️ Simulation uniquement.`
   );
-});
+}
+
+/* =========================================================
+   COMMANDES
+   ========================================================= */
+
+bot.command(
+  "starttrade",
+  async ctx => {
+
+    const parts =
+      ctx.message.text
+        .trim()
+        .split(/\s+/);
+
+    await startTrade(
+      parts[1]
+    );
+  }
+);
+
+bot.command(
+  "status",
+  async () => {
+    await status();
+  }
+);
+
+bot.command(
+  "stoptrade",
+  async () => {
+    await stopTrade();
+  }
+);
+
+bot.command(
+  "help",
+  async () => {
+    await help();
+  }
+);
 
 /* =========================================================
    LANCEMENT
@@ -821,13 +1484,19 @@ Il observe le marché et bloque l'entrée si les conditions deviennent mauvaises
 
 bot.launch()
   .then(() => {
-    console.log("🤖 Bot Telegram TEST V3 démarré");
+
+    console.log(
+      "🤖 Bot Telegram TEST V4 démarré"
+    );
+
   })
   .catch(err => {
+
     console.error(
       "Erreur lancement bot :",
       err.message
     );
+
   });
 
 process.once(
