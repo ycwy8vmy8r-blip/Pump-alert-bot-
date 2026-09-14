@@ -1,1262 +1,841 @@
 const { Telegraf } = require("telegraf");
+const fetch = global.fetch;
 
-// ============================================================
-// RADAR TRADING V2 - MODE TEST
-// ============================================================
-//
-// ⚠️ CETTE VERSION NE FAIT AUCUN TRADE RÉEL.
-//
-// STRATÉGIE :
-// 1. Achat simulé de 1 $
-// 2. Objectif +50 %
-// 3. Vente simulée si objectif atteint
-// 4. Bénéfice conservé, jamais réinvesti
-// 5. Nouveau cycle de 1 $
-// 6. Surveillance permanente de la liquidité
-// 7. Sortie d'urgence si la liquidité s'effondre
-// 8. Arrêt définitif après crash
-//
-// ============================================================
-
-// ------------------------------------------------------------
-// CONFIGURATION
-// ------------------------------------------------------------
+/* =========================================================
+   CONFIGURATION
+   ========================================================= */
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 
-if (!BOT_TOKEN) {
-  console.error("❌ BOT_TOKEN manquant.");
-  process.exit(1);
-}
-
-if (!CHAT_ID) {
-  console.error("❌ CHAT_ID manquant.");
+if (!BOT_TOKEN || !CHAT_ID) {
+  console.error("❌ BOT_TOKEN ou CHAT_ID manquant");
   process.exit(1);
 }
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// ------------------------------------------------------------
-// PARAMÈTRES DE LA STRATÉGIE
-// ------------------------------------------------------------
-
+// ===== STRATÉGIE TEST =====
 const CAPITAL_PER_CYCLE_USD = 10.00;
 const TARGET_NET_PERCENT = 5.00;
 
-// ------------------------------------------------------------
-// PROTECTION LIQUIDITÉ
-// ------------------------------------------------------------
+// ===== SURVEILLANCE =====
+const POLL_INTERVAL_MS = 2000;
+const HISTORY_MS = 120000;
 
-// Surveillance toutes les 2 secondes.
-const POLL_INTERVAL_MS = 2_000;
+// Temps minimum d'observation après une vente
+const ENTRY_COOLDOWN_MS = 15000;
 
-// Historique conservé.
-const HISTORY_MAX_MS = 120_000;
+// ===== FILTRES D'ENTRÉE =====
 
-// Fenêtre courte pour la protection.
-const LIQUIDITY_WINDOW_MS = 10_000;
+// On refuse une entrée si la liquidité baisse trop vite
+const ENTRY_MAX_LIQ_DROP_10S = -12;
 
-// Niveaux d'urgence.
-const LIQUIDITY_WARNING_PERCENT = -20;
-const LIQUIDITY_DANGER_PERCENT = -35;
-const LIQUIDITY_CRITICAL_PERCENT = -50;
+// On refuse une entrée si le prix baisse trop vite
+const ENTRY_MAX_PRICE_DROP_10S = -5;
 
-// Crash immédiat si disparition quasi totale.
-const LIQUIDITY_ZERO_USD = 1;
+// On refuse une entrée si la liquidité baisse fortement
+// sur une fenêtre plus longue
+const ENTRY_MAX_LIQ_DROP_30S = -20;
 
-// Crash prix classique.
-const CRASH_PRICE_DROP_PERCENT = -20;
+// Liquidité minimale absolue
+const MIN_LIQUIDITY_USD = 3000;
 
-// ------------------------------------------------------------
-// ETAT
-// ------------------------------------------------------------
+// ===== CRASH =====
 
-let trading = false;
-let stoppedByCrash = false;
+const CRASH_LIQ_DROP_10S = -50;
+const CRASH_PRICE_DROP_10S = -20;
+const CRASH_MIN_LIQUIDITY_USD = 1;
 
-let watchedMint = null;
+// =========================================================
+// ÉTAT DU BOT
+// =========================================================
 
-let timer = null;
-let requestInProgress = false;
+let running = false;
+let crashed = false;
 
-let market = {
-  priceUsd: null,
-  liquidityUsd: null,
-  pairAddress: null,
-  dexId: null,
-  updatedAt: 0
-};
+let currentToken = null;
+
+let position = null;
+
+let cycleNumber = 0;
+let completedCycles = 0;
+
+let cumulativeProfit = 0;
+
+let lastPrice = null;
+let lastLiquidity = null;
 
 let history = [];
 
-let strategy = {
-  state: "IDLE",
+let cooldownUntil = 0;
 
-  cycle: 0,
+let pollTimer = null;
 
-  tokensHeld: 0,
+/* =========================================================
+   OUTILS
+   ========================================================= */
 
-  entryPrice: 0,
-  entryTime: 0,
-
-  realizedProfit: 0,
-
-  totalInvested: 0,
-  totalReturned: 0,
-
-  completedCycles: 0,
-
-  lastBuyPrice: 0,
-  lastSellPrice: 0,
-
-  lastActionAt: 0,
-
-  crashReason: null
-};
-
-// ------------------------------------------------------------
-// OUTILS
-// ------------------------------------------------------------
-
-function fmtUsd(value) {
-  if (!Number.isFinite(value)) {
-    return "N/A";
-  }
-
-  if (value >= 1) {
-    return `$${value.toFixed(4)}`;
-  }
-
-  if (value >= 0.01) {
-    return `$${value.toFixed(6)}`;
-  }
-
-  return `$${value.toFixed(10)}`;
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function fmtMoney(value) {
-  if (!Number.isFinite(value)) {
-    return "$0.00";
-  }
-
-  return `$${value.toFixed(4)}`;
+function shortToken(mint) {
+  if (!mint) return "???";
+  return mint.slice(0, 6) + "..." + mint.slice(-6);
 }
 
-function fmtPercent(value) {
-  if (!Number.isFinite(value)) {
-    return "N/A";
-  }
-
-  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
+function now() {
+  return Date.now();
 }
 
-function shortenMint(mint) {
-  if (!mint) {
-    return "N/A";
-  }
-
-  return `${mint.slice(0, 6)}...${mint.slice(-6)}`;
-}
-
-function getChatId(ctx) {
-  return String(ctx.chat.id);
-}
-
-function isAuthorized(ctx) {
-  return getChatId(ctx) === String(CHAT_ID);
-}
-
-async function send(text) {
+async function sendTelegram(message) {
   try {
-    await bot.telegram.sendMessage(CHAT_ID, text);
+    await bot.telegram.sendMessage(CHAT_ID, message);
   } catch (err) {
-    console.error(
-      "❌ Telegram send error:",
-      err.message
-    );
+    console.error("Erreur Telegram :", err.message);
   }
 }
 
-// ------------------------------------------------------------
-// DEXSCREENER
-// ------------------------------------------------------------
+/* =========================================================
+   DEXSCREENER
+   ========================================================= */
 
-async function fetchPumpSwapMarket(mint) {
-  const url =
-    `https://api.dexscreener.com/latest/dex/tokens/${encodeURIComponent(mint)}`;
-
-  const controller = new AbortController();
-
-  const timeout = setTimeout(() => {
-    controller.abort();
-  }, 8000);
-
+async function getTokenData(mint) {
   try {
-    const response = await fetch(url, {
-      method: "GET",
-      headers: {
-        accept: "application/json"
-      },
-      signal: controller.signal
-    });
+    const response = await fetch(
+      `https://api.dexscreener.com/latest/dex/tokens/${mint}`
+    );
 
     if (!response.ok) {
-      throw new Error(
-        `DexScreener HTTP ${response.status}`
-      );
+      throw new Error(`DexScreener HTTP ${response.status}`);
     }
 
     const data = await response.json();
 
-    const pairs = Array.isArray(data.pairs)
-      ? data.pairs
-      : [];
-
-    const pumpPairs = pairs.filter(pair => {
-      return String(pair.dexId || "").toLowerCase() === "pumpswap";
-    });
-
-    if (pumpPairs.length === 0) {
-      throw new Error(
-        "Aucune paire PumpSwap trouvée."
-      );
+    if (!data.pairs || data.pairs.length === 0) {
+      return null;
     }
 
-    pumpPairs.sort((a, b) => {
-      const liqA =
-        Number(a?.liquidity?.usd || 0);
+    // On privilégie PumpSwap
+    let pair =
+      data.pairs.find(p => {
+        return (
+          p.dexId &&
+          p.dexId.toLowerCase().includes("pump")
+        );
+      }) || data.pairs[0];
 
-      const liqB =
-        Number(b?.liquidity?.usd || 0);
+    const price = Number(pair.priceUsd);
+    const liquidity = Number(pair.liquidity?.usd);
 
-      return liqB - liqA;
-    });
+    if (!Number.isFinite(price) || price <= 0) {
+      return null;
+    }
 
-    const pair = pumpPairs[0];
-
-    const priceUsd =
-      Number(pair.priceUsd);
-
-    const liquidityUsd =
-      Number(pair?.liquidity?.usd || 0);
-
-    if (
-      !Number.isFinite(priceUsd) ||
-      priceUsd <= 0
-    ) {
-      throw new Error(
-        "Prix PumpSwap invalide."
-      );
+    if (!Number.isFinite(liquidity)) {
+      return null;
     }
 
     return {
-      priceUsd,
-      liquidityUsd,
-      pairAddress:
-        pair.pairAddress || null,
-      dexId:
-        pair.dexId || "pumpswap"
+      price,
+      liquidity,
+      dexId: pair.dexId || "unknown",
+      pairAddress: pair.pairAddress || null
     };
 
-  } finally {
-    clearTimeout(timeout);
+  } catch (err) {
+    console.error("DexScreener :", err.message);
+    return null;
   }
 }
 
-// ------------------------------------------------------------
-// HISTORIQUE
-// ------------------------------------------------------------
+/* =========================================================
+   HISTORIQUE
+   ========================================================= */
 
-function addMarketPoint() {
-  if (
-    !Number.isFinite(market.priceUsd) ||
-    !Number.isFinite(market.liquidityUsd)
-  ) {
-    return;
-  }
-
-  const now = Date.now();
+function addHistory(data) {
+  const timestamp = now();
 
   history.push({
-    time: now,
-    price: market.priceUsd,
-    liquidity: market.liquidityUsd
+    timestamp,
+    price: data.price,
+    liquidity: data.liquidity
   });
 
-  const cutoff =
-    now - HISTORY_MAX_MS;
+  const cutoff = timestamp - HISTORY_MS;
 
-  history = history.filter(
-    point => point.time >= cutoff
-  );
+  history = history.filter(x => x.timestamp >= cutoff);
 }
 
-function getOldestPointWithin(windowMs) {
-  const now = Date.now();
-  const target =
-    now - windowMs;
+function getValueAgo(field, milliseconds) {
+  const target = now() - milliseconds;
 
   let candidate = null;
 
-  for (const point of history) {
-    if (point.time <= target) {
-      candidate = point;
+  for (const item of history) {
+    if (item.timestamp <= target) {
+      candidate = item;
     }
   }
 
-  if (candidate) {
-    return candidate;
-  }
-
-  return history.length > 0
-    ? history[0]
-    : null;
+  return candidate ? candidate[field] : null;
 }
 
-function percentageChange(
-  current,
-  previous
-) {
+function percentageChange(current, old) {
   if (
-    !Number.isFinite(current) ||
-    !Number.isFinite(previous) ||
-    previous <= 0
+    old === null ||
+    old === undefined ||
+    !Number.isFinite(old) ||
+    old === 0
   ) {
     return null;
   }
 
-  return (
-    ((current - previous) / previous) *
-    100
-  );
+  return ((current - old) / old) * 100;
 }
 
-function getPriceChange(windowMs) {
-  const old =
-    getOldestPointWithin(windowMs);
+function getMetrics(data) {
+  const liq10 = getValueAgo("liquidity", 10000);
+  const liq30 = getValueAgo("liquidity", 30000);
+  const price10 = getValueAgo("price", 10000);
 
-  if (!old) {
-    return null;
-  }
+  return {
+    liquidity10s: percentageChange(
+      data.liquidity,
+      liq10
+    ),
 
-  return percentageChange(
-    market.priceUsd,
-    old.price
-  );
+    liquidity30s: percentageChange(
+      data.liquidity,
+      liq30
+    ),
+
+    price10s: percentageChange(
+      data.price,
+      price10
+    )
+  };
 }
 
-function getLiquidityChange(windowMs) {
-  const old =
-    getOldestPointWithin(windowMs);
+/* =========================================================
+   ANALYSE DU MARCHÉ
+   ========================================================= */
 
-  if (!old) {
-    return null;
-  }
-
-  return percentageChange(
-    market.liquidityUsd,
-    old.liquidity
-  );
-}
-
-// ------------------------------------------------------------
-// ANALYSE DE LA LIQUIDITÉ
-// ------------------------------------------------------------
-
-function analyseLiquidity() {
-  const change =
-    getLiquidityChange(
-      LIQUIDITY_WINDOW_MS
-    );
+function analyzeEntry(data) {
+  const metrics = getMetrics(data);
 
   const reasons = [];
 
-  if (
-    Number.isFinite(change) &&
-    change <= LIQUIDITY_CRITICAL_PERCENT
-  ) {
+  if (data.liquidity < MIN_LIQUIDITY_USD) {
     reasons.push(
-      `liquidité ${fmtPercent(change)} sur ~10s`
+      `liquidité trop faible : $${data.liquidity.toFixed(2)}`
     );
   }
 
   if (
-    Number.isFinite(change) &&
-    change <= LIQUIDITY_DANGER_PERCENT
+    metrics.liquidity10s !== null &&
+    metrics.liquidity10s <= ENTRY_MAX_LIQ_DROP_10S
   ) {
     reasons.push(
-      `forte baisse de liquidité ${fmtPercent(change)}`
+      `liquidité ${metrics.liquidity10s.toFixed(2)}% / 10s`
     );
   }
 
   if (
-    Number.isFinite(change) &&
-    change <= LIQUIDITY_WARNING_PERCENT
+    metrics.liquidity30s !== null &&
+    metrics.liquidity30s <= ENTRY_MAX_LIQ_DROP_30S
   ) {
     reasons.push(
-      `baisse rapide de liquidité ${fmtPercent(change)}`
+      `liquidité ${metrics.liquidity30s.toFixed(2)}% / 30s`
     );
   }
 
   if (
-    Number.isFinite(market.liquidityUsd) &&
-    market.liquidityUsd <= LIQUIDITY_ZERO_USD
+    metrics.price10s !== null &&
+    metrics.price10s <= ENTRY_MAX_PRICE_DROP_10S
   ) {
     reasons.push(
-      "liquidité pratiquement inexistante"
+      `prix ${metrics.price10s.toFixed(2)}% / 10s`
+    );
+  }
+
+  // Il faut suffisamment de données pour éviter
+  // d'acheter immédiatement sur une information incomplète.
+  const enoughHistory =
+    history.length >= 8;
+
+  if (!enoughHistory) {
+    reasons.push("historique encore insuffisant");
+  }
+
+  return {
+    healthy: reasons.length === 0,
+    reasons,
+    metrics
+  };
+}
+
+/* =========================================================
+   CRASH
+   ========================================================= */
+
+function analyzeCrash(data) {
+  const metrics = getMetrics(data);
+
+  const reasons = [];
+
+  if (data.liquidity <= CRASH_MIN_LIQUIDITY_USD) {
+    reasons.push(
+      `liquidité quasi nulle : $${data.liquidity.toFixed(2)}`
+    );
+  }
+
+  if (
+    metrics.liquidity10s !== null &&
+    metrics.liquidity10s <= CRASH_LIQ_DROP_10S
+  ) {
+    reasons.push(
+      `liquidité ${metrics.liquidity10s.toFixed(2)}% / 10s`
+    );
+  }
+
+  if (
+    metrics.price10s !== null &&
+    metrics.price10s <= CRASH_PRICE_DROP_10S
+  ) {
+    reasons.push(
+      `prix ${metrics.price10s.toFixed(2)}% / 10s`
     );
   }
 
   return {
-    change,
-    reasons
+    crash: reasons.length > 0,
+    reasons,
+    metrics
   };
 }
 
-// ------------------------------------------------------------
-// DETECTION DU CRASH
-// ------------------------------------------------------------
+/* =========================================================
+   ACHAT TEST
+   ========================================================= */
 
-function detectCrash() {
-  const priceChange =
-    getPriceChange(
-      LIQUIDITY_WINDOW_MS
-    );
+async function simulatedBuy(data) {
 
-  const liquidity =
-    analyseLiquidity();
+  cycleNumber++;
 
-  const reasons = [];
+  const amount = CAPITAL_PER_CYCLE_USD;
 
-  // Liquidité pratiquement disparue.
-  if (
-    Number.isFinite(market.liquidityUsd) &&
-    market.liquidityUsd <= LIQUIDITY_ZERO_USD
-  ) {
-    reasons.push(
-      "liquidité pratiquement disparue"
-    );
-  }
-
-  // Baisse liquidité >= 50 %.
-  if (
-    Number.isFinite(liquidity.change) &&
-    liquidity.change <=
-      LIQUIDITY_CRITICAL_PERCENT
-  ) {
-    reasons.push(
-      `liquidité ${fmtPercent(liquidity.change)} sur ~10s`
-    );
-  }
-
-  // Crash prix.
-  if (
-    Number.isFinite(priceChange) &&
-    priceChange <=
-      CRASH_PRICE_DROP_PERCENT
-  ) {
-    reasons.push(
-      `prix ${fmtPercent(priceChange)} sur ~10s`
-    );
-  }
-
-  if (reasons.length === 0) {
-    return null;
-  }
-
-  return {
-    priceChange,
-    liquidityChange:
-      liquidity.change,
-    reasons
-  };
-}
-
-// ------------------------------------------------------------
-// ACHAT SIMULÉ
-// ------------------------------------------------------------
-
-async function simulatedBuy() {
-  if (!trading) {
-    return;
-  }
-
-  if (stoppedByCrash) {
-    return;
-  }
-
-  if (
-    !Number.isFinite(market.priceUsd) ||
-    market.priceUsd <= 0
-  ) {
-    return;
-  }
-
-  // Protection importante :
-  // aucune nouvelle entrée si la liquidité
-  // est déjà très mauvaise.
-  if (
-    Number.isFinite(market.liquidityUsd) &&
-    market.liquidityUsd <=
-      LIQUIDITY_ZERO_USD
-  ) {
-    return;
-  }
-
-  const liquidityAnalysis =
-    analyseLiquidity();
-
-  if (
-    Number.isFinite(
-      liquidityAnalysis.change
-    ) &&
-    liquidityAnalysis.change <=
-      LIQUIDITY_DANGER_PERCENT
-  ) {
-    console.log(
-      "🛑 Nouveau cycle refusé : liquidité dégradée."
-    );
-
-    return;
-  }
-
-  strategy.cycle += 1;
-
-  strategy.state = "HOLDING";
-
-  strategy.entryPrice =
-    market.priceUsd;
-
-  strategy.lastBuyPrice =
-    market.priceUsd;
-
-  strategy.entryTime =
-    Date.now();
-
-  strategy.tokensHeld =
-    CAPITAL_PER_CYCLE_USD /
-    market.priceUsd;
-
-  strategy.totalInvested +=
-    CAPITAL_PER_CYCLE_USD;
-
-  strategy.lastActionAt =
-    Date.now();
-
-  console.log(
-    `🟢 BUY TEST #${strategy.cycle}` +
-    ` | ${fmtMoney(CAPITAL_PER_CYCLE_USD)}` +
-    ` | prix ${fmtUsd(market.priceUsd)}`
-  );
-
-  await send(
-    `🟢 ACHAT TEST #${strategy.cycle}\n\n` +
-    `Token : ${shortenMint(watchedMint)}\n` +
-    `Mise fixe : ${fmtMoney(CAPITAL_PER_CYCLE_USD)}\n` +
-    `Prix simulé : ${fmtUsd(market.priceUsd)}\n` +
-    `Tokens : ${strategy.tokensHeld.toFixed(8)}\n\n` +
-    `🎯 Objectif : +${TARGET_NET_PERCENT.toFixed(2)}%`
-  );
-}
-
-// ------------------------------------------------------------
-// VENTE NORMALE À +50 %
-// ------------------------------------------------------------
-
-async function simulatedTargetSell() {
-  if (!trading) {
-    return;
-  }
-
-  if (stoppedByCrash) {
-    return;
-  }
-
-  if (
-    strategy.state !== "HOLDING"
-  ) {
-    return;
-  }
-
-  if (
-    !Number.isFinite(strategy.entryPrice) ||
-    strategy.entryPrice <= 0
-  ) {
-    return;
-  }
-
-  if (
-    !Number.isFinite(market.priceUsd) ||
-    market.priceUsd <= 0
-  ) {
-    return;
-  }
+  const tokens = amount / data.price;
 
   const targetPrice =
-    strategy.entryPrice *
+    data.price *
     (1 + TARGET_NET_PERCENT / 100);
 
-  if (
-    market.priceUsd < targetPrice
-  ) {
-    return;
-  }
+  position = {
+    cycle: cycleNumber,
+    invested: amount,
+    entryPrice: data.price,
+    tokens,
+    targetPrice,
+    entryLiquidity: data.liquidity
+  };
 
-  // Vérification liquidité avant vente.
-  const liquidityAnalysis =
-    analyseLiquidity();
+  await sendTelegram(
+`🟢 ACHAT TEST #${cycleNumber}
 
-  if (
-    Number.isFinite(
-      liquidityAnalysis.change
-    ) &&
-    liquidityAnalysis.change <=
-      LIQUIDITY_CRITICAL_PERCENT
-  ) {
-    console.log(
-      "⚠️ Objectif atteint mais liquidité critique."
-    );
+Token : ${shortToken(currentToken)}
 
-    return;
-  }
+Mise fixe : $${amount.toFixed(4)}
+Prix simulé : $${data.price.toFixed(8)}
+Tokens : ${tokens.toFixed(8)}
 
-  const grossValue =
-    strategy.tokensHeld *
-    market.priceUsd;
+🎯 Objectif : +${TARGET_NET_PERCENT.toFixed(2)}%
+Prix cible : $${targetPrice.toFixed(8)}
 
-  const invested =
-    CAPITAL_PER_CYCLE_USD;
+💧 Liquidité : $${data.liquidity.toFixed(2)}
 
-  const grossProfit =
-    grossValue - invested;
-
-  const actualPercent =
-    (grossProfit / invested) * 100;
-
-  strategy.realizedProfit +=
-    grossProfit;
-
-  strategy.totalReturned +=
-    grossValue;
-
-  strategy.completedCycles += 1;
-
-  strategy.lastSellPrice =
-    market.priceUsd;
-
-  strategy.lastActionAt =
-    Date.now();
-
-  strategy.tokensHeld = 0;
-
-  strategy.state = "SOLD";
-
-  await send(
-    `🔴 VENTE TEST #${strategy.cycle}\n\n` +
-    `Token : ${shortenMint(watchedMint)}\n` +
-    `Prix : ${fmtUsd(market.priceUsd)}\n` +
-    `Montant simulé : ${fmtMoney(grossValue)}\n` +
-    `Résultat : ${fmtPercent(actualPercent)}\n` +
-    `Bénéfice réalisé : ${fmtMoney(grossProfit)}\n\n` +
-    `💰 Bénéfices cumulés : ${fmtMoney(strategy.realizedProfit)}\n\n` +
-    `🔄 Prochain cycle : ${fmtMoney(CAPITAL_PER_CYCLE_USD)}`
+🛡️ Filtre d'entrée : OK`
   );
 }
 
-// ------------------------------------------------------------
-// SORTIE D'URGENCE
-// ------------------------------------------------------------
+/* =========================================================
+   VENTE TEST
+   ========================================================= */
 
-async function emergencyStop(crash) {
-  if (stoppedByCrash) {
-    return;
+async function simulatedSell() {
+
+  if (!position) return;
+
+  /*
+    IMPORTANT :
+
+    On vend au prix cible exact.
+
+    Cela évite de transformer un polling toutes les 2 secondes
+    en bénéfice artificiellement supérieur à l'objectif.
+  */
+
+  const executionPrice = position.targetPrice;
+
+  const amountReceived =
+    position.tokens * executionPrice;
+
+  const profit =
+    amountReceived - position.invested;
+
+  const percent =
+    (profit / position.invested) * 100;
+
+  cumulativeProfit += profit;
+  completedCycles++;
+
+  const cycle = position.cycle;
+
+  position = null;
+
+  cooldownUntil =
+    now() + ENTRY_COOLDOWN_MS;
+
+  await sendTelegram(
+`🔴 VENTE TEST #${cycle}
+
+Token : ${shortToken(currentToken)}
+
+Prix de vente : $${executionPrice.toFixed(8)}
+
+Montant simulé : $${amountReceived.toFixed(4)}
+
+Résultat : +${percent.toFixed(2)}%
+Bénéfice réalisé : $${profit.toFixed(4)}
+
+💰 Bénéfices cumulés : $${cumulativeProfit.toFixed(4)}
+
+⏳ PAUSE AVANT NOUVEL ACHAT
+Observation du marché pendant ${ENTRY_COOLDOWN_MS / 1000}s`
+  );
+}
+
+/* =========================================================
+   STOP CRASH
+   ========================================================= */
+
+async function emergencyStop(data, crashAnalysis) {
+
+  if (crashed) return;
+
+  crashed = true;
+  running = false;
+
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
   }
 
-  stoppedByCrash = true;
-  trading = false;
+  let positionMessage = "";
 
-  strategy.state = "CRASH";
-
-  strategy.crashReason =
-    crash.reasons.join(" + ");
-
-  if (timer) {
-    clearInterval(timer);
-    timer = null;
-  }
-
-  let positionMessage =
-    "Aucune position simulée.";
-
-  // ----------------------------------------------------------
-  // IMPORTANT :
-  //
-  // Si la liquidité est très faible ou nulle,
-  // on NE FAIT PAS semblant d'avoir vendu au prix affiché.
-  // ----------------------------------------------------------
-
-  const liquidityIsCritical =
-    !Number.isFinite(
-      market.liquidityUsd
-    ) ||
-    market.liquidityUsd <=
-      LIQUIDITY_ZERO_USD ||
-    (
-      Number.isFinite(
-        crash.liquidityChange
-      ) &&
-      crash.liquidityChange <=
-        LIQUIDITY_CRITICAL_PERCENT
-    );
-
-  if (
-    strategy.tokensHeld > 0 &&
-    liquidityIsCritical
-  ) {
-    positionMessage =
-      `⚠️ Position restante : ${strategy.tokensHeld.toFixed(8)} tokens\n\n` +
-      `⚠️ Prix de sortie NON considéré fiable.\n` +
-      `⚠️ Liquidité trop faible pour simuler une vente honnête.\n` +
-      `⚠️ Aucun bénéfice fictif ajouté.`;
-
-    strategy.tokensHeld = 0;
-  }
-
-  else if (
-    strategy.tokensHeld > 0 &&
-    Number.isFinite(
-      market.priceUsd
-    )
-  ) {
-    const exitValue =
-      strategy.tokensHeld *
-      market.priceUsd;
-
-    const pnl =
-      exitValue -
-      CAPITAL_PER_CYCLE_USD;
-
-    strategy.realizedProfit +=
-      pnl;
-
-    strategy.totalReturned +=
-      exitValue;
+  if (position) {
 
     positionMessage =
-      `Position simulée liquidée : ${fmtMoney(exitValue)}\n` +
-      `Résultat du dernier cycle : ${fmtMoney(pnl)}`;
+`⚠️ Position restante :
+${position.tokens.toFixed(8)} tokens
 
-    strategy.tokensHeld = 0;
+⚠️ Prix de sortie NON considéré fiable.
+⚠️ Aucun bénéfice fictif ajouté.`;
+
+  } else {
+
+    positionMessage =
+`✅ Aucune position ouverte au moment du crash.`;
   }
 
-  await send(
-    `🚨 STOP CRASH - MODE TEST\n\n` +
-    `Token : ${shortenMint(watchedMint)}\n\n` +
+  await sendTelegram(
+`🚨 STOP CRASH - MODE TEST
 
-    `Prix : ${fmtUsd(market.priceUsd)}\n` +
-    `Variation ~10s : ${fmtPercent(crash.priceChange)}\n\n` +
+Token : ${shortToken(currentToken)}
 
-    `Liquidité : ${fmtMoney(market.liquidityUsd)}\n` +
-    `Variation ~10s : ${fmtPercent(crash.liquidityChange)}\n\n` +
+Prix : $${data.price.toFixed(8)}
 
-    `⚠️ Signaux :\n` +
-    crash.reasons
-      .map(reason => `• ${reason}`)
-      .join("\n") +
+Variation prix ~10s :
+${crashAnalysis.metrics.price10s !== null
+  ? crashAnalysis.metrics.price10s.toFixed(2) + "%"
+  : "N/D"}
 
-    `\n\n` +
+Liquidité :
+$${data.liquidity.toFixed(2)}
 
-    `${positionMessage}\n\n` +
+Variation liquidité ~10s :
+${crashAnalysis.metrics.liquidity10s !== null
+  ? crashAnalysis.metrics.liquidity10s.toFixed(2) + "%"
+  : "N/D"}
 
-    `⛔ NOUVEAU CYCLE BLOQUÉ\n` +
-    `⛔ RADAR ARRÊTÉ\n\n` +
+⚠️ Signaux :
+• ${crashAnalysis.reasons.join("\n• ")}
 
-    `Cycles terminés : ${strategy.completedCycles}\n` +
-    `💰 Bénéfices réellement simulés : ${fmtMoney(strategy.realizedProfit)}\n\n` +
+${positionMessage}
 
-    `⚠️ Ceci reste une simulation.`
-  );
+⛔ NOUVEAU CYCLE BLOQUÉ
+⛔ RADAR ARRÊTÉ
 
-  console.log(
-    "🛑 STOP CRASH",
-    crash
+Cycles terminés : ${completedCycles}
+
+💰 Bénéfices réellement simulés :
+$${cumulativeProfit.toFixed(4)}
+
+⚠️ Ceci reste une simulation.`
   );
 }
 
-// ------------------------------------------------------------
-// BOUCLE PRINCIPALE
-// ------------------------------------------------------------
+/* =========================================================
+   AUTORISATION D'ACHAT
+   ========================================================= */
 
-async function tick() {
-  if (!trading) {
+async function tryEntry(data) {
+
+  if (!running || crashed) return;
+
+  if (position) return;
+
+  // Cooldown après vente
+  if (now() < cooldownUntil) {
     return;
   }
 
-  if (stoppedByCrash) {
-    return;
-  }
+  const analysis = analyzeEntry(data);
 
-  if (!watchedMint) {
-    return;
-  }
+  if (!analysis.healthy) {
 
-  if (requestInProgress) {
-    return;
-  }
+    // On évite de spammer Telegram à chaque passage.
+    if (!tryEntry.lastWarning ||
+        now() - tryEntry.lastWarning > 10000) {
 
-  requestInProgress = true;
+      tryEntry.lastWarning = now();
 
-  try {
-    const data =
-      await fetchPumpSwapMarket(
-        watchedMint
+      await sendTelegram(
+`⛔ ACHAT REFUSÉ
+
+Token : ${shortToken(currentToken)}
+
+Le marché n'est pas suffisamment sain.
+
+⚠️ Raisons :
+• ${analysis.reasons.join("\n• ")}
+
+💧 Liquidité :
+$${data.liquidity.toFixed(2)}
+
+📊 Prix :
+$${data.price.toFixed(8)}
+
+⏳ Surveillance en cours...`
       );
-
-    market = {
-      ...data,
-      updatedAt: Date.now()
-    };
-
-    addMarketPoint();
-
-    console.log(
-      `📡 ${shortenMint(watchedMint)}` +
-      ` | prix ${fmtUsd(market.priceUsd)}` +
-      ` | liq ${fmtMoney(market.liquidityUsd)}` +
-      ` | état ${strategy.state}`
-    );
-
-    // --------------------------------------------------------
-    // PRIORITÉ 1 : CRASH
-    // --------------------------------------------------------
-
-    const crash =
-      detectCrash();
-
-    if (crash) {
-      await emergencyStop(crash);
-      return;
     }
 
-    // --------------------------------------------------------
-    // PRIORITÉ 2 : ACHAT
-    // --------------------------------------------------------
-
-    if (
-      strategy.state === "IDLE" ||
-      strategy.state === "SOLD"
-    ) {
-      await simulatedBuy();
-      return;
-    }
-
-    // --------------------------------------------------------
-    // PRIORITÉ 3 : OBJECTIF +50 %
-    // --------------------------------------------------------
-
-    if (
-      strategy.state === "HOLDING"
-    ) {
-      await simulatedTargetSell();
-    }
-
-  } catch (err) {
-    console.error(
-      "❌ Erreur marché :",
-      err.message
-    );
-
-    // Une erreur réseau ne provoque
-    // jamais un achat ou une vente.
-  } finally {
-    requestInProgress = false;
+    return;
   }
+
+  await simulatedBuy(data);
 }
 
-// ------------------------------------------------------------
-// DEMARRAGE
-// ------------------------------------------------------------
+/* =========================================================
+   BOUCLE PRINCIPALE
+   ========================================================= */
 
-async function startTrading(mint) {
-  if (trading) {
-    await send(
-      `⚠️ Un test est déjà actif.\n\n` +
-      `Token : ${shortenMint(watchedMint)}\n\n` +
-      `Utilise /stoptrade avant de changer de token.`
+async function monitor() {
+
+  if (!running || crashed || !currentToken) {
+    return;
+  }
+
+  const data =
+    await getTokenData(currentToken);
+
+  if (!data) {
+    return;
+  }
+
+  addHistory(data);
+
+  lastPrice = data.price;
+  lastLiquidity = data.liquidity;
+
+  // =========================================
+  // CRASH PRIORITAIRE
+  // =========================================
+
+  const crashAnalysis =
+    analyzeCrash(data);
+
+  if (crashAnalysis.crash) {
+
+    await emergencyStop(
+      data,
+      crashAnalysis
     );
 
     return;
   }
 
-  if (
-    !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(
-      mint
-    )
-  ) {
-    await send(
-      `❌ Adresse de token invalide.\n\n` +
-      `Utilise l'adresse Solana complète.`
-    );
+  // =========================================
+  // POSITION OUVERTE
+  // =========================================
+
+  if (position) {
+
+    if (
+      data.price >= position.targetPrice
+    ) {
+      await simulatedSell();
+    }
 
     return;
   }
 
-  try {
-    const data =
-      await fetchPumpSwapMarket(
-        mint
-      );
+  // =========================================
+  // PAS DE POSITION
+  // =========================================
 
-    watchedMint = mint;
+  await tryEntry(data);
+}
 
-    market = {
-      ...data,
-      updatedAt: Date.now()
-    };
+/* =========================================================
+   START TRADE
+   ========================================================= */
 
-    history = [];
+async function startTrade(mint) {
 
-    strategy = {
-      state: "IDLE",
-
-      cycle: 0,
-
-      tokensHeld: 0,
-
-      entryPrice: 0,
-      entryTime: 0,
-
-      realizedProfit: 0,
-
-      totalInvested: 0,
-      totalReturned: 0,
-
-      completedCycles: 0,
-
-      lastBuyPrice: 0,
-      lastSellPrice: 0,
-
-      lastActionAt: 0,
-
-      crashReason: null
-    };
-
-    stoppedByCrash = false;
-    trading = true;
-
-    addMarketPoint();
-
-    await send(
-      `🧪 TRADING TEST V2 DÉMARRÉ\n\n` +
-
-      `Token : ${shortenMint(mint)}\n` +
-      `DEX : ${market.dexId}\n\n` +
-
-      `💵 Mise par cycle : ${fmtMoney(CAPITAL_PER_CYCLE_USD)}\n` +
-      `🎯 Objectif : +${TARGET_NET_PERCENT.toFixed(2)}%\n\n` +
-
-      `🛡️ PROTECTION LIQUIDITÉ\n` +
-      `• Surveillance toutes les 2s\n` +
-      `• Alerte dégradation : ${LIQUIDITY_WARNING_PERCENT}%\n` +
-      `• Danger : ${LIQUIDITY_DANGER_PERCENT}%\n` +
-      `• Critique : ${LIQUIDITY_CRITICAL_PERCENT}%\n` +
-      `• Quasi zéro : STOP\n\n` +
-
-      `⚠️ Aucun achat réel.\n` +
-      `⚠️ Aucune vente réelle.\n\n` +
-
-      `Prix actuel : ${fmtUsd(market.priceUsd)}\n` +
-      `Liquidité : ${fmtMoney(market.liquidityUsd)}\n\n` +
-
-      `⏳ Premier cycle...`
+  if (running) {
+    await sendTelegram(
+      "⚠️ Un test est déjà en cours."
     );
+    return;
+  }
 
-    timer = setInterval(
-      tick,
+  if (!mint) {
+    await sendTelegram(
+`❌ Mint manquant.
+
+Utilisation :
+
+/starttrade ADRESSE_DU_TOKEN`
+    );
+    return;
+  }
+
+  currentToken = mint.trim();
+
+  running = true;
+  crashed = false;
+
+  position = null;
+
+  cycleNumber = 0;
+  completedCycles = 0;
+  cumulativeProfit = 0;
+
+  history = [];
+
+  lastPrice = null;
+  lastLiquidity = null;
+
+  cooldownUntil = 0;
+
+  tryEntry.lastWarning = 0;
+
+  await sendTelegram(
+`🚀 TEST V3 DÉMARRÉ
+
+Token :
+${shortToken(currentToken)}
+
+💵 Capital par cycle :
+$${CAPITAL_PER_CYCLE_USD.toFixed(2)}
+
+🎯 Objectif :
++${TARGET_NET_PERCENT.toFixed(2)}%
+
+⏳ Cooldown après vente :
+${ENTRY_COOLDOWN_MS / 1000}s
+
+🛡️ Nouveau filtre :
+Le bot ne rachète PAS automatiquement.
+
+Il attend que le marché soit suffisamment sain.
+
+⛔ Crash :
+arrêt définitif du test.
+
+📡 Surveillance en cours...`
+  );
+
+  pollTimer =
+    setInterval(
+      monitor,
       POLL_INTERVAL_MS
     );
 
-    await tick();
-
-  } catch (err) {
-    console.error(
-      "❌ Impossible de démarrer :",
-      err.message
-    );
-
-    await send(
-      `❌ IMPOSSIBLE DE DÉMARRER\n\n` +
-      `Token : ${shortenMint(mint)}\n\n` +
-      `${err.message}\n\n` +
-      `Le bot exige une paire PumpSwap détectable.`
-    );
-  }
+  // Premier passage immédiat
+  await monitor();
 }
 
-// ------------------------------------------------------------
-// ARRET MANUEL
-// ------------------------------------------------------------
+/* =========================================================
+   STOP MANUEL
+   ========================================================= */
 
-async function stopTrading(
-  sendMessage = true
-) {
-  trading = false;
+async function stopTrade() {
 
-  if (timer) {
-    clearInterval(timer);
-    timer = null;
-  }
-
-  strategy.state = "IDLE";
-
-  if (sendMessage) {
-    await send(
-      `🛑 TEST ARRÊTÉ\n\n` +
-      `Token : ${shortenMint(watchedMint)}\n\n` +
-      `Cycles terminés : ${strategy.completedCycles}\n` +
-      `Bénéfices simulés : ${fmtMoney(strategy.realizedProfit)}\n\n` +
-      `Aucune transaction réelle n'a été effectuée.`
+  if (!running) {
+    await sendTelegram(
+      "ℹ️ Aucun test en cours."
     );
-  }
-}
-
-// ------------------------------------------------------------
-// STATUS
-// ------------------------------------------------------------
-
-async function sendStatus() {
-  if (
-    !trading &&
-    !watchedMint
-  ) {
-    await send(
-      `📊 TRADING TEST V2\n\n` +
-      `Aucun test actif.\n\n` +
-      `/starttrade ADRESSE_TOKEN`
-    );
-
     return;
   }
 
-  const targetPrice =
-    strategy.state === "HOLDING"
-      ? strategy.entryPrice *
-        (1 + TARGET_NET_PERCENT / 100)
-      : null;
+  running = false;
 
-  const priceChange =
-    getPriceChange(
-      LIQUIDITY_WINDOW_MS
-    );
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
 
-  const liquidityChange =
-    getLiquidityChange(
-      LIQUIDITY_WINDOW_MS
-    );
+  await sendTelegram(
+`🛑 TEST ARRÊTÉ MANUELLEMENT
 
-  await send(
-    `📊 STATUS TEST V2\n\n` +
+Cycles terminés :
+${completedCycles}
 
-    `Token : ${shortenMint(watchedMint)}\n` +
-    `État : ${strategy.state}\n` +
-    `Trading : ${trading ? "ACTIF" : "ARRÊTÉ"}\n\n` +
+💰 Bénéfices simulés :
+$${cumulativeProfit.toFixed(4)}
 
-    `💵 Cycle : ${fmtMoney(CAPITAL_PER_CYCLE_USD)}\n` +
-    `🎯 Objectif : +${TARGET_NET_PERCENT.toFixed(2)}%\n\n` +
-
-    `Prix : ${fmtUsd(market.priceUsd)}\n` +
-    `Liquidité : ${fmtMoney(market.liquidityUsd)}\n\n` +
-
-    `Prix ~10s : ${fmtPercent(priceChange)}\n` +
-    `Liquidité ~10s : ${fmtPercent(liquidityChange)}\n\n` +
-
-    (
-      strategy.state === "HOLDING"
-        ? `🟢 Position simulée\n` +
-          `Cycle : #${strategy.cycle}\n` +
-          `Prix achat : ${fmtUsd(strategy.entryPrice)}\n` +
-          `Objectif : ${fmtUsd(targetPrice)}\n` +
-          `Tokens : ${strategy.tokensHeld.toFixed(8)}\n\n`
-        : ""
-    ) +
-
-    `🔄 Cycles terminés : ${strategy.completedCycles}\n` +
-    `💰 Bénéfices cumulés : ${fmtMoney(strategy.realizedProfit)}`
+${position
+  ? "⚠️ Une position simulée était encore ouverte."
+  : "✅ Aucune position ouverte."}`
   );
 }
 
-// ------------------------------------------------------------
-// COMMANDES
-// ------------------------------------------------------------
+/* =========================================================
+   STATUS
+   ========================================================= */
 
-bot.command(
-  "starttrade",
-  async ctx => {
-    if (!isAuthorized(ctx)) {
-      return;
-    }
+async function status() {
 
-    const parts =
-      ctx.message.text
-        .trim()
-        .split(/\s+/);
-
-    if (parts.length < 2) {
-      await ctx.reply(
-        `❌ Adresse du token manquante.\n\n` +
-        `/starttrade ADRESSE_DU_TOKEN`
-      );
-
-      return;
-    }
-
-    await startTrading(
-      parts[1].trim()
+  if (!currentToken) {
+    await sendTelegram(
+      "ℹ️ Aucun token chargé."
     );
+    return;
   }
-);
 
-bot.command(
-  "stoptrade",
-  async ctx => {
-    if (!isAuthorized(ctx)) {
-      return;
-    }
+  let positionText =
+    "Aucune position";
 
-    await stopTrading(true);
+  if (position) {
+    positionText =
+`Position #${position.cycle}
+Mise : $${position.invested.toFixed(2)}
+Entrée : $${position.entryPrice.toFixed(8)}
+Cible : $${position.targetPrice.toFixed(8)}`
   }
-);
 
-bot.command(
-  "status",
-  async ctx => {
-    if (!isAuthorized(ctx)) {
-      return;
-    }
+  await sendTelegram(
+`📊 STATUS TEST V3
 
-    await sendStatus();
-  }
-);
+Token :
+${shortToken(currentToken)}
 
-bot.command(
-  "help",
-  async ctx => {
-    if (!isAuthorized(ctx)) {
-      return;
-    }
+Radar :
+${running ? "🟢 ACTIF" : "🔴 ARRÊTÉ"}
 
-    await ctx.reply(
-      `🤖 TRADING TEST V2\n\n` +
+Cycles terminés :
+${completedCycles}
 
-      `/starttrade ADRESSE\n` +
-      `Lance une simulation.\n\n` +
+💰 Bénéfices :
+$${cumulativeProfit.toFixed(4)}
 
-      `/status\n` +
-      `Affiche le cycle actuel.\n\n` +
+${positionText}
 
-      `/stoptrade\n` +
-      `Arrête le test.\n\n` +
+💵 Capital/cycle :
+$${CAPITAL_PER_CYCLE_USD.toFixed(2)}
 
-      `💵 Mise : $1 fixe\n` +
-      `🎯 Objectif : +50 %\n` +
-      `🛡️ Protection liquidité\n` +
-      `🚨 STOP automatique sur crash\n\n` +
+🎯 Objectif :
++${TARGET_NET_PERCENT.toFixed(2)}%`
+  );
+}
 
-      `⚠️ MODE TEST UNIQUEMENT.`
-    );
-  }
-);
+/* =========================================================
+   COMMANDES TELEGRAM
+   ========================================================= */
 
-// ------------------------------------------------------------
-// ERREURS TELEGRAM
-// ------------------------------------------------------------
+bot.command("starttrade", async ctx => {
 
-bot.catch(err => {
-  console.error(
-    "❌ Erreur Telegram :",
-    err.message
+  const text = ctx.message.text || "";
+
+  const parts =
+    text.split(/\s+/);
+
+  const mint = parts[1];
+
+  await startTrade(mint);
+});
+
+bot.command("stoptrade", async ctx => {
+  await stopTrade();
+});
+
+bot.command("status", async ctx => {
+  await status();
+});
+
+bot.command("help", async ctx => {
+
+  await sendTelegram(
+`🤖 TEST V3
+
+/starttrade MINT
+➡️ démarre un test
+
+/stoptrade
+➡️ arrête le test
+
+/status
+➡️ affiche l'état
+
+💵 Capital :
+$${CAPITAL_PER_CYCLE_USD.toFixed(2)} par cycle
+
+🎯 Objectif :
++${TARGET_NET_PERCENT.toFixed(2)}%
+
+🛡️ Particularité V3 :
+Après une vente, le bot ne rachète plus immédiatement.
+
+Il observe le marché et bloque l'entrée si les conditions deviennent mauvaises.
+
+⚠️ Simulation uniquement.`
   );
 });
 
-// ------------------------------------------------------------
-// ARRET PROPRE
-// ------------------------------------------------------------
+/* =========================================================
+   LANCEMENT
+   ========================================================= */
 
-async function shutdown(signal) {
-  console.log(
-    `🛑 Arrêt reçu : ${signal}`
-  );
-
-  if (timer) {
-    clearInterval(timer);
-    timer = null;
-  }
-
-  trading = false;
-
-  try {
-    bot.stop(signal);
-  } catch (err) {
+bot.launch()
+  .then(() => {
+    console.log("🤖 Bot Telegram TEST V3 démarré");
+  })
+  .catch(err => {
     console.error(
-      "Erreur arrêt Telegram :",
+      "Erreur lancement bot :",
       err.message
     );
-  }
-
-  process.exit(0);
-}
+  });
 
 process.once(
   "SIGINT",
-  () => shutdown("SIGINT")
+  () => bot.stop("SIGINT")
 );
 
 process.once(
   "SIGTERM",
-  () => shutdown("SIGTERM")
+  () => bot.stop("SIGTERM")
 );
-
-// ------------------------------------------------------------
-// LANCEMENT
-// ------------------------------------------------------------
-
-(async () => {
-  console.log(
-    "========================================"
-  );
-
-  console.log(
-    "🧪 TRADING V2 - MODE TEST"
-  );
-
-  console.log(
-    "========================================"
-  );
-
-  console.log(
-    "💵 Capital par cycle : $1"
-  );
-
-  console.log(
-    "🎯 Objectif : +50%"
-  );
-
-  console.log(
-    "🛡️ Protection liquidité activée"
-  );
-
-  console.log(
-    "🚨 Aucun trade réel"
-  );
-
-  console.log(
-    "========================================"
-  );
-
-  await bot.launch();
-
-  console.log(
-    "🤖 Bot Telegram connecté."
-  );
-})();
