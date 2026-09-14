@@ -1,198 +1,189 @@
 const { Connection, PublicKey } = require("@solana/web3.js");
 const { Telegraf } = require("telegraf");
+const WebSocket = require("ws");
 
 // ============================================================
-// RADAR SORTIE V5
-// Objectif : détecter les micro-signaux pré-crash
+// RADAR V6
+// Détection précoce de dégradation structurelle PumpSwap
 // ============================================================
-
-// ------------------------------------------------------------
-// ENV
-// ------------------------------------------------------------
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 
-if (!BOT_TOKEN) {
-  console.error("❌ BOT_TOKEN manquant");
+if (!BOT_TOKEN || !CHAT_ID || !HELIUS_API_KEY) {
+  console.error("❌ Variables manquantes : BOT_TOKEN, CHAT_ID ou HELIUS_API_KEY");
   process.exit(1);
 }
 
-if (!CHAT_ID) {
-  console.error("❌ CHAT_ID manquant");
-  process.exit(1);
-}
-
-if (!HELIUS_API_KEY) {
-  console.error("❌ HELIUS_API_KEY manquant");
-  process.exit(1);
-}
-
-// ------------------------------------------------------------
-// CONNECTION
-// ------------------------------------------------------------
+const bot = new Telegraf(BOT_TOKEN);
 
 const RPC_URL =
   `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
-const WSS_URL =
+const WS_URL =
   `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
 const connection = new Connection(RPC_URL, {
   commitment: "processed",
-  wsEndpoint: WSS_URL
 });
-
-const bot = new Telegraf(BOT_TOKEN);
-
-// ------------------------------------------------------------
-// CONSTANTES
-// ------------------------------------------------------------
 
 const PUMPSWAP_PROGRAM =
   "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
-const WSOL_MINT =
+const SOL_MINT =
   "So11111111111111111111111111111111111111112";
 
-// Pool layout PumpSwap
+// ============================================================
+// LAYOUT PUMPSWAP
+// ============================================================
+
 const BASE_VAULT_OFFSET = 139;
 const QUOTE_VAULT_OFFSET = 171;
+const VIRTUAL_QUOTE_OFFSET = 245;
 
-// ------------------------------------------------------------
-// ETAT
-// ------------------------------------------------------------
+// ============================================================
+// RÉGLAGES
+// ============================================================
 
-let watchedMint = null;
-let poolAddress = null;
+const POLL_MS = 3000;
+const BATCH_MS = 120;
+const EVENT_HISTORY_MS = 30000;
 
-let baseVault = null;
-let quoteVault = null;
+// ============================================================
+// ÉTAT
+// ============================================================
 
-let baseSubscription = null;
-let quoteSubscription = null;
-let logSubscription = null;
+const state = {
+  mint: null,
+  pool: null,
 
-let currentBase = null;
-let currentQuote = null;
+  baseVault: null,
+  quoteVault: null,
 
-let lastPrice = null;
-let lastLiquidity = null;
+  ws: null,
+  wsReady: false,
 
-let localHighPrice = null;
-let localHighLiquidity = null;
+  baseSub: null,
+  quoteSub: null,
+  logSub: null,
 
-let lastDexUpdate = 0;
+  wsReconnectTimer: null,
+  wsPingTimer: null,
 
-let onChainActive = false;
+  pendingBase: null,
+  pendingQuote: null,
+  pendingTimer: null,
 
-let lastAlertTime = 0;
-let lastAlertLevel = "NORMAL";
+  baseRaw: null,
+  quoteRaw: null,
 
-let lastStatusTime = 0;
+  quoteSol: 0,
 
-// ------------------------------------------------------------
-// HISTORIQUE MICRO
-// ------------------------------------------------------------
+  virtualQuoteRaw: 0n,
 
-const events = [];
+  price: 0,
+  liquidityUsd: 0,
 
-/*
-event = {
-  time,
-  type: BUY / SELL / WITHDRAW / ADD,
-  quote,
-  base,
-  tx
-}
-*/
+  priceHistory: [],
+  liquidityHistory: [],
+  reserveHistory: [],
+  events: [],
 
-function cleanupEvents() {
-  const now = Date.now();
+  localHigh: 0,
 
-  while (
-    events.length &&
-    now - events[0].time > 30000
-  ) {
-    events.shift();
-  }
-}
+  lastOnchainAt: 0,
+  lastDexAt: 0,
 
-// ------------------------------------------------------------
-// UTILITAIRES
-// ------------------------------------------------------------
+  dexErrors: 0,
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+  pollTimer: null,
+  staleTimer: null,
 
-function safeNumber(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : 0;
+  running: false,
+  stopped: false,
+
+  stopReason: null,
+
+  lastAlertAt: 0,
+  lastAlertKey: null,
+
+  alertCount: 0,
+};
+
+// ============================================================
+// OUTILS
+// ============================================================
+
+function now() {
+  return Date.now();
 }
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-function formatSol(value) {
-  return safeNumber(value).toFixed(4);
-}
-
-function formatPct(value) {
-  return safeNumber(value).toFixed(1);
-}
-
-// ------------------------------------------------------------
-// TELEGRAM
-// ------------------------------------------------------------
-
-async function sendTelegram(text) {
-  try {
-    await bot.telegram.sendMessage(CHAT_ID, text);
-    console.log("📨 Telegram envoyé");
-  } catch (err) {
-    console.error("❌ Telegram:", err.message);
+function pctChange(oldValue, newValue) {
+  if (
+    oldValue == null ||
+    newValue == null ||
+    oldValue === 0
+  ) {
+    return 0;
   }
+
+  return ((newValue - oldValue) / oldValue) * 100;
 }
 
-// ------------------------------------------------------------
+function fmtPct(value) {
+  if (!Number.isFinite(value)) {
+    return "0.0%";
+  }
+
+  return `${value >= 0 ? "+" : ""}${value.toFixed(1)}%`;
+}
+
+function fmtSol(value) {
+  if (!Number.isFinite(value)) {
+    return "0.0000";
+  }
+
+  return value.toFixed(4);
+}
+
+function fmtUsd(value) {
+  if (!Number.isFinite(value)) {
+    return "0.00";
+  }
+
+  return value.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+// ============================================================
 // LECTURE U64
-// ------------------------------------------------------------
+// ============================================================
 
 function readU64LE(buffer, offset) {
-  if (!buffer || buffer.length < offset + 8) {
-    return null;
+  if (!buffer || offset + 8 > buffer.length) {
+    return 0n;
   }
 
-  try {
-    return buffer.readBigUInt64LE(offset);
-  } catch {
-    return null;
-  }
+  return buffer.readBigUInt64LE(offset);
 }
 
-// ------------------------------------------------------------
-// TOKEN ACCOUNT
-// Amount SPL TokenAccount = offset 64
-// ------------------------------------------------------------
+// ============================================================
+// COMPTE SPL TOKEN
+//
+// Dans un compte Token Account SPL :
+// amount = offset 64
+//
+// C'était une erreur importante de V5.
+// ============================================================
 
-function readTokenAmount(data) {
-  let buffer = null;
-
-  if (Buffer.isBuffer(data)) {
-    buffer = data;
-  } else if (data && Buffer.isBuffer(data.data)) {
-    buffer = data.data;
-  } else if (data && Array.isArray(data.data)) {
-    try {
-      buffer = Buffer.from(data.data[0], "base64");
-    } catch {
-      return null;
-    }
-  }
-
+function readSplTokenAccountAmount(buffer) {
   if (!buffer || buffer.length < 72) {
     return null;
   }
@@ -200,1956 +191,2213 @@ function readTokenAmount(data) {
   return readU64LE(buffer, 64);
 }
 
-// ------------------------------------------------------------
-// POOL VAULTS
-// ------------------------------------------------------------
+// ============================================================
+// PUBKEY
+// ============================================================
 
-async function readPoolVaults(pool) {
-  try {
-    const info = await connection.getAccountInfo(
-      new PublicKey(pool),
-      "processed"
-    );
-
-    if (!info || !info.data) {
-      return null;
-    }
-
-    const data = Buffer.from(info.data);
-
-    if (data.length < QUOTE_VAULT_OFFSET + 32) {
-      return null;
-    }
-
-    const base = new PublicKey(
-      data.subarray(
-        BASE_VAULT_OFFSET,
-        BASE_VAULT_OFFSET + 32
-      )
-    );
-
-    const quote = new PublicKey(
-      data.subarray(
-        QUOTE_VAULT_OFFSET,
-        QUOTE_VAULT_OFFSET + 32
-      )
-    );
-
-    return {
-      base: base.toBase58(),
-      quote: quote.toBase58()
-    };
-
-  } catch (err) {
-    console.error("❌ Lecture vaults:", err.message);
-    return null;
+function readPubkey(buffer, offset) {
+  if (!buffer || offset + 32 > buffer.length) {
+    throw new Error("Pubkey impossible à lire");
   }
+
+  return new PublicKey(
+    buffer.subarray(offset, offset + 32)
+  ).toBase58();
 }
 
-// ------------------------------------------------------------
-// BALANCES INITIALES
-// ------------------------------------------------------------
+// ============================================================
+// I128
+// ============================================================
 
-async function readVaultBalance(address) {
-  try {
-    const info = await connection.getAccountInfo(
-      new PublicKey(address),
-      "processed"
-    );
-
-    if (!info) {
-      return null;
-    }
-
-    return readTokenAmount(info.data);
-
-  } catch (err) {
-    console.error(
-      "❌ Lecture balance vault:",
-      err.message
-    );
-
-    return null;
+function readI128LE(buffer, offset) {
+  if (!buffer || offset + 16 > buffer.length) {
+    return 0n;
   }
+
+  let value = 0n;
+
+  for (let i = 0; i < 16; i++) {
+    value |=
+      BigInt(buffer[offset + i]) <<
+      (8n * BigInt(i));
+  }
+
+  const signBit = 1n << 127n;
+
+  if (value & signBit) {
+    value -= 1n << 128n;
+  }
+
+  return value;
 }
 
-// ------------------------------------------------------------
-// DEXSCREENER
-// ------------------------------------------------------------
+// ============================================================
+// LAMPORTS -> SOL
+// ============================================================
 
-async function fetchDexData() {
-  if (!watchedMint) {
-    return null;
-  }
-
-  try {
-    const url =
-      `https://api.dexscreener.com/latest/dex/tokens/${watchedMint}`;
-
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      throw new Error(
-        `HTTP ${response.status}`
-      );
-    }
-
-    const json = await response.json();
-
-    if (!json.pairs || !json.pairs.length) {
-      return null;
-    }
-
-    const pumpPairs = json.pairs.filter(pair => {
-      const dexId =
-        String(pair.dexId || "").toLowerCase();
-
-      return (
-        dexId.includes("pump") ||
-        dexId.includes("pumpswap")
-      );
-    });
-
-    const pairs =
-      pumpPairs.length
-        ? pumpPairs
-        : json.pairs;
-
-    pairs.sort((a, b) => {
-      const la =
-        safeNumber(a.liquidity?.usd);
-
-      const lb =
-        safeNumber(b.liquidity?.usd);
-
-      return lb - la;
-    });
-
-    const pair = pairs[0];
-
-    if (!pair) {
-      return null;
-    }
-
-    const price =
-      safeNumber(pair.priceUsd);
-
-    const liquidity =
-      safeNumber(pair.liquidity?.usd);
-
-    const detectedPool =
-      pair.pairAddress || null;
-
-    return {
-      price,
-      liquidity,
-      pool: detectedPool
-    };
-
-  } catch (err) {
-    console.error(
-      "⚠️ DexScreener:",
-      err.message
-    );
-
-    return null;
-  }
-}
-
-// ------------------------------------------------------------
-// UPDATE PRIX / LIQUIDITE
-// ------------------------------------------------------------
-
-async function updateMarketData() {
-  const data = await fetchDexData();
-
-  if (!data) {
-    return;
-  }
-
-  const now = Date.now();
-
-  lastPrice = data.price;
-  lastLiquidity = data.liquidity;
-
-  if (
-    lastPrice > 0 &&
-    (
-      localHighPrice === null ||
-      lastPrice > localHighPrice
-    )
-  ) {
-    localHighPrice = lastPrice;
-  }
-
-  if (
-    lastLiquidity > 0 &&
-    (
-      localHighLiquidity === null ||
-      lastLiquidity > localHighLiquidity
-    )
-  ) {
-    localHighLiquidity = lastLiquidity;
-  }
-
-  lastDexUpdate = now;
-}
-
-// ------------------------------------------------------------
-// PRIX DEPUIS SOMMET
-// ------------------------------------------------------------
-
-function priceDrawdown() {
-  if (
-    !localHighPrice ||
-    !lastPrice ||
-    localHighPrice <= 0
-  ) {
+function lamportsToSol(raw) {
+  if (raw == null) {
     return 0;
   }
 
-  return (
-    (lastPrice - localHighPrice) /
-    localHighPrice
-  ) * 100;
-}
-
-// ------------------------------------------------------------
-// LIQUIDITE DEPUIS SOMMET
-// ------------------------------------------------------------
-
-function liquidityDrawdown() {
-  if (
-    !localHighLiquidity ||
-    !lastLiquidity ||
-    localHighLiquidity <= 0
-  ) {
-    return 0;
-  }
+  const whole = raw / 1000000000n;
+  const remainder = raw % 1000000000n;
 
   return (
-    (lastLiquidity - localHighLiquidity) /
-    localHighLiquidity
-  ) * 100;
-}
-
-// ------------------------------------------------------------
-// EVENEMENTS PAR FENETRE
-// ------------------------------------------------------------
-
-function getEvents(seconds) {
-  cleanupEvents();
-
-  const cutoff =
-    Date.now() - seconds * 1000;
-
-  return events.filter(
-    e => e.time >= cutoff
+    Number(whole) +
+    Number(remainder) / 1000000000
   );
 }
 
-function getSellEvents(seconds) {
-  return getEvents(seconds)
-    .filter(e => e.type === "SELL");
+// ============================================================
+// DATA COMPTE
+// ============================================================
+
+function dataToBuffer(data) {
+  if (!data) {
+    return null;
+  }
+
+  if (Buffer.isBuffer(data)) {
+    return data;
+  }
+
+  if (
+    Array.isArray(data) &&
+    typeof data[0] === "string"
+  ) {
+    try {
+      return Buffer.from(data[0], "base64");
+    } catch (_) {
+      return null;
+    }
+  }
+
+  if (typeof data === "string") {
+    try {
+      return Buffer.from(data, "base64");
+    } catch (_) {
+      return null;
+    }
+  }
+
+  return null;
 }
 
-function getBuyEvents(seconds) {
-  return getEvents(seconds)
-    .filter(e => e.type === "BUY");
-}
+// ============================================================
+// HISTORIQUES
+// ============================================================
 
-// ------------------------------------------------------------
-// VOLUME SELL
-// ------------------------------------------------------------
+function trimHistory() {
+  const priceCutoff =
+    now() - 10 * 60 * 1000;
 
-function sellVolume(seconds) {
-  return getSellEvents(seconds)
-    .reduce(
-      (sum, e) => sum + safeNumber(e.quote),
-      0
+  const eventCutoff =
+    now() - EVENT_HISTORY_MS;
+
+  state.priceHistory =
+    state.priceHistory.filter(
+      x => x.t >= priceCutoff
+    );
+
+  state.liquidityHistory =
+    state.liquidityHistory.filter(
+      x => x.t >= priceCutoff
+    );
+
+  state.reserveHistory =
+    state.reserveHistory.filter(
+      x => x.t >= priceCutoff
+    );
+
+  state.events =
+    state.events.filter(
+      x => x.t >= eventCutoff
     );
 }
 
-// ------------------------------------------------------------
-// VOLUME BUY
-// ------------------------------------------------------------
+function valueAtOrBefore(history, seconds) {
+  const target =
+    now() - seconds * 1000;
 
-function buyVolume(seconds) {
-  return getBuyEvents(seconds)
-    .reduce(
-      (sum, e) => sum + safeNumber(e.quote),
-      0
-    );
+  let result = null;
+
+  for (const item of history) {
+    if (item.t <= target) {
+      result = item;
+    } else {
+      break;
+    }
+  }
+
+  return result;
 }
 
-// ------------------------------------------------------------
-// RATIO SELL
-// ------------------------------------------------------------
+function changeWithin(history, seconds) {
+  if (!history.length) {
+    return 0;
+  }
+
+  const old =
+    valueAtOrBefore(history, seconds);
+
+  if (!old) {
+    return 0;
+  }
+
+  const current =
+    history[history.length - 1];
+
+  return pctChange(
+    old.v,
+    current.v
+  );
+}
+
+// ============================================================
+// PRIX SOUS SOMMET
+// ============================================================
+
+function getPriceDropFromHigh() {
+  if (
+    !state.price ||
+    !state.localHigh
+  ) {
+    return 0;
+  }
+
+  if (state.price >= state.localHigh) {
+    return 0;
+  }
+
+  return (
+    1 -
+    state.price / state.localHigh
+  ) * 100;
+}
+
+// ============================================================
+// DEXSCREENER
+// ============================================================
+
+function getPumpPair(data, mint) {
+  const pairs =
+    data?.pairs || [];
+
+  const candidates =
+    pairs.filter(pair => {
+      const base =
+        pair?.baseToken?.address;
+
+      const quote =
+        pair?.quoteToken?.address;
+
+      return (
+        (base === mint &&
+          quote === SOL_MINT) ||
+        (quote === mint &&
+          base === SOL_MINT)
+      );
+    });
+
+  candidates.sort((a, b) => {
+    const la =
+      Number(a?.liquidity?.usd || 0);
+
+    const lb =
+      Number(b?.liquidity?.usd || 0);
+
+    return lb - la;
+  });
+
+  return candidates[0] || null;
+}
+
+async function fetchDex() {
+  const url =
+    `https://api.dexscreener.com/latest/dex/tokens/${state.mint}`;
+
+  const response =
+    await fetch(url, {
+      headers: {
+        accept: "application/json",
+      },
+    });
+
+  if (!response.ok) {
+    throw new Error(
+      `DexScreener HTTP ${response.status}`
+    );
+  }
+
+  const data =
+    await response.json();
+
+  const pair =
+    getPumpPair(
+      data,
+      state.mint
+    );
+
+  if (!pair) {
+    throw new Error(
+      "Paire PumpSwap introuvable"
+    );
+  }
+
+  if (pair.pairAddress) {
+    state.pool =
+      pair.pairAddress;
+  }
+
+  state.price =
+    Number(pair.priceUsd || 0);
+
+  state.liquidityUsd =
+    Number(
+      pair.liquidity?.usd || 0
+    );
+
+  state.lastDexAt =
+    now();
+
+  state.dexErrors = 0;
+
+  if (state.price > 0) {
+    if (
+      state.localHigh === 0 ||
+      state.price > state.localHigh
+    ) {
+      state.localHigh =
+        state.price;
+    }
+
+    state.priceHistory.push({
+      t: now(),
+      v: state.price,
+    });
+  }
+
+  if (state.liquidityUsd > 0) {
+    state.liquidityHistory.push({
+      t: now(),
+      v: state.liquidityUsd,
+    });
+  }
+
+  trimHistory();
+
+  return pair;
+}
+
+// ============================================================
+// DÉCOUVERTE DU POOL
+// ============================================================
+
+async function discoverPool() {
+  console.log(
+    "🔎 Recherche du pool PumpSwap..."
+  );
+
+  const pair =
+    await fetchDex();
+
+  if (!state.pool) {
+    throw new Error(
+      "Adresse du pool introuvable"
+    );
+  }
+
+  console.log(
+    `🏊 Pool : ${state.pool}`
+  );
+
+  const info =
+    await connection.getAccountInfo(
+      new PublicKey(state.pool),
+      "processed"
+    );
+
+  if (!info?.data) {
+    throw new Error(
+      "Compte Pool illisible"
+    );
+  }
+
+  const data =
+    Buffer.from(info.data);
+
+  if (
+    data.length <
+    VIRTUAL_QUOTE_OFFSET + 16
+  ) {
+    throw new Error(
+      `Pool trop court : ${data.length}`
+    );
+  }
+
+  state.baseVault =
+    readPubkey(
+      data,
+      BASE_VAULT_OFFSET
+    );
+
+  state.quoteVault =
+    readPubkey(
+      data,
+      QUOTE_VAULT_OFFSET
+    );
+
+  state.virtualQuoteRaw =
+    readI128LE(
+      data,
+      VIRTUAL_QUOTE_OFFSET
+    );
+
+  console.log(
+    `🪙 Base vault : ${state.baseVault}`
+  );
+
+  console.log(
+    `💧 Quote vault : ${state.quoteVault}`
+  );
+
+  console.log(
+    `💠 Virtual quote : ${
+      fmtSol(
+        lamportsToSol(
+          state.virtualQuoteRaw > 0n
+            ? state.virtualQuoteRaw
+            : 0n
+        )
+      )
+    } SOL`
+  );
+
+  return pair;
+}
+
+// ============================================================
+// LECTURE DES VAULTS
+// ============================================================
+
+async function readVaults() {
+  const keys = [
+    new PublicKey(
+      state.baseVault
+    ),
+    new PublicKey(
+      state.quoteVault
+    ),
+  ];
+
+  const infos =
+    await connection.getMultipleAccountsInfo(
+      keys,
+      "processed"
+    );
+
+  const baseBuffer =
+    dataToBuffer(
+      infos[0]?.data
+    );
+
+  const quoteBuffer =
+    dataToBuffer(
+      infos[1]?.data
+    );
+
+  if (
+    !baseBuffer ||
+    !quoteBuffer
+  ) {
+    throw new Error(
+      "Vaults illisibles"
+    );
+  }
+
+  const base =
+    readSplTokenAccountAmount(
+      baseBuffer
+    );
+
+  const quote =
+    readSplTokenAccountAmount(
+      quoteBuffer
+    );
+
+  if (
+    base == null ||
+    quote == null
+  ) {
+    throw new Error(
+      "Montant SPL illisible"
+    );
+  }
+
+  state.baseRaw =
+    base;
+
+  state.quoteRaw =
+    quote;
+
+  state.quoteSol =
+    lamportsToSol(
+      quote
+    );
+
+  state.reserveHistory.push({
+    t: now(),
+    v: state.quoteSol,
+  });
+
+  state.lastOnchainAt =
+    now();
+
+  trimHistory();
+
+  return {
+    base,
+    quote,
+  };
+}
+
+// ============================================================
+// ÉVÉNEMENTS VAULTS
+// ============================================================
+
+function addEvent(
+  baseDelta,
+  quoteDelta
+) {
+  const absoluteQuote =
+    quoteDelta < 0n
+      ? -quoteDelta
+      : quoteDelta;
+
+  const quoteSol =
+    lamportsToSol(
+      absoluteQuote
+    );
+
+  // Poussière ignorée.
+  if (quoteSol < 0.01) {
+    return;
+  }
+
+  let type =
+    "OTHER";
+
+  // Base token sort du pool
+  // + SOL entre dans le pool
+  // = SELL
+  if (
+    baseDelta < 0n &&
+    quoteDelta > 0n
+  ) {
+    type = "SELL";
+  }
+
+  // Base token entre dans le pool
+  // + SOL sort du pool
+  // = BUY
+  else if (
+    baseDelta > 0n &&
+    quoteDelta < 0n
+  ) {
+    type = "BUY";
+  }
+
+  // Les deux réserves diminuent
+  // = retrait potentiel
+  else if (
+    baseDelta < 0n &&
+    quoteDelta < 0n
+  ) {
+    type = "WITHDRAWAL";
+  }
+
+  // Les deux augmentent
+  // = ajout de liquidité potentiel
+  else if (
+    baseDelta > 0n &&
+    quoteDelta > 0n
+  ) {
+    type = "LIQUIDITY_ADD";
+  }
+
+  state.events.push({
+    t: now(),
+    type,
+    quoteSol,
+    baseDelta,
+    quoteDelta,
+  });
+
+  trimHistory();
+}
+
+// ============================================================
+// BATCH VAULTS
+// ============================================================
+
+function flushVaultBatch() {
+  state.pendingTimer =
+    null;
+
+  const base =
+    state.pendingBase;
+
+  const quote =
+    state.pendingQuote;
+
+  state.pendingBase =
+    null;
+
+  state.pendingQuote =
+    null;
+
+  if (
+    base == null ||
+    quote == null
+  ) {
+    return;
+  }
+
+  if (
+    state.baseRaw == null ||
+    state.quoteRaw == null
+  ) {
+    state.baseRaw =
+      base;
+
+    state.quoteRaw =
+      quote;
+
+    state.quoteSol =
+      lamportsToSol(
+        quote
+      );
+
+    state.reserveHistory.push({
+      t: now(),
+      v: state.quoteSol,
+    });
+
+    state.lastOnchainAt =
+      now();
+
+    return;
+  }
+
+  const baseDelta =
+    base - state.baseRaw;
+
+  const quoteDelta =
+    quote - state.quoteRaw;
+
+  state.baseRaw =
+    base;
+
+  state.quoteRaw =
+    quote;
+
+  state.quoteSol =
+    lamportsToSol(
+      quote
+    );
+
+  state.reserveHistory.push({
+    t: now(),
+    v: state.quoteSol,
+  });
+
+  state.lastOnchainAt =
+    now();
+
+  addEvent(
+    baseDelta,
+    quoteDelta
+  );
+
+  trimHistory();
+}
+
+function queueVaultUpdate(
+  which,
+  value
+) {
+  if (which === "base") {
+    state.pendingBase =
+      value;
+  } else {
+    state.pendingQuote =
+      value;
+  }
+
+  if (!state.pendingTimer) {
+    state.pendingTimer =
+      setTimeout(
+        flushVaultBatch,
+        BATCH_MS
+      );
+  }
+}
+
+// ============================================================
+// ÉVÉNEMENTS
+// ============================================================
+
+function eventsWithin(
+  seconds,
+  type = null
+) {
+  const cutoff =
+    now() -
+    seconds * 1000;
+
+  return state.events.filter(
+    event =>
+      event.t >= cutoff &&
+      (!type ||
+        event.type === type)
+  );
+}
+
+function sumEvents(
+  seconds,
+  type
+) {
+  return eventsWithin(
+    seconds,
+    type
+  ).reduce(
+    (sum, event) =>
+      sum + event.quoteSol,
+    0
+  );
+}
+
+function countEvents(
+  seconds,
+  type
+) {
+  return eventsWithin(
+    seconds,
+    type
+  ).length;
+}
 
 function sellRatio(seconds) {
-  const sells = sellVolume(seconds);
-  const buys = buyVolume(seconds);
+  const events =
+    eventsWithin(seconds);
 
-  const total = sells + buys;
+  let sell = 0;
+  let buy = 0;
+
+  for (const event of events) {
+    if (event.type === "SELL") {
+      sell += event.quoteSol;
+    }
+
+    if (event.type === "BUY") {
+      buy += event.quoteSol;
+    }
+  }
+
+  const total =
+    sell + buy;
 
   if (total <= 0) {
     return 0;
   }
 
   return (
-    sells / total
+    sell / total
   ) * 100;
 }
 
-// ------------------------------------------------------------
-// NOMBRE SELL
-// ------------------------------------------------------------
-
-function sellCount(seconds) {
-  return getSellEvents(seconds).length;
-}
-
-// ------------------------------------------------------------
-// GROS SELL
-// ------------------------------------------------------------
-
-function largestSell(seconds) {
-  const sells = getSellEvents(seconds);
-
-  if (!sells.length) {
-    return 0;
-  }
-
-  return Math.max(
-    ...sells.map(
-      e => safeNumber(e.quote)
-    )
-  );
-}
-
-// ------------------------------------------------------------
-// ACCELERATION SELL
-// Compare 3s avec les 3s précédentes
-// ------------------------------------------------------------
-
-function sellAcceleration() {
-  cleanupEvents();
-
-  const now = Date.now();
-
-  const recent = events.filter(
-    e =>
-      e.type === "SELL" &&
-      e.time >= now - 3000
-  );
-
-  const previous = events.filter(
-    e =>
-      e.type === "SELL" &&
-      e.time >= now - 6000 &&
-      e.time < now - 3000
-  );
-
-  const recentVolume =
-    recent.reduce(
-      (s, e) => s + safeNumber(e.quote),
-      0
-    );
-
-  const previousVolume =
-    previous.reduce(
-      (s, e) => s + safeNumber(e.quote),
-      0
-    );
-
-  if (previousVolume <= 0) {
-    return recentVolume > 0
-      ? 999
-      : 0;
-  }
-
-  return (
-    recentVolume /
-    previousVolume
-  );
-}
-
-// ------------------------------------------------------------
-// SELL BURST
-// ------------------------------------------------------------
-
-function sellBurstScore() {
-  const s1 = sellVolume(1);
-  const s3 = sellVolume(3);
-  const s5 = sellVolume(5);
-  const c1 = sellCount(1);
-  const c3 = sellCount(3);
-
-  let score = 0;
-
-  // Activité instantanée
-  if (s1 >= 3) score += 8;
-  if (s1 >= 5) score += 8;
-  if (s1 >= 10) score += 10;
-  if (s1 >= 20) score += 12;
-
-  // Répétition
-  if (c1 >= 3) score += 6;
-  if (c1 >= 5) score += 8;
-  if (c3 >= 10) score += 8;
-
-  // Ratio
-  const ratio = sellRatio(3);
-
-  if (ratio >= 70) score += 5;
-  if (ratio >= 80) score += 7;
-  if (ratio >= 90) score += 10;
-
-  // Accélération
-  const acceleration =
-    sellAcceleration();
-
-  if (acceleration >= 2) score += 6;
-  if (acceleration >= 4) score += 8;
-  if (acceleration >= 8) score += 10;
-
-  return clamp(score, 0, 45);
-}
-
-// ------------------------------------------------------------
-// LIQUIDITY MICRO
-// ------------------------------------------------------------
-
-let liquiditySamples = [];
-
-/*
-{
-  time,
-  liquidity,
-  price
-}
-*/
-
-function addLiquiditySample() {
-  if (
-    !lastLiquidity ||
-    lastLiquidity <= 0
-  ) {
-    return;
-  }
-
-  liquiditySamples.push({
-    time: Date.now(),
-    liquidity: lastLiquidity,
-    price: lastPrice
-  });
-
-  const cutoff =
-    Date.now() - 60000;
-
-  liquiditySamples =
-    liquiditySamples.filter(
-      x => x.time >= cutoff
-    );
-}
-
-// ------------------------------------------------------------
-// LIQUIDITE CHANGE
-// ------------------------------------------------------------
-
-function liquidityChange(seconds) {
-  const now = Date.now();
-
-  const cutoff =
-    now - seconds * 1000;
-
-  const samples =
-    liquiditySamples.filter(
-      x => x.time >= cutoff
-    );
-
-  if (
-    !samples.length ||
-    !lastLiquidity
-  ) {
-    return 0;
-  }
-
-  const oldest =
-    samples[0].liquidity;
-
-  if (!oldest) {
-    return 0;
-  }
-
-  return (
-    (lastLiquidity - oldest) /
-    oldest
-  ) * 100;
-}
-
-// ------------------------------------------------------------
-// RESERVE MICRO CHANGE
-// ------------------------------------------------------------
-
-let reserveSamples = [];
-
-/*
-{
-  time,
-  quote
-}
-*/
-
-function addReserveSample() {
-  if (
-    currentQuote === null ||
-    currentQuote === undefined
-  ) {
-    return;
-  }
-
-  reserveSamples.push({
-    time: Date.now(),
-    quote: Number(currentQuote)
-  });
-
-  const cutoff =
-    Date.now() - 30000;
-
-  reserveSamples =
-    reserveSamples.filter(
-      x => x.time >= cutoff
-    );
-}
-
-function reserveChange(seconds) {
-  if (
-    currentQuote === null ||
-    currentQuote === undefined
-  ) {
-    return 0;
-  }
-
-  const cutoff =
-    Date.now() - seconds * 1000;
-
-  const samples =
-    reserveSamples.filter(
-      x => x.time >= cutoff
-    );
-
-  if (!samples.length) {
-    return 0;
-  }
-
-  const oldest =
-    samples[0].quote;
-
-  if (!oldest) {
-    return 0;
-  }
-
-  return (
-    (
-      Number(currentQuote) -
-      oldest
-    ) / oldest
-  ) * 100;
-}
-
-// ------------------------------------------------------------
-// SCORE PRIX
-// ------------------------------------------------------------
-
-function priceWeaknessScore() {
-  let score = 0;
-
-  const dd = priceDrawdown();
-
-  // Prix proche du sommet mais qui commence à décrocher
-  if (dd <= -1) score += 4;
-  if (dd <= -2) score += 7;
-  if (dd <= -3) score += 10;
-  if (dd <= -5) score += 15;
-  if (dd <= -8) score += 20;
-
-  return clamp(score, 0, 25);
-}
-
-// ------------------------------------------------------------
-// SCORE RESERVE
-// ------------------------------------------------------------
-
-function reserveRiskScore() {
-  let score = 0;
-
-  const r10 =
-    reserveChange(10);
-
-  const r5 =
-    reserveChange(5);
-
-  if (r5 <= -0.5) score += 5;
-  if (r5 <= -1) score += 7;
-  if (r5 <= -2) score += 10;
-  if (r5 <= -5) score += 15;
-
-  if (r10 <= -2) score += 5;
-  if (r10 <= -5) score += 8;
-  if (r10 <= -10) score += 12;
-  if (r10 <= -20) score += 18;
-
-  return clamp(score, 0, 30);
-}
-
-// ------------------------------------------------------------
-// SCORE LIQUIDITE
-// ------------------------------------------------------------
-
-function liquidityRiskScore() {
-  let score = 0;
-
-  const l5 =
-    liquidityChange(5);
-
-  const l15 =
-    liquidityChange(15);
-
-  if (l5 <= -1) score += 5;
-  if (l5 <= -3) score += 8;
-  if (l5 <= -5) score += 12;
-  if (l5 <= -10) score += 18;
-
-  if (l15 <= -3) score += 5;
-  if (l15 <= -8) score += 8;
-  if (l15 <= -15) score += 12;
-  if (l15 <= -25) score += 18;
-
-  return clamp(score, 0, 30);
-}
-
-// ------------------------------------------------------------
-// RETRAITS LIQUIDITE
-// ------------------------------------------------------------
-
-function withdrawalRiskScore() {
-  const withdrawals =
-    getEvents(10)
-      .filter(
-        e => e.type === "WITHDRAW"
-      );
-
-  if (!withdrawals.length) {
-    return 0;
-  }
-
-  const total =
-    withdrawals.reduce(
-      (s, e) =>
-        s + Math.abs(safeNumber(e.quote)),
-      0
-    );
-
-  let score = 10;
-
-  if (total >= 5) score += 8;
-  if (total >= 20) score += 10;
-  if (total >= 50) score += 12;
-  if (withdrawals.length >= 2) score += 10;
-
-  return clamp(score, 0, 35);
-}
-
-// ------------------------------------------------------------
-// CONFLUENCE
-// Le cœur de V5
-// ------------------------------------------------------------
+// ============================================================
+// CALCUL DU RISQUE V6
+// ============================================================
 
 function calculateRisk() {
-  let score = 0;
+  const price5 =
+    changeWithin(
+      state.priceHistory,
+      5
+    );
 
-  const reasons = [];
+  const price10 =
+    changeWithin(
+      state.priceHistory,
+      10
+    );
 
-  const burst =
-    sellBurstScore();
+  const liquidity5 =
+    changeWithin(
+      state.liquidityHistory,
+      5
+    );
 
-  const priceRisk =
-    priceWeaknessScore();
+  const liquidity10 =
+    changeWithin(
+      state.liquidityHistory,
+      10
+    );
 
-  const reserveRisk =
-    reserveRiskScore();
+  const reserve5 =
+    changeWithin(
+      state.reserveHistory,
+      5
+    );
 
-  const liquidityRisk =
-    liquidityRiskScore();
+  const reserve10 =
+    changeWithin(
+      state.reserveHistory,
+      10
+    );
 
-  const withdrawalRisk =
-    withdrawalRiskScore();
+  const sell1 =
+    sumEvents(
+      1,
+      "SELL"
+    );
 
-  score += burst;
-  score += priceRisk;
-  score += reserveRisk;
-  score += liquidityRisk;
-  score += withdrawalRisk;
+  const sell3 =
+    sumEvents(
+      3,
+      "SELL"
+    );
 
-  // ----------------------------------------------------------
-  // CONFLUENCE 1
-  // SELL agressifs + prix qui décroche
-  // ----------------------------------------------------------
+  const sell5 =
+    sumEvents(
+      5,
+      "SELL"
+    );
 
   const sell10 =
-    sellVolume(10);
+    sumEvents(
+      10,
+      "SELL"
+    );
+
+  const sellCount10 =
+    countEvents(
+      10,
+      "SELL"
+    );
 
   const ratio10 =
     sellRatio(10);
 
-  const dd =
-    priceDrawdown();
+  const withdrawal10 =
+    sumEvents(
+      10,
+      "WITHDRAWAL"
+    );
+
+  const priceBelowHigh =
+    getPriceDropFromHigh();
+
+  let score = 0;
+
+  const signals = [];
+
+  // ==========================================================
+  // 1. VENTES ABSORBÉES
+  //
+  // Si le prix continue à monter et que la réserve/liquidité
+  // restent stables, les SELL ne sont pas considérés comme
+  // dangereux.
+  // ==========================================================
+
+  const makingHigh =
+    state.price > 0 &&
+    state.localHigh > 0 &&
+    state.price >=
+      state.localHigh * 0.998;
+
+  const healthyMarket =
+    price10 >= 0 &&
+    liquidity10 > -1 &&
+    reserve10 > -1;
+
+  if (
+    ratio10 >= 85 &&
+    sell10 >= 2
+  ) {
+    if (
+      makingHigh &&
+      healthyMarket
+    ) {
+      score += 3;
+    } else {
+      score += 6;
+    }
+  }
+
+  // ==========================================================
+  // 2. SELL + BAISSE DU PRIX
+  // ==========================================================
+
+  if (
+    sell5 >= 5 &&
+    price5 < -0.5
+  ) {
+    score += 15;
+
+    signals.push(
+      "SELL + prix en baisse"
+    );
+  }
 
   if (
     sell10 >= 10 &&
-    ratio10 >= 75 &&
-    dd <= -1
-  ) {
-    score += 15;
-    reasons.push(
-      "SELL agressifs + prix sous le sommet"
-    );
-  }
-
-  // ----------------------------------------------------------
-  // CONFLUENCE 2
-  // SELL agressifs + réserve en baisse
-  // ----------------------------------------------------------
-
-  const r10 =
-    reserveChange(10);
-
-  if (
-    sell10 >= 10 &&
-    ratio10 >= 70 &&
-    r10 <= -2
-  ) {
-    score += 15;
-    reasons.push(
-      "SELL agressifs + réserve en baisse"
-    );
-  }
-
-  // ----------------------------------------------------------
-  // CONFLUENCE 3
-  // SELL accélèrent
-  // ----------------------------------------------------------
-
-  const acceleration =
-    sellAcceleration();
-
-  if (
-    acceleration >= 3 &&
-    sellCount(3) >= 5
+    price10 < -1
   ) {
     score += 12;
 
-    reasons.push(
-      "accélération brutale des SELL"
+    signals.push(
+      "pression vendeuse non absorbée"
     );
   }
 
-  // ----------------------------------------------------------
-  // CONFLUENCE 4
-  // plusieurs gros SELL rapprochés
-  // ----------------------------------------------------------
-
-  const biggest =
-    largestSell(5);
-
-  const count5 =
-    sellCount(5);
-
   if (
-    biggest >= 10 &&
-    count5 >= 3
-  ) {
-    score += 12;
-
-    reasons.push(
-      "gros SELL répétés"
-    );
-  }
-
-  // ----------------------------------------------------------
-  // CONFLUENCE 5
-  // prix monte encore mais pression extrême
-  // ----------------------------------------------------------
-
-  if (
-    ratio10 >= 90 &&
-    sell10 >= 15 &&
-    dd > -1
+    sell10 >= 20 &&
+    price10 < -2
   ) {
     score += 8;
 
-    reasons.push(
-      "pression extrême malgré prix encore haut"
+    signals.push(
+      "accélération vendeuse toxique"
     );
   }
 
-  // ----------------------------------------------------------
-  // CONFLUENCE 6
-  // liquidité et réserve chutent ensemble
-  // ----------------------------------------------------------
-
-  const l10 =
-    liquidityChange(10);
-
+  // Beaucoup de SELL mais prix toujours positif.
   if (
-    l10 <= -3 &&
-    r10 <= -2
+    sellCount10 >= 20 &&
+    price10 >= 0
   ) {
-    score += 15;
+    score -= 3;
+  }
 
-    reasons.push(
-      "liquidité + réserve se dégradent"
+  // ==========================================================
+  // 3. ÉCHEC DU SOMMET
+  // ==========================================================
+
+  if (
+    priceBelowHigh >= 1
+  ) {
+    score += 8;
+
+    signals.push(
+      "prix sous le sommet"
     );
   }
 
-  // ----------------------------------------------------------
-  // CONFLUENCE 7
-  // rupture du sommet
-  // ----------------------------------------------------------
-
   if (
-    dd <= -3 &&
-    sell10 >= 5
+    priceBelowHigh >= 2
   ) {
     score += 10;
 
-    reasons.push(
-      "rupture du sommet récent"
+    signals.push(
+      "perte du sommet local"
     );
   }
 
-  return {
-    score: clamp(
+  if (
+    price10 < -1
+  ) {
+    score += 10;
+
+    signals.push(
+      "prix commence à décrocher"
+    );
+  }
+
+  if (
+    price10 < -3
+  ) {
+    score += 10;
+
+    signals.push(
+      "décrochage rapide du prix"
+    );
+  }
+
+  // ==========================================================
+  // 4. RÉSERVE ON-CHAIN
+  //
+  // PRIORITÉ V6
+  // ==========================================================
+
+  if (
+    reserve5 <= -1
+  ) {
+    score += 12;
+
+    signals.push(
+      "réserve WSOL en baisse"
+    );
+  }
+
+  if (
+    reserve10 <= -2
+  ) {
+    score += 15;
+
+    signals.push(
+      "baisse anormale de réserve"
+    );
+  }
+
+  if (
+    reserve10 <= -5
+  ) {
+    score += 20;
+
+    signals.push(
+      "forte sortie de réserve"
+    );
+  }
+
+  if (
+    reserve10 <= -15
+  ) {
+    score += 30;
+
+    signals.push(
+      "sortie structurelle de réserve"
+    );
+  }
+
+  // ==========================================================
+  // 5. LIQUIDITÉ
+  // ==========================================================
+
+  if (
+    liquidity10 <= -2
+  ) {
+    score += 8;
+
+    signals.push(
+      "liquidité en baisse"
+    );
+  }
+
+  if (
+    liquidity10 <= -5
+  ) {
+    score += 15;
+
+    signals.push(
+      "dégradation rapide de liquidité"
+    );
+  }
+
+  if (
+    liquidity10 <= -15
+  ) {
+    score += 25;
+
+    signals.push(
+      "liquidité fortement retirée"
+    );
+  }
+
+  // ==========================================================
+  // 6. RETRAIT STRUCTUREL
+  // ==========================================================
+
+  if (
+    withdrawal10 >= 1
+  ) {
+    score += 25;
+
+    signals.push(
+      "retrait de liquidité détecté"
+    );
+  }
+
+  if (
+    withdrawal10 >= 10
+  ) {
+    score += 30;
+
+    signals.push(
+      "retrait structurel important"
+    );
+  }
+
+  // ==========================================================
+  // 7. CONFLUENCE
+  // ==========================================================
+
+  const negativeFactors = [
+    price10 < -1,
+    reserve10 < -1,
+    liquidity10 < -1,
+    priceBelowHigh >= 1,
+    sell10 >= 10 &&
+      ratio10 >= 75,
+  ].filter(Boolean).length;
+
+  if (
+    negativeFactors >= 3
+  ) {
+    score += 15;
+
+    signals.push(
+      "confluence de signaux"
+    );
+  }
+
+  score =
+    clamp(
       Math.round(score),
       0,
       100
-    ),
-    reasons,
-    metrics: {
-      sell1: sellVolume(1),
-      sell3: sellVolume(3),
-      sell5: sellVolume(5),
-      sell10,
-      sell30: sellVolume(30),
-      buy10: buyVolume(10),
-      ratio10,
-      sellCount1: sellCount(1),
-      sellCount3: sellCount(3),
-      sellCount10: sellCount(10),
-      acceleration,
-      drawdown: dd,
-      reserve5: reserveChange(5),
-      reserve10: r10,
-      liquidity5: liquidityChange(5),
-      liquidity15: liquidityChange(15)
-    }
+    );
+
+  // ==========================================================
+  // NIVEAUX
+  // ==========================================================
+
+  let level =
+    "NORMAL";
+
+  if (
+    score >= 80
+  ) {
+    level =
+      "URGENT";
+  } else if (
+    score >= 60
+  ) {
+    level =
+      "CRITIQUE";
+  } else if (
+    score >= 40
+  ) {
+    level =
+      "DANGER";
+  } else if (
+    score >= 25
+  ) {
+    level =
+      "SURVEILLANCE";
+  }
+
+  // ==========================================================
+  // CRASH CONFIRMÉ
+  //
+  // Après une vraie chute, on arrête complètement le radar.
+  // ==========================================================
+
+  const crash =
+    priceBelowHigh >= 50 ||
+    liquidity10 <= -50 ||
+    reserve10 <= -50;
+
+  return {
+    score,
+    level,
+
+    price5,
+    price10,
+
+    liquidity5,
+    liquidity10,
+
+    reserve5,
+    reserve10,
+
+    sell1,
+    sell3,
+    sell5,
+    sell10,
+
+    sellCount10,
+    ratio10,
+
+    withdrawal10,
+
+    priceBelowHigh,
+
+    signals: [
+      ...new Set(signals),
+    ],
+
+    crash,
   };
 }
 
-// ------------------------------------------------------------
-// NIVEAU
-// ------------------------------------------------------------
+// ============================================================
+// ALERTES
+// ============================================================
 
-function getRiskLevel(score) {
-  if (score >= 75) {
-    return "URGENT";
+function alertTitle(level) {
+  if (
+    level === "URGENT"
+  ) {
+    return "🚨 SORTIE URGENTE";
   }
 
-  if (score >= 50) {
-    return "DANGER";
+  if (
+    level === "CRITIQUE"
+  ) {
+    return "🔴 CRITIQUE : RISQUE DE CHUTE";
   }
 
-  if (score >= 35) {
-    return "PRECRASH";
+  if (
+    level === "DANGER"
+  ) {
+    return "🟠 DANGER : DÉGRADATION";
   }
 
-  if (score >= 20) {
-    return "PRESSION";
-  }
-
-  return "NORMAL";
+  return "🟡 SURVEILLANCE";
 }
 
-// ------------------------------------------------------------
-// DOIT ALERTER ?
-// ------------------------------------------------------------
+function buildAlert(risk) {
+  return `${alertTitle(risk.level)}
 
-function shouldAlert(level, score) {
-  const now = Date.now();
+Score risque : ${risk.score}/100
 
-  // Normal
-  if (level === "NORMAL") {
-    return false;
-  }
+Prix : $${state.price.toFixed(8)}
+Liquidité : $${fmtUsd(state.liquidityUsd)}
 
-  // Nouveau niveau
-  if (level !== lastAlertLevel) {
-    return true;
-  }
-
-  // Urgent : cooldown court
-  if (level === "URGENT") {
-    return (
-      now - lastAlertTime >= 15000
-    );
-  }
-
-  // Danger
-  if (level === "DANGER") {
-    return (
-      now - lastAlertTime >= 20000
-    );
-  }
-
-  // Precrash
-  if (level === "PRECRASH") {
-    return (
-      now - lastAlertTime >= 30000
-    );
-  }
-
-  // Pression
-  return (
-    now - lastAlertTime >= 60000
-  );
-}
-
-// ------------------------------------------------------------
-// MESSAGE ALERTE
-// ------------------------------------------------------------
-
-async function sendRiskAlert(
-  level,
-  analysis
-) {
-  const m =
-    analysis.metrics;
-
-  let title = "";
-
-  if (level === "URGENT") {
-    title =
-      "🚨 SIGNAL DE SORTIE URGENT";
-  } else if (level === "DANGER") {
-    title =
-      "🟠 DANGER : DÉGRADATION RAPIDE";
-  } else if (level === "PRECRASH") {
-    title =
-      "🟡 PRÉ-CRASH : MICRO-SIGNAUX";
-  } else {
-    title =
-      "🟠 PRESSION VENDEUSE";
-  }
-
-  const reasonText =
-    analysis.reasons.length
-      ? analysis.reasons.join(" | ")
-      : "activité vendeuse inhabituelle";
-
-  const message =
-`${title}
-
-Score risque : ${analysis.score}/100
-
-Prix : $${safeNumber(lastPrice).toFixed(8)}
-Liquidité : $${safeNumber(lastLiquidity).toFixed(2)}
-
-SELL 1s : ${formatSol(m.sell1)} SOL
-SELL 3s : ${formatSol(m.sell3)} SOL
-SELL 5s : ${formatSol(m.sell5)} SOL
-SELL 10s : ${formatSol(m.sell10)} SOL
-SELL ratio 10s : ${formatPct(m.ratio10)}%
-
-SELL / 10s : ${m.sellCount10}
+SELL 1s : ${fmtSol(risk.sell1)} SOL
+SELL 3s : ${fmtSol(risk.sell3)} SOL
+SELL 5s : ${fmtSol(risk.sell5)} SOL
+SELL 10s : ${fmtSol(risk.sell10)} SOL
+SELL ratio 10s : ${risk.ratio10.toFixed(1)}%
+SELL / 10s : ${risk.sellCount10}
 
 Réserve WSOL :
-${currentQuote !== null
-  ? formatSol(Number(currentQuote))
-  : "N/A"} SOL
-
-Prix sous sommet :
-${formatPct(m.drawdown)}%
+${fmtSol(state.quoteSol)} SOL
 
 Réserve 5s :
-${formatPct(m.reserve5)}%
+${fmtPct(risk.reserve5)}
 
 Réserve 10s :
-${formatPct(m.reserve10)}%
+${fmtPct(risk.reserve10)}
+
+Prix sous sommet :
+${risk.priceBelowHigh.toFixed(1)}%
 
 Liquidité 5s :
-${formatPct(m.liquidity5)}%
+${fmtPct(risk.liquidity5)}
+
+Liquidité 10s :
+${fmtPct(risk.liquidity10)}
 
 ⚠️ Signaux :
-${reasonText}
-
-📡 RADAR V5`;
-
-  await sendTelegram(message);
-
-  lastAlertTime = Date.now();
-  lastAlertLevel = level;
+${
+  risk.signals.length
+    ? risk.signals
+        .map(x => `• ${x}`)
+        .join("\n")
+    : "• aucun signal"
 }
 
-// ------------------------------------------------------------
-// EVALUATION
-// ------------------------------------------------------------
-
-async function evaluateRisk() {
-  if (!watchedMint) {
-    return;
-  }
-
-  cleanupEvents();
-
-  const analysis =
-    calculateRisk();
-
-  const level =
-    getRiskLevel(
-      analysis.score
-    );
-
-  if (
-    shouldAlert(
-      level,
-      analysis.score
-    )
-  ) {
-    await sendRiskAlert(
-      level,
-      analysis
-    );
-  }
-
-  if (level === "NORMAL") {
-    lastAlertLevel = "NORMAL";
-  }
+📡 RADAR V6`;
 }
 
-// ------------------------------------------------------------
-// ENREGISTREMENT EVENEMENT
-// ------------------------------------------------------------
+// ============================================================
+// ANTI-SPAM
+// ============================================================
 
-function recordEvent(
-  type,
-  quote,
-  base,
-  tx
-) {
-  events.push({
-    time: Date.now(),
-    type,
-    quote: Math.abs(
-      safeNumber(quote)
-    ),
-    base: Math.abs(
-      safeNumber(base)
-    ),
-    tx: tx || null
-  });
-
-  cleanupEvents();
-
-  console.log(
-    `📊 ${type} | ${safeNumber(quote).toFixed(4)} SOL`
-  );
-}
-
-// ------------------------------------------------------------
-// BATCH VAULT
-// ------------------------------------------------------------
-
-let pendingBase = null;
-let pendingQuote = null;
-
-let batchTimer = null;
-
-function scheduleVaultEvaluation() {
-  if (batchTimer) {
-    return;
-  }
-
-  batchTimer = setTimeout(() => {
-    batchTimer = null;
-
-    processVaultBatch();
-
-  }, 80);
-}
-
-// ------------------------------------------------------------
-// PROCESS DELTA
-// ------------------------------------------------------------
-
-function processVaultBatch() {
+function shouldAlert(risk) {
   if (
-    pendingBase === null ||
-    pendingQuote === null
-  ) {
-    return;
-  }
-
-  const newBase =
-    pendingBase;
-
-  const newQuote =
-    pendingQuote;
-
-  pendingBase = null;
-  pendingQuote = null;
-
-  if (
-    currentBase === null ||
-    currentQuote === null
-  ) {
-    currentBase = newBase;
-    currentQuote = newQuote;
-
-    addReserveSample();
-
-    return;
-  }
-
-  const baseDelta =
-    newBase - currentBase;
-
-  const quoteDelta =
-    newQuote - currentQuote;
-
-  currentBase = newBase;
-  currentQuote = newQuote;
-
-  addReserveSample();
-
-  if (
-    baseDelta === 0 &&
-    quoteDelta === 0
-  ) {
-    return;
-  }
-
-  /*
-   SELL :
-   base vault ↓
-   quote vault ↑
-
-   BUY :
-   base vault ↑
-   quote vault ↓
-
-   RETRAIT :
-   base vault ↓
-   quote vault ↓
-
-   AJOUT :
-   base vault ↑
-   quote vault ↑
-  */
-
-  const baseDown =
-    baseDelta < 0;
-
-  const baseUp =
-    baseDelta > 0;
-
-  const quoteDown =
-    quoteDelta < 0;
-
-  const quoteUp =
-    quoteDelta > 0;
-
-  const quoteAbs =
-    Math.abs(
-      Number(quoteDelta)
-    ) /
-    1e9;
-
-  const baseAbs =
-    Math.abs(
-      Number(baseDelta)
-    );
-
-  if (
-    baseDown &&
-    quoteUp
-  ) {
-    recordEvent(
-      "SELL",
-      quoteAbs,
-      baseAbs,
-      null
-    );
-
-    return;
-  }
-
-  if (
-    baseUp &&
-    quoteDown
-  ) {
-    recordEvent(
-      "BUY",
-      quoteAbs,
-      baseAbs,
-      null
-    );
-
-    return;
-  }
-
-  if (
-    baseDown &&
-    quoteDown
-  ) {
-    recordEvent(
-      "WITHDRAW",
-      quoteAbs,
-      baseAbs,
-      null
-    );
-
-    return;
-  }
-
-  if (
-    baseUp &&
-    quoteUp
-  ) {
-    recordEvent(
-      "ADD",
-      quoteAbs,
-      baseAbs,
-      null
-    );
-
-    return;
-  }
-}
-
-// ------------------------------------------------------------
-// BASE VAULT SUBSCRIPTION
-// ------------------------------------------------------------
-
-async function subscribeBaseVault() {
-  if (!baseVault) {
-    return;
-  }
-
-  try {
-    baseSubscription =
-      connection.onAccountChange(
-        new PublicKey(baseVault),
-        accountInfo => {
-          const amount =
-            readTokenAmount(
-              accountInfo.data
-            );
-
-          if (
-            amount === null
-          ) {
-            return;
-          }
-
-          pendingBase =
-            amount;
-
-          scheduleVaultEvaluation();
-        },
-        {
-          commitment: "processed",
-          encoding: "base64"
-        }
-      );
-
-    console.log(
-      "🟢 Base vault surveillé"
-    );
-
-  } catch (err) {
-    console.error(
-      "❌ Base subscription:",
-      err.message
-    );
-  }
-}
-
-// ------------------------------------------------------------
-// QUOTE VAULT SUBSCRIPTION
-// ------------------------------------------------------------
-
-async function subscribeQuoteVault() {
-  if (!quoteVault) {
-    return;
-  }
-
-  try {
-    quoteSubscription =
-      connection.onAccountChange(
-        new PublicKey(quoteVault),
-        accountInfo => {
-          const amount =
-            readTokenAmount(
-              accountInfo.data
-            );
-
-          if (
-            amount === null
-          ) {
-            return;
-          }
-
-          pendingQuote =
-            amount;
-
-          scheduleVaultEvaluation();
-        },
-        {
-          commitment: "processed",
-          encoding: "base64"
-        }
-      );
-
-    console.log(
-      "🟢 Quote vault surveillé"
-    );
-
-  } catch (err) {
-    console.error(
-      "❌ Quote subscription:",
-      err.message
-    );
-  }
-}
-
-// ------------------------------------------------------------
-// LOGS PUMPSWAP
-// ------------------------------------------------------------
-
-async function subscribeLogs() {
-  if (!poolAddress) {
-    return;
-  }
-
-  try {
-    logSubscription =
-      connection.onLogs(
-        new PublicKey(poolAddress),
-        logInfo => {
-
-          const logs =
-            logInfo.logs || [];
-
-          const text =
-            logs.join(" ");
-
-          const lower =
-            text.toLowerCase();
-
-          if (
-            lower.includes("sell")
-          ) {
-            console.log(
-              "⚠️ LOG PUMPSWAP SELL"
-            );
-          }
-
-          if (
-            lower.includes("buy")
-          ) {
-            console.log(
-              "🟢 LOG PUMPSWAP BUY"
-            );
-          }
-
-        },
-        "processed"
-      );
-
-    console.log(
-      "🟢 Logs PumpSwap actifs"
-    );
-
-  } catch (err) {
-    console.error(
-      "❌ Logs subscription:",
-      err.message
-    );
-  }
-}
-
-// ------------------------------------------------------------
-// INITIALISATION VAULTS
-// ------------------------------------------------------------
-
-async function initializeVaultBalances() {
-  if (
-    !baseVault ||
-    !quoteVault
+    state.stopped
   ) {
     return false;
   }
 
-  const base =
-    await readVaultBalance(
-      baseVault
-    );
-
-  const quote =
-    await readVaultBalance(
-      quoteVault
-    );
-
   if (
-    base === null ||
-    quote === null
+    risk.score < 25
   ) {
-    console.error(
-      "❌ Impossible d'initialiser les réserves"
-    );
-
     return false;
   }
 
-  currentBase = base;
-  currentQuote = quote;
+  const elapsed =
+    now() -
+    state.lastAlertAt;
 
-  addReserveSample();
+  const cooldown =
+    risk.level === "URGENT" ||
+    risk.level === "CRITIQUE"
+      ? 15000
+      : 45000;
 
-  console.log(
-    "💧 Base :",
-    base.toString()
-  );
+  if (
+    elapsed < cooldown
+  ) {
+    return false;
+  }
 
-  console.log(
-    "💧 Quote :",
-    quote.toString()
-  );
+  const key = [
+    risk.level,
+    Math.floor(
+      risk.score / 10
+    ),
+    risk.signals
+      .slice(0, 2)
+      .join("|"),
+  ].join(":");
+
+  if (
+    key === state.lastAlertKey &&
+    elapsed < 90000
+  ) {
+    return false;
+  }
 
   return true;
 }
 
-// ------------------------------------------------------------
-// RESET
-// ------------------------------------------------------------
-
-async function resetSubscriptions() {
-  try {
-    if (
-      baseSubscription !== null
-    ) {
-      await connection.removeAccountChangeListener(
-        baseSubscription
-      );
-    }
-  } catch {}
-
-  try {
-    if (
-      quoteSubscription !== null
-    ) {
-      await connection.removeAccountChangeListener(
-        quoteSubscription
-      );
-    }
-  } catch {}
-
-  try {
-    if (
-      logSubscription !== null
-    ) {
-      await connection.removeOnLogsListener(
-        logSubscription
-      );
-    }
-  } catch {}
-
-  baseSubscription = null;
-  quoteSubscription = null;
-  logSubscription = null;
-}
-
-// ------------------------------------------------------------
-// DISCOVERY
-// ------------------------------------------------------------
-
-async function discoverPool() {
-  const data =
-    await fetchDexData();
-
-  if (!data) {
-    throw new Error(
-      "Token introuvable sur DexScreener"
-    );
+async function sendAlert(risk) {
+  if (
+    !shouldAlert(risk)
+  ) {
+    return;
   }
 
-  if (!data.pool) {
-    throw new Error(
-      "Pool introuvable"
-    );
-  }
+  state.lastAlertAt =
+    now();
 
-  poolAddress =
-    data.pool;
+  state.lastAlertKey = [
+    risk.level,
+    Math.floor(
+      risk.score / 10
+    ),
+    risk.signals
+      .slice(0, 2)
+      .join("|"),
+  ].join(":");
 
-  lastPrice =
-    data.price;
+  state.alertCount++;
 
-  lastLiquidity =
-    data.liquidity;
-
-  localHighPrice =
-    data.price;
-
-  localHighLiquidity =
-    data.liquidity;
-
-  console.log(
-    "🏊 Pool :",
-    poolAddress
-  );
-
-  const vaults =
-    await readPoolVaults(
-      poolAddress
-    );
-
-  if (!vaults) {
-    throw new Error(
-      "Impossible de lire les vaults PumpSwap"
-    );
-  }
-
-  baseVault =
-    vaults.base;
-
-  quoteVault =
-    vaults.quote;
-
-  console.log(
-    "🪙 Base vault :",
-    baseVault
-  );
-
-  console.log(
-    "💧 Quote vault :",
-    quoteVault
-  );
-}
-
-// ------------------------------------------------------------
-// START WATCH
-// ------------------------------------------------------------
-
-async function startWatch(mint) {
   try {
-    await resetSubscriptions();
-
-    watchedMint =
-      mint.trim();
-
-    events.length = 0;
-    liquiditySamples = [];
-    reserveSamples = [];
-
-    currentBase = null;
-    currentQuote = null;
-
-    lastPrice = null;
-    lastLiquidity = null;
-
-    localHighPrice = null;
-    localHighLiquidity = null;
-
-    lastAlertTime = 0;
-    lastAlertLevel = "NORMAL";
+    await bot.telegram.sendMessage(
+      CHAT_ID,
+      buildAlert(risk)
+    );
 
     console.log(
-      "🔎 Recherche pool..."
+      `📨 Telegram : ${risk.level} ${risk.score}/100`
+    );
+  } catch (error) {
+    console.error(
+      "❌ Telegram :",
+      error.message
+    );
+  }
+}
+
+// ============================================================
+// ARRÊT AUTOMATIQUE
+// ============================================================
+
+async function stopRadar(
+  reason,
+  sendMessage = true
+) {
+  if (
+    state.stopped
+  ) {
+    return;
+  }
+
+  state.stopped =
+    true;
+
+  state.running =
+    false;
+
+  state.stopReason =
+    reason;
+
+  if (
+    state.pollTimer
+  ) {
+    clearInterval(
+      state.pollTimer
     );
 
-    await discoverPool();
+    state.pollTimer =
+      null;
+  }
 
-    const initialized =
-      await initializeVaultBalances();
+  if (
+    state.staleTimer
+  ) {
+    clearInterval(
+      state.staleTimer
+    );
 
-    if (!initialized) {
-      throw new Error(
-        "Initialisation des réserves impossible"
+    state.staleTimer =
+      null;
+  }
+
+  if (
+    state.wsReconnectTimer
+  ) {
+    clearTimeout(
+      state.wsReconnectTimer
+    );
+
+    state.wsReconnectTimer =
+      null;
+  }
+
+  if (
+    state.wsPingTimer
+  ) {
+    clearInterval(
+      state.wsPingTimer
+    );
+
+    state.wsPingTimer =
+      null;
+  }
+
+  try {
+    if (
+      state.ws &&
+      state.ws.readyState ===
+        WebSocket.OPEN
+    ) {
+      state.ws.close();
+    }
+  } catch (_) {}
+
+  state.ws =
+    null;
+
+  state.wsReady =
+    false;
+
+  console.log(
+    `🛑 RADAR ARRÊTÉ : ${reason}`
+  );
+
+  if (!sendMessage) {
+    return;
+  }
+
+  try {
+    await bot.telegram.sendMessage(
+      CHAT_ID,
+      `🛑 RADAR V6 ARRÊTÉ
+
+🚨 Chute brutale confirmée.
+
+${reason}
+
+Le token n'est plus surveillé.
+
+Le radar s'arrête automatiquement afin d'éviter les alertes répétitives après le crash.`
+    );
+  } catch (error) {
+    console.error(
+      "❌ Telegram arrêt :",
+      error.message
+    );
+  }
+}
+
+// ============================================================
+// WEBSOCKET HELIUS
+// ============================================================
+
+function connectWebSocket() {
+  if (
+    state.stopped
+  ) {
+    return;
+  }
+
+  if (state.ws) {
+    try {
+      state.ws.close();
+    } catch (_) {}
+  }
+
+  const ws =
+    new WebSocket(
+      WS_URL
+    );
+
+  state.ws =
+    ws;
+
+  ws.on(
+    "open",
+    () => {
+      console.log(
+        "🔌 Helius WSS connecté"
+      );
+
+      state.wsReady =
+        true;
+
+      const baseRequest = {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "accountSubscribe",
+        params: [
+          state.baseVault,
+          {
+            commitment:
+              "processed",
+            encoding:
+              "base64",
+          },
+        ],
+      };
+
+      const quoteRequest = {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "accountSubscribe",
+        params: [
+          state.quoteVault,
+          {
+            commitment:
+              "processed",
+            encoding:
+              "base64",
+          },
+        ],
+      };
+
+      const logsRequest = {
+        jsonrpc: "2.0",
+        id: 3,
+        method: "logsSubscribe",
+        params: [
+          {
+            mentions: [
+              state.pool,
+            ],
+          },
+          {
+            commitment:
+              "processed",
+          },
+        ],
+      };
+
+      ws.send(
+        JSON.stringify(
+          baseRequest
+        )
+      );
+
+      ws.send(
+        JSON.stringify(
+          quoteRequest
+        )
+      );
+
+      ws.send(
+        JSON.stringify(
+          logsRequest
+        )
+      );
+
+      if (
+        state.wsPingTimer
+      ) {
+        clearInterval(
+          state.wsPingTimer
+        );
+      }
+
+      state.wsPingTimer =
+        setInterval(
+          () => {
+            if (
+              state.ws &&
+              state.ws.readyState ===
+                WebSocket.OPEN
+            ) {
+              try {
+                state.ws.ping();
+              } catch (_) {}
+            }
+          },
+          15000
+        );
+    }
+  );
+
+  ws.on(
+    "message",
+    raw => {
+      try {
+        const message =
+          JSON.parse(
+            raw.toString()
+          );
+
+        // Réponses des subscriptions
+        if (
+          message.id === 1 &&
+          typeof message.result ===
+            "number"
+        ) {
+          state.baseSub =
+            message.result;
+
+          return;
+        }
+
+        if (
+          message.id === 2 &&
+          typeof message.result ===
+            "number"
+        ) {
+          state.quoteSub =
+            message.result;
+
+          return;
+        }
+
+        if (
+          message.id === 3 &&
+          typeof message.result ===
+            "number"
+        ) {
+          state.logSub =
+            message.result;
+
+          return;
+        }
+
+        if (
+          message.method !==
+          "accountNotification"
+        ) {
+          return;
+        }
+
+        const subscription =
+          message?.params?.subscription;
+
+        const data =
+          message?.params?.result?.value?.data;
+
+        const buffer =
+          dataToBuffer(data);
+
+        if (!buffer) {
+          return;
+        }
+
+        const amount =
+          readSplTokenAccountAmount(
+            buffer
+          );
+
+        if (
+          amount == null
+        ) {
+          return;
+        }
+
+        if (
+          subscription ===
+          state.baseSub
+        ) {
+          queueVaultUpdate(
+            "base",
+            amount
+          );
+        }
+
+        else if (
+          subscription ===
+          state.quoteSub
+        ) {
+          queueVaultUpdate(
+            "quote",
+            amount
+          );
+        }
+
+      } catch (error) {
+        console.error(
+          "⚠️ Message WSS :",
+          error.message
+        );
+      }
+    }
+  );
+
+  ws.on(
+    "error",
+    error => {
+      console.error(
+        "❌ Helius WSS :",
+        error.message
       );
     }
+  );
 
-    await subscribeBaseVault();
-    await subscribeQuoteVault();
-    await subscribeLogs();
+  ws.on(
+    "close",
+    () => {
+      state.wsReady =
+        false;
 
-    onChainActive = true;
+      if (
+        state.wsPingTimer
+      ) {
+        clearInterval(
+          state.wsPingTimer
+        );
 
-    await sendTelegram(
-`🛰️ RADAR SORTIE V5 ACTIVÉ
+        state.wsPingTimer =
+          null;
+      }
 
-Token :
-${watchedMint}
+      if (
+        state.stopped
+      ) {
+        return;
+      }
 
-Pool :
-${poolAddress}
+      console.log(
+        "🔌 WSS fermé, reconnexion dans 2 secondes..."
+      );
 
-Je surveille maintenant :
+      clearTimeout(
+        state.wsReconnectTimer
+      );
 
-• micro-SELL 1s / 3s / 5s / 10s
-• accélération des SELL
-• SELL répétés
-• pression vendeuse extrême
-• vraies variations des vaults
-• retraits de liquidité
-• réserve WSOL
-• liquidité
-• prix
-• sommet récent
-• confluence pré-crash
+      state.wsReconnectTimer =
+        setTimeout(
+          connectWebSocket,
+          2000
+        );
+    }
+  );
+}
 
-🟢 On-chain : ACTIVE
+// ============================================================
+// WATCHDOG WSS
+// ============================================================
 
-⚠️ V5 cherche des signaux précoces, mais aucune alerte ne peut garantir une sortie avant un crash.`);
+function staleWatchdog() {
+  if (
+    state.stopped
+  ) {
+    return;
+  }
 
-  } catch (err) {
+  if (
+    state.lastOnchainAt > 0 &&
+    now() -
+      state.lastOnchainAt >
+      30000
+  ) {
+    console.log(
+      "⚠️ Flux on-chain silencieux > 30s"
+    );
+
+    readVaults()
+      .catch(
+        error =>
+          console.error(
+            "⚠️ Relecture vaults :",
+            error.message
+          )
+      );
+  }
+}
+
+// ============================================================
+// TICK PRINCIPAL
+// ============================================================
+
+async function marketTick() {
+  if (
+    state.stopped
+  ) {
+    return;
+  }
+
+  try {
+    await fetchDex();
+
+    const risk =
+      calculateRisk();
+
+    console.log(
+      `📊 ${risk.level} ${risk.score}/100 | ` +
+      `Prix $${state.price.toFixed(8)} | ` +
+      `Liq $${Math.round(state.liquidityUsd)} | ` +
+      `Réserve ${fmtSol(state.quoteSol)} SOL | ` +
+      `R10 ${risk.reserve10.toFixed(2)}% | ` +
+      `High ${risk.priceBelowHigh.toFixed(2)}%`
+    );
+
+    // ========================================================
+    // CRASH AVANT TOUTE ALERTE
+    // ========================================================
+
+    if (
+      risk.crash
+    ) {
+      await stopRadar(
+        `Prix sous sommet : ${risk.priceBelowHigh.toFixed(1)}%
+Liquidité 10s : ${fmtPct(risk.liquidity10)}
+Réserve 10s : ${fmtPct(risk.reserve10)}`,
+        true
+      );
+
+      return;
+    }
+
+    await sendAlert(
+      risk
+    );
+
+  } catch (error) {
+    state.dexErrors++;
+
     console.error(
-      "❌ startWatch:",
-      err.message
+      "⚠️ Tick :",
+      error.message
     );
 
-    onChainActive = false;
+    // Le radar on-chain continue même si DexScreener tombe.
+    if (
+      state.dexErrors >= 5
+    ) {
+      console.log(
+        "⚠️ DexScreener indisponible. Surveillance on-chain maintenue."
+      );
 
-    await sendTelegram(
-`❌ RADAR V5
-
-Impossible d'activer la surveillance.
-
-Erreur :
-${err.message}`
-    );
+      state.dexErrors =
+        0;
+    }
   }
 }
 
-// ------------------------------------------------------------
-// STOP WATCH
-// ------------------------------------------------------------
+// ============================================================
+// DÉMARRAGE RADAR
+// ============================================================
 
-async function stopWatch() {
-  await resetSubscriptions();
+async function startRadar(
+  mint
+) {
+  if (
+    state.running
+  ) {
+    await stopRadar(
+      "Nouveau token demandé",
+      false
+    );
+  }
 
-  watchedMint = null;
-  poolAddress = null;
+  // Reset complet
+  state.mint =
+    mint;
 
-  baseVault = null;
-  quoteVault = null;
+  state.pool =
+    null;
 
-  currentBase = null;
-  currentQuote = null;
+  state.baseVault =
+    null;
 
-  onChainActive = false;
+  state.quoteVault =
+    null;
 
-  events.length = 0;
-  liquiditySamples = [];
-  reserveSamples = [];
+  state.baseSub =
+    null;
 
-  await sendTelegram(
-    "🔴 RADAR V5 arrêté."
+  state.quoteSub =
+    null;
+
+  state.logSub =
+    null;
+
+  state.baseRaw =
+    null;
+
+  state.quoteRaw =
+    null;
+
+  state.quoteSol =
+    0;
+
+  state.virtualQuoteRaw =
+    0n;
+
+  state.price =
+    0;
+
+  state.liquidityUsd =
+    0;
+
+  state.priceHistory =
+    [];
+
+  state.liquidityHistory =
+    [];
+
+  state.reserveHistory =
+    [];
+
+  state.events =
+    [];
+
+  state.localHigh =
+    0;
+
+  state.lastOnchainAt =
+    0;
+
+  state.lastDexAt =
+    0;
+
+  state.dexErrors =
+    0;
+
+  state.lastAlertAt =
+    0;
+
+  state.lastAlertKey =
+    null;
+
+  state.alertCount =
+    0;
+
+  state.pendingBase =
+    null;
+
+  state.pendingQuote =
+    null;
+
+  state.stopped =
+    false;
+
+  state.stopReason =
+    null;
+
+  state.running =
+    true;
+
+  console.log(
+    `\n🚀 RADAR V6 : ${mint}`
   );
-}
 
-// ------------------------------------------------------------
-// STATUS
-// ------------------------------------------------------------
+  // Découverte
+  await discoverPool();
 
-async function sendStatus() {
-  if (!watchedMint) {
-    await sendTelegram(
-      "ℹ️ Aucun token surveillé."
+  // Lecture initiale
+  await readVaults();
+
+  // Connexion temps réel
+  connectWebSocket();
+
+  // Premier tick
+  await marketTick();
+
+  // Surveillance Dex
+  state.pollTimer =
+    setInterval(
+      marketTick,
+      POLL_MS
     );
 
-    return;
-  }
-
-  await updateMarketData();
-
-  addLiquiditySample();
-  addReserveSample();
-
-  const analysis =
-    calculateRisk();
-
-  const level =
-    getRiskLevel(
-      analysis.score
+  // Surveillance WSS
+  state.staleTimer =
+    setInterval(
+      staleWatchdog,
+      10000
     );
 
-  const m =
-    analysis.metrics;
-
-  const status =
-`🛰️ RADAR V5
+  try {
+    await bot.telegram.sendMessage(
+      CHAT_ID,
+      `🛰️ RADAR V6 ACTIVÉ
 
 Token :
-${watchedMint}
+${mint}
 
 Pool :
-${poolAddress || "N/A"}
+${state.pool}
 
-💰 Prix :
-$${safeNumber(lastPrice).toFixed(8)}
+Réserve initiale :
+${fmtSol(state.quoteSol)} SOL
 
-💧 Liquidité :
-$${safeNumber(lastLiquidity).toFixed(2)}
+Le radar surveille :
 
-📈 Sommet :
-$${safeNumber(localHighPrice).toFixed(8)}
+• ventes absorbées
+• ventes toxiques
+• prix sous sommet
+• réserve WSOL
+• retraits structurels
+• liquidité
+• confluence de signaux
 
-📉 Sous sommet :
-${formatPct(m.drawdown)}%
-
-💧 Réserve WSOL :
-${currentQuote !== null
-  ? formatSol(Number(currentQuote))
-  : "N/A"} SOL
-
-🔴 SELL 1s :
-${formatSol(m.sell1)} SOL
-
-🔴 SELL 3s :
-${formatSol(m.sell3)} SOL
-
-🔴 SELL 5s :
-${formatSol(m.sell5)} SOL
-
-🔴 SELL 10s :
-${formatSol(m.sell10)} SOL
-
-🔴 SELL 30s :
-${formatSol(m.sell30)} SOL
-
-📊 SELL ratio 10s :
-${formatPct(m.ratio10)}%
-
-🔢 SELL / 10s :
-${m.sellCount10}
-
-⚡ Accélération :
-${safeNumber(m.acceleration).toFixed(2)}x
-
-💧 Réserve 5s :
-${formatPct(m.reserve5)}%
-
-💧 Réserve 10s :
-${formatPct(m.reserve10)}%
-
-💧 Liquidité 5s :
-${formatPct(m.liquidity5)}%
-
-💧 Liquidité 15s :
-${formatPct(m.liquidity15)}%
-
-🎯 RISQUE :
-${analysis.score}/100
-
-NIVEAU :
-${level}
-
-📡 On-chain :
-${onChainActive
-  ? "ACTIVE"
-  : "INACTIVE"}
-
-🔎 Raisons :
-${analysis.reasons.length
-  ? analysis.reasons.join(" | ")
-  : "aucune"}`;
-
-  await sendTelegram(
-    status
-  );
+🛑 Arrêt automatique après crash confirmé.`
+    );
+  } catch (error) {
+    console.error(
+      "Telegram démarrage :",
+      error.message
+    );
+  }
 }
 
-// ------------------------------------------------------------
-// COMMANDES TELEGRAM
-// ------------------------------------------------------------
+// ============================================================
+// VALIDATION TOKEN
+// ============================================================
 
-bot.command("watch", async ctx => {
-  const text =
-    ctx.message.text
-      .replace("/watch", "")
-      .trim();
-
-  if (!text) {
-    await ctx.reply(
-      "Utilisation : /watch MINT"
+function isValidMint(
+  mint
+) {
+  try {
+    new PublicKey(
+      mint
     );
 
-    return;
+    return (
+      mint.length >= 32 &&
+      mint.length <= 44
+    );
+
+  } catch (_) {
+    return false;
   }
+}
 
-  await ctx.reply(
-    "🔎 V5 recherche le pool..."
-  );
+// ============================================================
+// TELEGRAM
+// ============================================================
 
-  await startWatch(text);
-});
-
-// ------------------------------------------------------------
-
-bot.command("unwatch", async ctx => {
-  await stopWatch();
-});
-
-// ------------------------------------------------------------
-
-bot.command("status", async ctx => {
-  await sendStatus();
-});
-
-// ------------------------------------------------------------
-
-bot.command("help", async ctx => {
-  await ctx.reply(
-`🛰️ RADAR SORTIE V5
+bot.start(
+  ctx => {
+    ctx.reply(
+      `🛰️ RADAR V6
 
 Commandes :
 
-/watch MINT
-→ surveiller un token
+/watch ADRESSE_TOKEN
+/status
+/unwatch
+/help`
+    );
+  }
+);
+
+bot.help(
+  ctx => {
+    ctx.reply(
+      `🛰️ RADAR V6
+
+/watch ADRESSE_TOKEN
+→ démarre la surveillance
 
 /status
-→ état actuel du radar
+→ affiche l'état actuel
 
 /unwatch
-→ arrêter
+→ arrête le radar
 
-V5 surveille les micro-signaux pré-crash, les SELL rapides, les variations réelles des réserves, les retraits de liquidité et la perte du sommet.`
-  );
-});
-
-// ------------------------------------------------------------
-// MARKET LOOP
-// ------------------------------------------------------------
-
-setInterval(async () => {
-  if (!watchedMint) {
-    return;
-  }
-
-  try {
-    await updateMarketData();
-
-    addLiquiditySample();
-
-    addReserveSample();
-
-    await evaluateRisk();
-
-  } catch (err) {
-    console.error(
-      "❌ Market loop:",
-      err.message
+La V6 cherche surtout les dégradations structurelles et ne considère plus un simple ratio SELL élevé comme un crash.`
     );
   }
+);
 
-}, 3000);
+// ============================================================
+// /WATCH
+// ============================================================
 
-// ------------------------------------------------------------
-// RESERVE LOOP
-// ------------------------------------------------------------
+bot.command(
+  "watch",
+  async ctx => {
+    const parts =
+      ctx.message.text
+        .trim()
+        .split(/\s+/);
 
-setInterval(async () => {
-  if (!watchedMint) {
-    return;
-  }
+    const mint =
+      parts[1];
 
-  try {
     if (
-      quoteVault &&
-      currentQuote !== null
+      !mint ||
+      !isValidMint(mint)
     ) {
-      addReserveSample();
+      await ctx.reply(
+        "❌ Adresse du token invalide."
+      );
+
+      return;
     }
 
-  } catch (err) {
-    console.error(
-      "❌ Reserve loop:",
-      err.message
+    try {
+      await ctx.reply(
+        "🔎 Recherche du pool PumpSwap..."
+      );
+
+      await startRadar(
+        mint
+      );
+
+    } catch (error) {
+      console.error(
+        "❌ WATCH :",
+        error
+      );
+
+      await ctx.reply(
+        `❌ Impossible de démarrer le radar.
+
+${error.message}`
+      );
+    }
+  }
+);
+
+// ============================================================
+// /UNWATCH
+// ============================================================
+
+bot.command(
+  "unwatch",
+  async ctx => {
+    if (
+      !state.running
+    ) {
+      await ctx.reply(
+        "ℹ️ Aucun token n'est actuellement surveillé."
+      );
+
+      return;
+    }
+
+    await stopRadar(
+      "Arrêt manuel",
+      false
+    );
+
+    await ctx.reply(
+      "🛑 Radar arrêté."
     );
   }
+);
 
-}, 1000);
+// ============================================================
+// /STATUS
+// ============================================================
 
-// ------------------------------------------------------------
-// WATCHDOG
-// ------------------------------------------------------------
+bot.command(
+  "status",
+  async ctx => {
+    if (
+      !state.mint
+    ) {
+      await ctx.reply(
+        "ℹ️ Aucun token surveillé."
+      );
 
-setInterval(async () => {
-  if (!watchedMint) {
-    return;
-  }
+      return;
+    }
 
-  const age =
-    Date.now() - lastDexUpdate;
+    if (
+      state.stopped
+    ) {
+      await ctx.reply(
+        `🛑 RADAR ARRÊTÉ
 
-  if (
-    age > 30000
-  ) {
-    console.log(
-      "⚠️ DexScreener non actualisé depuis",
-      Math.round(age / 1000),
-      "s"
+Token :
+${state.mint}
+
+Raison :
+${state.stopReason || "arrêt automatique"}`
+      );
+
+      return;
+    }
+
+    const risk =
+      calculateRisk();
+
+    await ctx.reply(
+      `🛰️ RADAR V6
+
+Token :
+${state.mint}
+
+État :
+${risk.level}
+
+Score :
+${risk.score}/100
+
+Prix :
+$${state.price.toFixed(8)}
+
+Liquidité :
+$${fmtUsd(state.liquidityUsd)}
+
+Réserve WSOL :
+${fmtSol(state.quoteSol)} SOL
+
+Réserve 10s :
+${fmtPct(risk.reserve10)}
+
+Prix sous sommet :
+${risk.priceBelowHigh.toFixed(1)}%
+
+SELL 10s :
+${fmtSol(risk.sell10)} SOL
+
+Ratio SELL :
+${risk.ratio10.toFixed(1)}%
+
+Signaux :
+${
+  risk.signals.length
+    ? risk.signals.join(" | ")
+    : "aucun"
+}`
     );
   }
+);
 
-  if (
-    !onChainActive
-  ) {
-    console.log(
-      "⚠️ On-chain inactif"
-    );
-  }
-
-}, 15000);
-
-// ------------------------------------------------------------
-// START BOT
-// ------------------------------------------------------------
+// ============================================================
+// DÉMARRAGE BOT
+// ============================================================
 
 bot.launch()
-  .then(() => {
-    console.log(
-      "🛰️ RADAR SORTIE V5 démarré"
-    );
+  .then(
+    () =>
+      console.log(
+        "🤖 Telegram RADAR V6 démarré"
+      )
+  )
+  .catch(
+    error => {
+      console.error(
+        "❌ Bot Telegram :",
+        error
+      );
 
-    console.log(
-      "📡 Helius RPC/WSS actif"
-    );
-  })
-  .catch(err => {
-    console.error(
-      "❌ Bot launch:",
-      err.message
-    );
+      process.exit(1);
+    }
+  );
 
-    process.exit(1);
-  });
-
-// ------------------------------------------------------------
-// STOP PROPRE
-// ------------------------------------------------------------
+// ============================================================
+// ARRÊT PROPRE
+// ============================================================
 
 process.once(
   "SIGINT",
