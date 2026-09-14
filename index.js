@@ -43,8 +43,8 @@ const bot = new Telegraf(BOT_TOKEN);
 // STRATEGIE
 // ------------------------------------------------------------
 
-const CAPITAL_PER_CYCLE_USD = 5.00;
-const TARGET_NET_PERCENT = 2.5;
+const CAPITAL_PER_CYCLE_USD = 1.00;
+const TARGET_NET_PERCENT = 50;
 
 // On considère une chute brutale si le prix perd au moins 20 %
 // sur une fenêtre très courte.
