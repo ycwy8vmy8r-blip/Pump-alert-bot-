@@ -1,10 +1,9 @@
-const { Connection, PublicKey } = require("@solana/web3.js");
 const { Telegraf } = require("telegraf");
 const WebSocket = require("ws");
+const https = require("https");
 
 // ============================================================
-// RADAR V6
-// Détection précoce de dégradation structurelle PumpSwap
+// CONFIG
 // ============================================================
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -12,7 +11,7 @@ const CHAT_ID = process.env.CHAT_ID;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 
 if (!BOT_TOKEN || !CHAT_ID || !HELIUS_API_KEY) {
-  console.error("❌ Variables manquantes : BOT_TOKEN, CHAT_ID ou HELIUS_API_KEY");
+  console.error("❌ Variables manquantes : BOT_TOKEN / CHAT_ID / HELIUS_API_KEY");
   process.exit(1);
 }
 
@@ -24,308 +23,160 @@ const RPC_URL =
 const WS_URL =
   `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
-const connection = new Connection(RPC_URL, {
-  commitment: "processed",
-});
-
+// PumpSwap
 const PUMPSWAP_PROGRAM =
   "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
 const SOL_MINT =
   "So11111111111111111111111111111111111111112";
 
-// ============================================================
-// LAYOUT PUMPSWAP
-// ============================================================
-
+// Pool account offsets
 const BASE_VAULT_OFFSET = 139;
 const QUOTE_VAULT_OFFSET = 171;
 const VIRTUAL_QUOTE_OFFSET = 245;
 
+// SPL token account amount offset
+const SPL_AMOUNT_OFFSET = 64;
+
+// Timing
+const DEX_INTERVAL_MS = 2000;
+const BATCH_MS = 100;
+
+const HISTORY_MS = 120000;
+
+const EARLY_WINDOW_MS = 30000;
+const PRECRASH_WINDOW_MS = 15000;
+
+const ALERT_COOLDOWN_PRE = 45000;
+const ALERT_COOLDOWN_EXIT = 30000;
+const ALERT_COOLDOWN_CRITICAL = 15000;
+
 // ============================================================
-// RÉGLAGES
+// STATE
 // ============================================================
 
-const POLL_MS = 3000;
-const BATCH_MS = 120;
-const EVENT_HISTORY_MS = 30000;
+let watching = false;
+let stopped = false;
 
-// ============================================================
-// ÉTAT
-// ============================================================
+let mint = null;
 
-const state = {
-  mint: null,
-  pool: null,
+let poolAddress = null;
+let baseVault = null;
+let quoteVault = null;
 
-  baseVault: null,
-  quoteVault: null,
+let ws = null;
 
-  ws: null,
-  wsReady: false,
+let dexTimer = null;
+let reconnectTimer = null;
 
-  baseSub: null,
-  quoteSub: null,
-  logSub: null,
+let baseSub = null;
+let quoteSub = null;
+let poolSub = null;
 
-  wsReconnectTimer: null,
-  wsPingTimer: null,
+let rpcId = 1;
 
-  pendingBase: null,
-  pendingQuote: null,
-  pendingTimer: null,
+let current = {
+  price: null,
+  liquidity: null,
 
   baseRaw: null,
   quoteRaw: null,
-
-  quoteSol: 0,
-
   virtualQuoteRaw: 0n,
+  effectiveQuoteRaw: null,
 
-  price: 0,
-  liquidityUsd: 0,
-
-  priceHistory: [],
-  liquidityHistory: [],
-  reserveHistory: [],
-  events: [],
-
-  localHigh: 0,
-
-  lastOnchainAt: 0,
-  lastDexAt: 0,
-
-  dexErrors: 0,
-
-  pollTimer: null,
-  staleTimer: null,
-
-  running: false,
-  stopped: false,
-
-  stopReason: null,
-
-  lastAlertAt: 0,
-  lastAlertKey: null,
-
-  alertCount: 0,
+  updatedAt: 0
 };
 
+let previousVault = {
+  base: null,
+  quote: null,
+  effectiveQuote: null,
+  timestamp: 0
+};
+
+let histories = {
+  reserve: [],
+  price: [],
+  liquidity: [],
+
+  sell: [],
+  buy: [],
+
+  withdrawals: [],
+  additions: []
+};
+
+let pendingVaultChanges = {
+  base: null,
+  quote: null
+};
+
+let lastInstruction = {
+  type: null,
+  timestamp: 0,
+  slot: null,
+  signature: null
+};
+
+let highPrice = null;
+
+let riskState = "NORMAL";
+
+let lastAlert = {
+  type: null,
+  timestamp: 0
+};
+
+let lastCriticalReason = null;
+
 // ============================================================
-// OUTILS
+// HELPERS
 // ============================================================
 
 function now() {
   return Date.now();
 }
 
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(max, v));
 }
 
-function pctChange(oldValue, newValue) {
-  if (
-    oldValue == null ||
-    newValue == null ||
-    oldValue === 0
-  ) {
-    return 0;
-  }
-
-  return ((newValue - oldValue) / oldValue) * 100;
+function lamportsToSol(v) {
+  if (v === null || v === undefined) return 0;
+  return Number(v) / 1e9;
 }
 
-function fmtPct(value) {
-  if (!Number.isFinite(value)) {
-    return "0.0%";
-  }
-
-  return `${value >= 0 ? "+" : ""}${value.toFixed(1)}%`;
+function safeNumber(v) {
+  if (typeof v === "number") return v;
+  if (typeof v === "bigint") return Number(v);
+  return Number(v || 0);
 }
 
-function fmtSol(value) {
-  if (!Number.isFinite(value)) {
-    return "0.0000";
-  }
+function trimHistory(arr) {
+  const cutoff = now() - HISTORY_MS;
 
-  return value.toFixed(4);
+  while (arr.length && arr[0].timestamp < cutoff) {
+    arr.shift();
+  }
 }
 
-function fmtUsd(value) {
-  if (!Number.isFinite(value)) {
-    return "0.00";
-  }
-
-  return value.toLocaleString("en-US", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
+function addHistory(arr, value) {
+  arr.push({
+    timestamp: now(),
+    value
   });
+
+  trimHistory(arr);
 }
 
-// ============================================================
-// LECTURE U64
-// ============================================================
-
-function readU64LE(buffer, offset) {
-  if (!buffer || offset + 8 > buffer.length) {
-    return 0n;
-  }
-
-  return buffer.readBigUInt64LE(offset);
-}
-
-// ============================================================
-// COMPTE SPL TOKEN
-//
-// Dans un compte Token Account SPL :
-// amount = offset 64
-//
-// C'était une erreur importante de V5.
-// ============================================================
-
-function readSplTokenAccountAmount(buffer) {
-  if (!buffer || buffer.length < 72) {
-    return null;
-  }
-
-  return readU64LE(buffer, 64);
-}
-
-// ============================================================
-// PUBKEY
-// ============================================================
-
-function readPubkey(buffer, offset) {
-  if (!buffer || offset + 32 > buffer.length) {
-    throw new Error("Pubkey impossible à lire");
-  }
-
-  return new PublicKey(
-    buffer.subarray(offset, offset + 32)
-  ).toBase58();
-}
-
-// ============================================================
-// I128
-// ============================================================
-
-function readI128LE(buffer, offset) {
-  if (!buffer || offset + 16 > buffer.length) {
-    return 0n;
-  }
-
-  let value = 0n;
-
-  for (let i = 0; i < 16; i++) {
-    value |=
-      BigInt(buffer[offset + i]) <<
-      (8n * BigInt(i));
-  }
-
-  const signBit = 1n << 127n;
-
-  if (value & signBit) {
-    value -= 1n << 128n;
-  }
-
-  return value;
-}
-
-// ============================================================
-// LAMPORTS -> SOL
-// ============================================================
-
-function lamportsToSol(raw) {
-  if (raw == null) {
-    return 0;
-  }
-
-  const whole = raw / 1000000000n;
-  const remainder = raw % 1000000000n;
-
-  return (
-    Number(whole) +
-    Number(remainder) / 1000000000
-  );
-}
-
-// ============================================================
-// DATA COMPTE
-// ============================================================
-
-function dataToBuffer(data) {
-  if (!data) {
-    return null;
-  }
-
-  if (Buffer.isBuffer(data)) {
-    return data;
-  }
-
-  if (
-    Array.isArray(data) &&
-    typeof data[0] === "string"
-  ) {
-    try {
-      return Buffer.from(data[0], "base64");
-    } catch (_) {
-      return null;
-    }
-  }
-
-  if (typeof data === "string") {
-    try {
-      return Buffer.from(data, "base64");
-    } catch (_) {
-      return null;
-    }
-  }
-
-  return null;
-}
-
-// ============================================================
-// HISTORIQUES
-// ============================================================
-
-function trimHistory() {
-  const priceCutoff =
-    now() - 10 * 60 * 1000;
-
-  const eventCutoff =
-    now() - EVENT_HISTORY_MS;
-
-  state.priceHistory =
-    state.priceHistory.filter(
-      x => x.t >= priceCutoff
-    );
-
-  state.liquidityHistory =
-    state.liquidityHistory.filter(
-      x => x.t >= priceCutoff
-    );
-
-  state.reserveHistory =
-    state.reserveHistory.filter(
-      x => x.t >= priceCutoff
-    );
-
-  state.events =
-    state.events.filter(
-      x => x.t >= eventCutoff
-    );
-}
-
-function valueAtOrBefore(history, seconds) {
-  const target =
-    now() - seconds * 1000;
+function valueAtOrBefore(arr, timestamp) {
+  if (!arr.length) return null;
 
   let result = null;
 
-  for (const item of history) {
-    if (item.t <= target) {
-      result = item;
-    } else {
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (arr[i].timestamp <= timestamp) {
+      result = arr[i].value;
       break;
     }
   }
@@ -333,853 +184,1384 @@ function valueAtOrBefore(history, seconds) {
   return result;
 }
 
-function changeWithin(history, seconds) {
-  if (!history.length) {
-    return 0;
+function percentChange(arr, seconds) {
+  const currentValue = arr.length
+    ? arr[arr.length - 1].value
+    : null;
+
+  if (currentValue === null || currentValue === undefined) {
+    return null;
   }
 
-  const old =
-    valueAtOrBefore(history, seconds);
-
-  if (!old) {
-    return 0;
-  }
-
-  const current =
-    history[history.length - 1];
-
-  return pctChange(
-    old.v,
-    current.v
+  const oldValue = valueAtOrBefore(
+    arr,
+    now() - seconds * 1000
   );
+
+  if (
+    oldValue === null ||
+    oldValue === undefined ||
+    oldValue === 0
+  ) {
+    return null;
+  }
+
+  return ((currentValue - oldValue) / oldValue) * 100;
+}
+
+function sumWindow(arr, seconds) {
+  const cutoff = now() - seconds * 1000;
+
+  let total = 0;
+
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (arr[i].timestamp < cutoff) break;
+    total += arr[i].value;
+  }
+
+  return total;
+}
+
+function countWindow(arr, seconds) {
+  const cutoff = now() - seconds * 1000;
+
+  let count = 0;
+
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (arr[i].timestamp < cutoff) break;
+    count++;
+  }
+
+  return count;
+}
+
+function formatPct(v) {
+  if (v === null || v === undefined) return "N/A";
+
+  const sign = v > 0 ? "+" : "";
+
+  return `${sign}${v.toFixed(1)}%`;
+}
+
+function formatUsd(v) {
+  if (v === null || v === undefined) return "N/A";
+
+  return `$${Number(v).toLocaleString("en-US", {
+    minimumFractionDigits: 4,
+    maximumFractionDigits: 4
+  })}`;
+}
+
+function formatLiquidity(v) {
+  if (v === null || v === undefined) return "N/A";
+
+  return `$${Number(v).toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  })}`;
 }
 
 // ============================================================
-// PRIX SOUS SOMMET
+// BIGINT PARSING
 // ============================================================
 
-function getPriceDropFromHigh() {
-  if (
-    !state.price ||
-    !state.localHigh
-  ) {
-    return 0;
+function readU64LE(buffer, offset) {
+  if (!buffer || buffer.length < offset + 8) return null;
+
+  return buffer.readBigUInt64LE(offset);
+}
+
+function readI128LE(buffer, offset) {
+  if (!buffer || buffer.length < offset + 16) return 0n;
+
+  const lo = buffer.readBigUInt64LE(offset);
+  const hi = buffer.readBigInt64LE(offset + 8);
+
+  return (hi << 64n) + BigInt(lo);
+}
+
+function readSplTokenAccountAmount(data) {
+  if (!data) return null;
+
+  let buffer = null;
+
+  if (Buffer.isBuffer(data)) {
+    buffer = data;
+  } else if (typeof data === "string") {
+    try {
+      buffer = Buffer.from(data, "base64");
+    } catch {
+      return null;
+    }
+  } else if (Array.isArray(data) && typeof data[0] === "string") {
+    try {
+      buffer = Buffer.from(data[0], "base64");
+    } catch {
+      return null;
+    }
   }
 
-  if (state.price >= state.localHigh) {
-    return 0;
+  if (!buffer || buffer.length < SPL_AMOUNT_OFFSET + 8) {
+    return null;
   }
 
-  return (
-    1 -
-    state.price / state.localHigh
-  ) * 100;
+  return readU64LE(buffer, SPL_AMOUNT_OFFSET);
+}
+
+// ============================================================
+// POOL PARSING
+// ============================================================
+
+function parsePoolData(data) {
+  if (!data) return null;
+
+  let buffer = null;
+
+  if (Buffer.isBuffer(data)) {
+    buffer = data;
+  } else if (typeof data === "string") {
+    try {
+      buffer = Buffer.from(data, "base64");
+    } catch {
+      return null;
+    }
+  } else if (Array.isArray(data) && typeof data[0] === "string") {
+    try {
+      buffer = Buffer.from(data[0], "base64");
+    } catch {
+      return null;
+    }
+  }
+
+  if (!buffer) return null;
+
+  if (buffer.length < 253) return null;
+
+  const base = readU64LE(buffer, BASE_VAULT_OFFSET);
+  const quote = readU64LE(buffer, QUOTE_VAULT_OFFSET);
+
+  let virtualQuote = 0n;
+
+  if (buffer.length >= VIRTUAL_QUOTE_OFFSET + 16) {
+    virtualQuote = readI128LE(
+      buffer,
+      VIRTUAL_QUOTE_OFFSET
+    );
+  }
+
+  return {
+    base,
+    quote,
+    virtualQuote
+  };
+}
+
+// ============================================================
+// RPC
+// ============================================================
+
+function rpc(method, params = []) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      jsonrpc: "2.0",
+      id: rpcId++,
+      method,
+      params
+    });
+
+    const req = https.request(
+      RPC_URL,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body)
+        }
+      },
+      res => {
+        let data = "";
+
+        res.on("data", chunk => {
+          data += chunk;
+        });
+
+        res.on("end", () => {
+          try {
+            const parsed = JSON.parse(data);
+
+            if (parsed.error) {
+              reject(
+                new Error(
+                  parsed.error.message ||
+                  JSON.stringify(parsed.error)
+                )
+              );
+              return;
+            }
+
+            resolve(parsed.result);
+          } catch (e) {
+            reject(e);
+          }
+        });
+      }
+    );
+
+    req.on("error", reject);
+
+    req.write(body);
+    req.end();
+  });
 }
 
 // ============================================================
 // DEXSCREENER
 // ============================================================
 
-function getPumpPair(data, mint) {
-  const pairs =
-    data?.pairs || [];
+async function fetchDex() {
+  if (!mint) return null;
 
-  const candidates =
-    pairs.filter(pair => {
-      const base =
-        pair?.baseToken?.address;
+  try {
+    const url =
+      `https://api.dexscreener.com/token-pairs/v1/solana/${mint}`;
 
-      const quote =
-        pair?.quoteToken?.address;
+    const response = await fetch(url);
 
+    if (!response.ok) return null;
+
+    const pairs = await response.json();
+
+    if (!Array.isArray(pairs)) return null;
+
+    const pumpPairs = pairs.filter(p => {
       return (
-        (base === mint &&
-          quote === SOL_MINT) ||
-        (quote === mint &&
-          base === SOL_MINT)
+        String(p.dexId || "").toLowerCase() === "pumpswap"
       );
     });
 
-  candidates.sort((a, b) => {
-    const la =
-      Number(a?.liquidity?.usd || 0);
+    const selected =
+      pumpPairs[0] ||
+      pairs[0];
 
-    const lb =
-      Number(b?.liquidity?.usd || 0);
+    if (!selected) return null;
 
-    return lb - la;
-  });
-
-  return candidates[0] || null;
-}
-
-async function fetchDex() {
-  const url =
-    `https://api.dexscreener.com/latest/dex/tokens/${state.mint}`;
-
-  const response =
-    await fetch(url, {
-      headers: {
-        accept: "application/json",
-      },
-    });
-
-  if (!response.ok) {
-    throw new Error(
-      `DexScreener HTTP ${response.status}`
-    );
+    return {
+      price: Number(selected.priceUsd || 0),
+      liquidity: Number(
+        selected.liquidity?.usd || 0
+      ),
+      pairAddress:
+        selected.pairAddress || null
+    };
+  } catch (e) {
+    console.log("DexScreener:", e.message);
+    return null;
   }
-
-  const data =
-    await response.json();
-
-  const pair =
-    getPumpPair(
-      data,
-      state.mint
-    );
-
-  if (!pair) {
-    throw new Error(
-      "Paire PumpSwap introuvable"
-    );
-  }
-
-  if (pair.pairAddress) {
-    state.pool =
-      pair.pairAddress;
-  }
-
-  state.price =
-    Number(pair.priceUsd || 0);
-
-  state.liquidityUsd =
-    Number(
-      pair.liquidity?.usd || 0
-    );
-
-  state.lastDexAt =
-    now();
-
-  state.dexErrors = 0;
-
-  if (state.price > 0) {
-    if (
-      state.localHigh === 0 ||
-      state.price > state.localHigh
-    ) {
-      state.localHigh =
-        state.price;
-    }
-
-    state.priceHistory.push({
-      t: now(),
-      v: state.price,
-    });
-  }
-
-  if (state.liquidityUsd > 0) {
-    state.liquidityHistory.push({
-      t: now(),
-      v: state.liquidityUsd,
-    });
-  }
-
-  trimHistory();
-
-  return pair;
 }
 
 // ============================================================
-// DÉCOUVERTE DU POOL
+// DISCOVER POOL
 // ============================================================
 
 async function discoverPool() {
-  console.log(
-    "🔎 Recherche du pool PumpSwap..."
+  const dex = await fetchDex();
+
+  if (!dex || !dex.pairAddress) {
+    throw new Error(
+      "Impossible de trouver le pool PumpSwap."
+    );
+  }
+
+  poolAddress = dex.pairAddress;
+
+  console.log("🏊 Pool trouvé :", poolAddress);
+
+  const account = await rpc(
+    "getAccountInfo",
+    [
+      poolAddress,
+      {
+        encoding: "base64",
+        commitment: "processed"
+      }
+    ]
   );
 
-  const pair =
-    await fetchDex();
-
-  if (!state.pool) {
+  if (!account || !account.value) {
     throw new Error(
-      "Adresse du pool introuvable"
+      "Impossible de lire le compte du pool."
     );
   }
 
-  console.log(
-    `🏊 Pool : ${state.pool}`
+  const parsed = parsePoolData(
+    account.value.data
   );
 
-  const info =
-    await connection.getAccountInfo(
-      new PublicKey(state.pool),
-      "processed"
-    );
-
-  if (!info?.data) {
+  if (!parsed) {
     throw new Error(
-      "Compte Pool illisible"
+      "Impossible de parser le pool PumpSwap."
     );
   }
 
-  const data =
-    Buffer.from(info.data);
+  current.baseRaw = parsed.base;
+  current.quoteRaw = parsed.quote;
+  current.virtualQuoteRaw = parsed.virtualQuote;
 
-  if (
-    data.length <
-    VIRTUAL_QUOTE_OFFSET + 16
-  ) {
+  current.effectiveQuoteRaw =
+    parsed.quote + parsed.virtualQuote;
+
+  const baseVaultAccount =
+    await rpc(
+      "getAccountInfo",
+      [
+        poolAddress,
+        {
+          encoding: "base64",
+          commitment: "processed"
+        }
+      ]
+    );
+
+  if (!baseVaultAccount) {
+    throw new Error("Erreur lecture pool.");
+  }
+
+  // Les vaults sont stockés dans le compte Pool
+  // à leurs offsets respectifs.
+  const poolData = parsePoolData(
+    baseVaultAccount.value.data
+  );
+
+  if (!poolData) {
+    throw new Error("Pool data invalide.");
+  }
+
+  // Pour obtenir les pubkeys des vaults,
+  // on lit directement le compte Pool.
+  const rawData =
+    Buffer.from(
+      poolDataBuffer(
+        baseVaultAccount.value.data
+      ),
+      "base64"
+    );
+
+  baseVault =
+    rawData
+      .subarray(139, 171)
+      .toString("base64");
+
+  // Cette partie est remplacée juste après
+  // par la lecture correcte des pubkeys.
+}
+
+// ============================================================
+// POOL BUFFER HELPER
+// ============================================================
+
+function poolDataBuffer(data) {
+  if (typeof data === "string") {
+    return data;
+  }
+
+  if (Array.isArray(data)) {
+    return data[0];
+  }
+
+  return null;
+}
+
+// ============================================================
+// CORRECT POOL DISCOVERY
+// ============================================================
+
+async function loadPool() {
+  const dex = await fetchDex();
+
+  if (!dex || !dex.pairAddress) {
     throw new Error(
-      `Pool trop court : ${data.length}`
+      "Pool PumpSwap introuvable."
     );
   }
 
-  state.baseVault =
-    readPubkey(
-      data,
+  poolAddress = dex.pairAddress;
+
+  console.log(
+    "🏊 PumpSwap pool :",
+    poolAddress
+  );
+
+  const account = await rpc(
+    "getAccountInfo",
+    [
+      poolAddress,
+      {
+        encoding: "base64",
+        commitment: "processed"
+      }
+    ]
+  );
+
+  if (!account?.value?.data) {
+    throw new Error(
+      "Impossible de lire le compte Pool."
+    );
+  }
+
+  const encoded =
+    Array.isArray(account.value.data)
+      ? account.value.data[0]
+      : account.value.data;
+
+  const buffer =
+    Buffer.from(encoded, "base64");
+
+  if (buffer.length < 245) {
+    throw new Error(
+      "Compte Pool trop court."
+    );
+  }
+
+  baseVault =
+    new (require("@solana/web3.js").PublicKey)(
+      buffer.subarray(43, 75)
+    ).toBase58();
+
+  quoteVault =
+    new (require("@solana/web3.js").PublicKey)(
+      buffer.subarray(75, 107)
+    ).toBase58();
+
+  const baseRaw =
+    readU64LE(
+      buffer,
       BASE_VAULT_OFFSET
     );
 
-  state.quoteVault =
-    readPubkey(
-      data,
+  const quoteRaw =
+    readU64LE(
+      buffer,
       QUOTE_VAULT_OFFSET
     );
 
-  state.virtualQuoteRaw =
-    readI128LE(
-      data,
-      VIRTUAL_QUOTE_OFFSET
-    );
-
-  console.log(
-    `🪙 Base vault : ${state.baseVault}`
-  );
-
-  console.log(
-    `💧 Quote vault : ${state.quoteVault}`
-  );
-
-  console.log(
-    `💠 Virtual quote : ${
-      fmtSol(
-        lamportsToSol(
-          state.virtualQuoteRaw > 0n
-            ? state.virtualQuoteRaw
-            : 0n
+  const virtualQuote =
+    buffer.length >= VIRTUAL_QUOTE_OFFSET + 16
+      ? readI128LE(
+          buffer,
+          VIRTUAL_QUOTE_OFFSET
         )
-      )
-    } SOL`
+      : 0n;
+
+  current.baseRaw = baseRaw;
+  current.quoteRaw = quoteRaw;
+  current.virtualQuoteRaw = virtualQuote;
+
+  current.effectiveQuoteRaw =
+    quoteRaw + virtualQuote;
+
+  console.log(
+    "🪙 Base vault :",
+    baseVault
   );
 
-  return pair;
+  console.log(
+    "💧 Quote vault :",
+    quoteVault
+  );
+
+  console.log(
+    "💰 Réserve effective :",
+    lamportsToSol(
+      current.effectiveQuoteRaw
+    ),
+    "SOL"
+  );
 }
 
 // ============================================================
-// LECTURE DES VAULTS
+// HISTORY INITIALIZATION
 // ============================================================
 
-async function readVaults() {
-  const keys = [
-    new PublicKey(
-      state.baseVault
-    ),
-    new PublicKey(
-      state.quoteVault
-    ),
-  ];
-
-  const infos =
-    await connection.getMultipleAccountsInfo(
-      keys,
-      "processed"
-    );
-
-  const baseBuffer =
-    dataToBuffer(
-      infos[0]?.data
-    );
-
-  const quoteBuffer =
-    dataToBuffer(
-      infos[1]?.data
-    );
-
-  if (
-    !baseBuffer ||
-    !quoteBuffer
-  ) {
-    throw new Error(
-      "Vaults illisibles"
-    );
-  }
-
-  const base =
-    readSplTokenAccountAmount(
-      baseBuffer
-    );
-
-  const quote =
-    readSplTokenAccountAmount(
-      quoteBuffer
-    );
-
-  if (
-    base == null ||
-    quote == null
-  ) {
-    throw new Error(
-      "Montant SPL illisible"
-    );
-  }
-
-  state.baseRaw =
-    base;
-
-  state.quoteRaw =
-    quote;
-
-  state.quoteSol =
-    lamportsToSol(
-      quote
-    );
-
-  state.reserveHistory.push({
-    t: now(),
-    v: state.quoteSol,
-  });
-
-  state.lastOnchainAt =
-    now();
-
-  trimHistory();
-
-  return {
-    base,
-    quote,
+function resetHistory() {
+  histories = {
+    reserve: [],
+    price: [],
+    liquidity: [],
+    sell: [],
+    buy: [],
+    withdrawals: [],
+    additions: []
   };
+
+  highPrice = null;
+
+  riskState = "NORMAL";
+
+  lastAlert = {
+    type: null,
+    timestamp: 0
+  };
+
+  lastCriticalReason = null;
 }
 
 // ============================================================
-// ÉVÉNEMENTS VAULTS
+// DEX UPDATE
 // ============================================================
 
-function addEvent(
-  baseDelta,
-  quoteDelta
-) {
-  const absoluteQuote =
-    quoteDelta < 0n
-      ? -quoteDelta
-      : quoteDelta;
+async function updateMarket() {
+  if (!watching || stopped) return;
 
-  const quoteSol =
-    lamportsToSol(
-      absoluteQuote
+  const dex = await fetchDex();
+
+  if (!dex) return;
+
+  if (dex.price > 0) {
+    current.price = dex.price;
+
+    if (
+      highPrice === null ||
+      dex.price > highPrice
+    ) {
+      highPrice = dex.price;
+    }
+
+    addHistory(
+      histories.price,
+      dex.price
     );
+  }
 
-  // Poussière ignorée.
-  if (quoteSol < 0.01) {
+  if (dex.liquidity > 0) {
+    current.liquidity =
+      dex.liquidity;
+
+    addHistory(
+      histories.liquidity,
+      dex.liquidity
+    );
+  }
+
+  if (
+    current.effectiveQuoteRaw !== null
+  ) {
+    addHistory(
+      histories.reserve,
+      lamportsToSol(
+        current.effectiveQuoteRaw
+      )
+    );
+  }
+
+  evaluateRisk("MARKET");
+}
+
+// ============================================================
+// VAULT READING
+// ============================================================
+
+async function readVaultAmount(address) {
+  const result = await rpc(
+    "getAccountInfo",
+    [
+      address,
+      {
+        encoding: "base64",
+        commitment: "processed"
+      }
+    ]
+  );
+
+  if (!result?.value?.data) {
+    return null;
+  }
+
+  return readSplTokenAccountAmount(
+    result.value.data
+  );
+}
+
+async function initializeVaults() {
+  const base = await readVaultAmount(
+    baseVault
+  );
+
+  const quote = await readVaultAmount(
+    quoteVault
+  );
+
+  if (base !== null) {
+    current.baseRaw = base;
+  }
+
+  if (quote !== null) {
+    current.quoteRaw = quote;
+  }
+
+  current.effectiveQuoteRaw =
+    current.quoteRaw +
+    current.virtualQuoteRaw;
+
+  previousVault = {
+    base: current.baseRaw,
+    quote: current.quoteRaw,
+    effectiveQuote:
+      current.effectiveQuoteRaw,
+    timestamp: now()
+  };
+
+  addHistory(
+    histories.reserve,
+    lamportsToSol(
+      current.effectiveQuoteRaw
+    )
+  );
+}
+
+// ============================================================
+// WEBSOCKET
+// ============================================================
+
+function wsSend(payload) {
+  if (!ws) return;
+
+  if (
+    ws.readyState !==
+    WebSocket.OPEN
+  ) {
     return;
   }
 
-  let type =
-    "OTHER";
+  ws.send(
+    JSON.stringify(payload)
+  );
+}
 
-  // Base token sort du pool
-  // + SOL entre dans le pool
-  // = SELL
-  if (
-    baseDelta < 0n &&
-    quoteDelta > 0n
-  ) {
-    type = "SELL";
-  }
+function subscribeAccounts() {
+  if (!ws) return;
 
-  // Base token entre dans le pool
-  // + SOL sort du pool
-  // = BUY
-  else if (
-    baseDelta > 0n &&
-    quoteDelta < 0n
-  ) {
-    type = "BUY";
-  }
-
-  // Les deux réserves diminuent
-  // = retrait potentiel
-  else if (
-    baseDelta < 0n &&
-    quoteDelta < 0n
-  ) {
-    type = "WITHDRAWAL";
-  }
-
-  // Les deux augmentent
-  // = ajout de liquidité potentiel
-  else if (
-    baseDelta > 0n &&
-    quoteDelta > 0n
-  ) {
-    type = "LIQUIDITY_ADD";
-  }
-
-  state.events.push({
-    t: now(),
-    type,
-    quoteSol,
-    baseDelta,
-    quoteDelta,
+  wsSend({
+    jsonrpc: "2.0",
+    id: rpcId++,
+    method: "accountSubscribe",
+    params: [
+      baseVault,
+      {
+        encoding: "base64",
+        commitment: "processed"
+      }
+    ]
   });
 
-  trimHistory();
+  wsSend({
+    jsonrpc: "2.0",
+    id: rpcId++,
+    method: "accountSubscribe",
+    params: [
+      quoteVault,
+      {
+        encoding: "base64",
+        commitment: "processed"
+      }
+    ]
+  });
+
+  wsSend({
+    jsonrpc: "2.0",
+    id: rpcId++,
+    method: "logsSubscribe",
+    params: [
+      {
+        mentions: [
+          poolAddress
+        ]
+      },
+      {
+        commitment: "processed"
+      }
+    ]
+  });
+}
+
+function connectWebSocket() {
+  if (stopped) return;
+
+  try {
+    if (ws) {
+      try {
+        ws.close();
+      } catch {}
+    }
+
+    ws = new WebSocket(
+      WS_URL
+    );
+
+    ws.on("open", () => {
+      console.log(
+        "🟢 WebSocket V7 connecté"
+      );
+
+      subscribeAccounts();
+    });
+
+    ws.on("message", raw => {
+      try {
+        const msg =
+          JSON.parse(
+            raw.toString()
+          );
+
+        // Subscription response
+        if (
+          msg.id &&
+          typeof msg.result === "number"
+        ) {
+          if (
+            !baseSub &&
+            msg.result
+          ) {
+            if (!baseSub) {
+              baseSub =
+                msg.result;
+            } else if (
+              !quoteSub
+            ) {
+              quoteSub =
+                msg.result;
+            } else {
+              poolSub =
+                msg.result;
+            }
+          }
+
+          return;
+        }
+
+        // Account notification
+        if (
+          msg.method ===
+          "accountNotification"
+        ) {
+          const value =
+            msg.params?.result?.value;
+
+          const subscription =
+            msg.params?.subscription;
+
+          const amount =
+            readSplTokenAccountAmount(
+              value?.data
+            );
+
+          if (amount === null) {
+            return;
+          }
+
+          if (
+            subscription ===
+            baseSub
+          ) {
+            pendingVaultChanges.base =
+              amount;
+          }
+
+          if (
+            subscription ===
+            quoteSub
+          ) {
+            pendingVaultChanges.quote =
+              amount;
+          }
+
+          return;
+        }
+
+        // Pool logs
+        if (
+          msg.method ===
+          "logsNotification"
+        ) {
+          const value =
+            msg.params?.result?.value;
+
+          const logs =
+            value?.logs || [];
+
+          const signature =
+            value?.signature || null;
+
+          const slot =
+            msg.params?.result?.context
+              ?.slot || null;
+
+          const text =
+            logs.join(" ");
+
+          if (
+            /Instruction: Sell/i.test(
+              text
+            )
+          ) {
+            lastInstruction = {
+              type: "SELL",
+              timestamp: now(),
+              slot,
+              signature
+            };
+          } else if (
+            /Instruction: Buy/i.test(
+              text
+            )
+          ) {
+            lastInstruction = {
+              type: "BUY",
+              timestamp: now(),
+              slot,
+              signature
+            };
+          } else if (
+            /Instruction: Withdraw/i.test(
+              text
+            )
+          ) {
+            lastInstruction = {
+              type: "WITHDRAW",
+              timestamp: now(),
+              slot,
+              signature
+            };
+          } else if (
+            /Instruction: Deposit/i.test(
+              text
+            )
+          ) {
+            lastInstruction = {
+              type: "DEPOSIT",
+              timestamp: now(),
+              slot,
+              signature
+            };
+          }
+        }
+
+      } catch (e) {
+        console.log(
+          "WS message error:",
+          e.message
+        );
+      }
+    });
+
+    ws.on("close", () => {
+      console.log(
+        "🔴 WebSocket fermé"
+      );
+
+      if (
+        watching &&
+        !stopped
+      ) {
+        clearTimeout(
+          reconnectTimer
+        );
+
+        reconnectTimer =
+          setTimeout(
+            connectWebSocket,
+            1500
+          );
+      }
+    });
+
+    ws.on("error", err => {
+      console.log(
+        "WS error:",
+        err.message
+      );
+    });
+
+  } catch (e) {
+    console.log(
+      "WS connection:",
+      e.message
+    );
+  }
 }
 
 // ============================================================
-// BATCH VAULTS
+// VAULT BATCH
 // ============================================================
 
 function flushVaultBatch() {
-  state.pendingTimer =
-    null;
+  if (!watching || stopped) return;
 
-  const base =
-    state.pendingBase;
+  const newBase =
+    pendingVaultChanges.base;
 
-  const quote =
-    state.pendingQuote;
+  const newQuote =
+    pendingVaultChanges.quote;
 
-  state.pendingBase =
-    null;
-
-  state.pendingQuote =
-    null;
+  pendingVaultChanges.base = null;
+  pendingVaultChanges.quote = null;
 
   if (
-    base == null ||
-    quote == null
+    newBase === null &&
+    newQuote === null
   ) {
     return;
   }
 
+  const oldBase =
+    current.baseRaw;
+
+  const oldQuote =
+    current.quoteRaw;
+
   if (
-    state.baseRaw == null ||
-    state.quoteRaw == null
+    newBase !== null
   ) {
-    state.baseRaw =
-      base;
-
-    state.quoteRaw =
-      quote;
-
-    state.quoteSol =
-      lamportsToSol(
-        quote
-      );
-
-    state.reserveHistory.push({
-      t: now(),
-      v: state.quoteSol,
-    });
-
-    state.lastOnchainAt =
-      now();
-
-    return;
+    current.baseRaw =
+      newBase;
   }
+
+  if (
+    newQuote !== null
+  ) {
+    current.quoteRaw =
+      newQuote;
+  }
+
+  current.effectiveQuoteRaw =
+    current.quoteRaw +
+    current.virtualQuoteRaw;
 
   const baseDelta =
-    base - state.baseRaw;
+    oldBase === null ||
+    oldBase === undefined ||
+    newBase === null
+      ? 0n
+      : newBase - oldBase;
 
   const quoteDelta =
-    quote - state.quoteRaw;
+    oldQuote === null ||
+    oldQuote === undefined ||
+    newQuote === null
+      ? 0n
+      : newQuote - oldQuote;
 
-  state.baseRaw =
-    base;
-
-  state.quoteRaw =
-    quote;
-
-  state.quoteSol =
-    lamportsToSol(
-      quote
+  const quoteSol =
+    Math.abs(
+      lamportsToSol(
+        quoteDelta
+      )
     );
 
-  state.reserveHistory.push({
-    t: now(),
-    v: state.quoteSol,
-  });
+  const effectiveReserveSol =
+    lamportsToSol(
+      current.effectiveQuoteRaw
+    );
 
-  state.lastOnchainAt =
-    now();
-
-  addEvent(
-    baseDelta,
-    quoteDelta
+  addHistory(
+    histories.reserve,
+    effectiveReserveSol
   );
 
-  trimHistory();
-}
+  // ----------------------------------------------------------
+  // Event classification
+  // ----------------------------------------------------------
 
-function queueVaultUpdate(
-  which,
-  value
-) {
-  if (which === "base") {
-    state.pendingBase =
-      value;
-  } else {
-    state.pendingQuote =
-      value;
+  const minEventSol = 0.01;
+
+  let eventType = null;
+
+  if (
+    lastInstruction.timestamp >
+    now() - 1500
+  ) {
+    eventType =
+      lastInstruction.type;
   }
 
-  if (!state.pendingTimer) {
-    state.pendingTimer =
-      setTimeout(
-        flushVaultBatch,
-        BATCH_MS
+  // SELL
+  if (
+    eventType === "SELL" ||
+    (
+      baseDelta < 0n &&
+      quoteDelta > 0n &&
+      quoteSol >= minEventSol
+    )
+  ) {
+    if (quoteSol >= minEventSol) {
+      addHistory(
+        histories.sell,
+        quoteSol
       );
-  }
-}
-
-// ============================================================
-// ÉVÉNEMENTS
-// ============================================================
-
-function eventsWithin(
-  seconds,
-  type = null
-) {
-  const cutoff =
-    now() -
-    seconds * 1000;
-
-  return state.events.filter(
-    event =>
-      event.t >= cutoff &&
-      (!type ||
-        event.type === type)
-  );
-}
-
-function sumEvents(
-  seconds,
-  type
-) {
-  return eventsWithin(
-    seconds,
-    type
-  ).reduce(
-    (sum, event) =>
-      sum + event.quoteSol,
-    0
-  );
-}
-
-function countEvents(
-  seconds,
-  type
-) {
-  return eventsWithin(
-    seconds,
-    type
-  ).length;
-}
-
-function sellRatio(seconds) {
-  const events =
-    eventsWithin(seconds);
-
-  let sell = 0;
-  let buy = 0;
-
-  for (const event of events) {
-    if (event.type === "SELL") {
-      sell += event.quoteSol;
-    }
-
-    if (event.type === "BUY") {
-      buy += event.quoteSol;
     }
   }
 
-  const total =
-    sell + buy;
-
-  if (total <= 0) {
-    return 0;
+  // BUY
+  else if (
+    eventType === "BUY" ||
+    (
+      baseDelta > 0n &&
+      quoteDelta < 0n &&
+      quoteSol >= minEventSol
+    )
+  ) {
+    if (quoteSol >= minEventSol) {
+      addHistory(
+        histories.buy,
+        quoteSol
+      );
+    }
   }
 
-  return (
-    sell / total
-  ) * 100;
+  // WITHDRAW
+  else if (
+    eventType === "WITHDRAW" ||
+    (
+      baseDelta < 0n &&
+      quoteDelta < 0n &&
+      quoteSol >= minEventSol
+    )
+  ) {
+    if (quoteSol >= minEventSol) {
+      addHistory(
+        histories.withdrawals,
+        quoteSol
+      );
+    }
+  }
+
+  // DEPOSIT
+  else if (
+    eventType === "DEPOSIT" ||
+    (
+      baseDelta > 0n &&
+      quoteDelta > 0n &&
+      quoteSol >= minEventSol
+    )
+  ) {
+    if (quoteSol >= minEventSol) {
+      addHistory(
+        histories.additions,
+        quoteSol
+      );
+    }
+  }
+
+  previousVault = {
+    base: current.baseRaw,
+    quote: current.quoteRaw,
+    effectiveQuote:
+      current.effectiveQuoteRaw,
+    timestamp: now()
+  };
+
+  // Important :
+  // on ne fait PAS confiance uniquement
+  // au gros choc de réserve.
+  // On cherche une dégradation progressive.
+  evaluateRisk("ONCHAIN");
 }
 
 // ============================================================
-// CALCUL DU RISQUE V6
+// RISK ENGINE V7
 // ============================================================
 
 function calculateRisk() {
-  const price5 =
-    changeWithin(
-      state.priceHistory,
-      5
-    );
-
-  const price10 =
-    changeWithin(
-      state.priceHistory,
-      10
-    );
-
-  const liquidity5 =
-    changeWithin(
-      state.liquidityHistory,
-      5
-    );
-
-  const liquidity10 =
-    changeWithin(
-      state.liquidityHistory,
-      10
-    );
-
-  const reserve5 =
-    changeWithin(
-      state.reserveHistory,
-      5
-    );
-
-  const reserve10 =
-    changeWithin(
-      state.reserveHistory,
-      10
-    );
-
-  const sell1 =
-    sumEvents(
-      1,
-      "SELL"
-    );
-
-  const sell3 =
-    sumEvents(
-      3,
-      "SELL"
-    );
-
-  const sell5 =
-    sumEvents(
-      5,
-      "SELL"
-    );
-
-  const sell10 =
-    sumEvents(
-      10,
-      "SELL"
-    );
-
-  const sellCount10 =
-    countEvents(
-      10,
-      "SELL"
-    );
-
-  const ratio10 =
-    sellRatio(10);
-
-  const withdrawal10 =
-    sumEvents(
-      10,
-      "WITHDRAWAL"
-    );
-
-  const priceBelowHigh =
-    getPriceDropFromHigh();
-
   let score = 0;
 
   const signals = [];
 
-  // ==========================================================
-  // 1. VENTES ABSORBÉES
-  //
-  // Si le prix continue à monter et que la réserve/liquidité
-  // restent stables, les SELL ne sont pas considérés comme
-  // dangereux.
-  // ==========================================================
+  const reserve5 =
+    percentChange(
+      histories.reserve,
+      5
+    );
 
-  const makingHigh =
-    state.price > 0 &&
-    state.localHigh > 0 &&
-    state.price >=
-      state.localHigh * 0.998;
+  const reserve10 =
+    percentChange(
+      histories.reserve,
+      10
+    );
 
-  const healthyMarket =
-    price10 >= 0 &&
-    liquidity10 > -1 &&
-    reserve10 > -1;
+  const reserve20 =
+    percentChange(
+      histories.reserve,
+      20
+    );
 
+  const reserve30 =
+    percentChange(
+      histories.reserve,
+      30
+    );
+
+  const price5 =
+    percentChange(
+      histories.price,
+      5
+    );
+
+  const price10 =
+    percentChange(
+      histories.price,
+      10
+    );
+
+  const price20 =
+    percentChange(
+      histories.price,
+      20
+    );
+
+  const price30 =
+    percentChange(
+      histories.price,
+      30
+    );
+
+  const liquidity10 =
+    percentChange(
+      histories.liquidity,
+      10
+    );
+
+  const liquidity30 =
+    percentChange(
+      histories.liquidity,
+      30
+    );
+
+  const sell5 =
+    sumWindow(
+      histories.sell,
+      5
+    );
+
+  const sell10 =
+    sumWindow(
+      histories.sell,
+      10
+    );
+
+  const sell20 =
+    sumWindow(
+      histories.sell,
+      20
+    );
+
+  const sell30 =
+    sumWindow(
+      histories.sell,
+      30
+    );
+
+  const buy10 =
+    sumWindow(
+      histories.buy,
+      10
+    );
+
+  const sellCount10 =
+    countWindow(
+      histories.sell,
+      10
+    );
+
+  const sellCount30 =
+    countWindow(
+      histories.sell,
+      30
+    );
+
+  const withdrawal10 =
+    sumWindow(
+      histories.withdrawals,
+      10
+    );
+
+  const withdrawal30 =
+    sumWindow(
+      histories.withdrawals,
+      30
+    );
+
+  // ----------------------------------------------------------
+  // 1. SELL PRESSURE
+  // ----------------------------------------------------------
+
+  const totalFlow10 =
+    sell10 + buy10;
+
+  const sellRatio10 =
+    totalFlow10 > 0
+      ? (sell10 / totalFlow10) * 100
+      : 0;
+
+  // Les ventes seules ne suffisent PAS.
   if (
-    ratio10 >= 85 &&
-    sell10 >= 2
+    sellRatio10 >= 75 &&
+    sell10 >= 1.0
   ) {
-    if (
-      makingHigh &&
-      healthyMarket
-    ) {
-      score += 3;
-    } else {
-      score += 6;
-    }
-  }
-
-  // ==========================================================
-  // 2. SELL + BAISSE DU PRIX
-  // ==========================================================
-
-  if (
-    sell5 >= 5 &&
-    price5 < -0.5
-  ) {
-    score += 15;
+    score += 6;
 
     signals.push(
-      "SELL + prix en baisse"
+      "pression vendeuse confirmée"
     );
   }
 
   if (
-    sell10 >= 10 &&
-    price10 < -1
+    sellRatio10 >= 85 &&
+    sell10 >= 2.5
   ) {
-    score += 12;
+    score += 6;
 
     signals.push(
-      "pression vendeuse non absorbée"
+      "pression vendeuse persistante"
     );
   }
 
+  // Accélération
   if (
-    sell10 >= 20 &&
-    price10 < -2
+    sell20 >= 1 &&
+    sell10 >= sell20 * 0.65
+  ) {
+    score += 5;
+
+    signals.push(
+      "accélération des ventes"
+    );
+  }
+
+  // Beaucoup de petits événements sans volume
+  // ne doivent plus déclencher l'alarme.
+  if (
+    sellCount10 >= 5 &&
+    sell10 >= 1
+  ) {
+    score += 3;
+  }
+
+  // ----------------------------------------------------------
+  // 2. MOMENTUM / PRICE FAILURE
+  // ----------------------------------------------------------
+
+  const drawdown =
+    highPrice &&
+    current.price
+      ? ((current.price - highPrice) /
+          highPrice) *
+        100
+      : 0;
+
+  // Essoufflement léger
+  if (
+    price20 !== null &&
+    price20 < -1.5 &&
+    sell10 >= 0.5
   ) {
     score += 8;
 
     signals.push(
-      "accélération vendeuse toxique"
+      "prix qui commence à céder"
     );
   }
 
-  // Beaucoup de SELL mais prix toujours positif.
+  // Dégradation plus nette
   if (
-    sellCount10 >= 20 &&
-    price10 >= 0
-  ) {
-    score -= 3;
-  }
-
-  // ==========================================================
-  // 3. ÉCHEC DU SOMMET
-  // ==========================================================
-
-  if (
-    priceBelowHigh >= 1
-  ) {
-    score += 8;
-
-    signals.push(
-      "prix sous le sommet"
-    );
-  }
-
-  if (
-    priceBelowHigh >= 2
+    price10 !== null &&
+    price10 < -3 &&
+    sell10 >= 1
   ) {
     score += 10;
 
     signals.push(
-      "perte du sommet local"
+      "cassure du momentum"
     );
   }
 
+  // Le prix reste proche du sommet
+  // mais les ventes deviennent fortes.
+  // Cela peut être un signal précoce.
   if (
-    price10 < -1
+    drawdown > -1 &&
+    sell20 >= 3 &&
+    sellRatio10 >= 70
+  ) {
+    score += 5;
+
+    signals.push(
+      "ventes absorbées mais pression croissante"
+    );
+  }
+
+  // ----------------------------------------------------------
+  // 3. RESERVE TREND
+  // ----------------------------------------------------------
+
+  // Petite baisse progressive
+  if (
+    reserve30 !== null &&
+    reserve30 <= -2 &&
+    reserve30 > -5
+  ) {
+    score += 5;
+
+    signals.push(
+      "réserve en baisse progressive"
+    );
+  }
+
+  // Dégradation intermédiaire
+  if (
+    reserve20 !== null &&
+    reserve20 <= -4 &&
+    reserve20 > -10
   ) {
     score += 10;
 
     signals.push(
-      "prix commence à décrocher"
+      "dégradation de réserve"
     );
   }
 
+  // Forte sortie
   if (
-    price10 < -3
-  ) {
-    score += 10;
-
-    signals.push(
-      "décrochage rapide du prix"
-    );
-  }
-
-  // ==========================================================
-  // 4. RÉSERVE ON-CHAIN
-  //
-  // PRIORITÉ V6
-  // ==========================================================
-
-  if (
-    reserve5 <= -1
-  ) {
-    score += 12;
-
-    signals.push(
-      "réserve WSOL en baisse"
-    );
-  }
-
-  if (
-    reserve10 <= -2
+    reserve10 !== null &&
+    reserve10 <= -8 &&
+    reserve10 > -15
   ) {
     score += 15;
 
     signals.push(
-      "baisse anormale de réserve"
+      "sortie importante de réserve"
     );
   }
 
+  // Très gros choc
   if (
-    reserve10 <= -5
-  ) {
-    score += 20;
-
-    signals.push(
-      "forte sortie de réserve"
-    );
-  }
-
-  if (
+    reserve10 !== null &&
     reserve10 <= -15
   ) {
-    score += 30;
+    score += 10;
 
     signals.push(
-      "sortie structurelle de réserve"
+      "choc de réserve"
     );
   }
 
-  // ==========================================================
-  // 5. LIQUIDITÉ
-  // ==========================================================
+  // ----------------------------------------------------------
+  // 4. LIQUIDITY
+  // ----------------------------------------------------------
 
   if (
-    liquidity10 <= -2
+    liquidity30 !== null &&
+    liquidity30 < -3
   ) {
-    score += 8;
+    score += 6;
 
     signals.push(
       "liquidité en baisse"
@@ -1187,33 +1569,24 @@ function calculateRisk() {
   }
 
   if (
-    liquidity10 <= -5
+    liquidity10 !== null &&
+    liquidity10 < -8
   ) {
-    score += 15;
+    score += 12;
 
     signals.push(
-      "dégradation rapide de liquidité"
+      "liquidité en forte baisse"
     );
   }
 
-  if (
-    liquidity10 <= -15
-  ) {
-    score += 25;
-
-    signals.push(
-      "liquidité fortement retirée"
-    );
-  }
-
-  // ==========================================================
-  // 6. RETRAIT STRUCTUREL
-  // ==========================================================
+  // ----------------------------------------------------------
+  // 5. WITHDRAWALS
+  // ----------------------------------------------------------
 
   if (
-    withdrawal10 >= 1
+    withdrawal30 >= 1
   ) {
-    score += 25;
+    score += 10;
 
     signals.push(
       "retrait de liquidité détecté"
@@ -1221,1003 +1594,668 @@ function calculateRisk() {
   }
 
   if (
-    withdrawal10 >= 10
+    withdrawal10 >= 3
   ) {
-    score += 30;
+    score += 15;
 
     signals.push(
-      "retrait structurel important"
+      "retrait important de liquidité"
     );
   }
 
-  // ==========================================================
-  // 7. CONFLUENCE
-  // ==========================================================
+  // ----------------------------------------------------------
+  // 6. CONFLUENCE
+  // ----------------------------------------------------------
 
   const negativeFactors = [
-    price10 < -1,
-    reserve10 < -1,
-    liquidity10 < -1,
-    priceBelowHigh >= 1,
-    sell10 >= 10 &&
-      ratio10 >= 75,
+    reserve20 !== null &&
+      reserve20 < -2,
+
+    price20 !== null &&
+      price20 < -1,
+
+    liquidity30 !== null &&
+      liquidity30 < -2,
+
+    sellRatio10 >= 70 &&
+      sell10 >= 1,
+
+    withdrawal30 >= 1
   ].filter(Boolean).length;
 
   if (
     negativeFactors >= 3
   ) {
-    score += 15;
+    score += 12;
 
     signals.push(
-      "confluence de signaux"
+      "confluence de plusieurs signaux"
     );
   }
 
-  score =
-    clamp(
+  // ----------------------------------------------------------
+  // 7. ABSORPTION CHECK
+  // ----------------------------------------------------------
+
+  // Si le prix monte encore franchement,
+  // la réserve peut bouger sans que le token
+  // soit immédiatement en train de mourir.
+  if (
+    price20 !== null &&
+    price20 > 3 &&
+    drawdown > -1
+  ) {
+    score -= 8;
+  }
+
+  if (
+    price30 !== null &&
+    price30 > 5 &&
+    liquidity30 !== null &&
+    liquidity30 > 0
+  ) {
+    score -= 8;
+  }
+
+  return {
+    score: clamp(
       Math.round(score),
       0,
       100
-    );
+    ),
 
-  // ==========================================================
-  // NIVEAUX
-  // ==========================================================
+    signals,
 
-  let level =
-    "NORMAL";
+    metrics: {
+      reserve5,
+      reserve10,
+      reserve20,
+      reserve30,
 
-  if (
-    score >= 80
-  ) {
-    level =
-      "URGENT";
-  } else if (
-    score >= 60
-  ) {
-    level =
-      "CRITIQUE";
-  } else if (
-    score >= 40
-  ) {
-    level =
-      "DANGER";
-  } else if (
-    score >= 25
-  ) {
-    level =
-      "SURVEILLANCE";
-  }
+      price5,
+      price10,
+      price20,
+      price30,
 
-  // ==========================================================
-  // CRASH CONFIRMÉ
-  //
-  // Après une vraie chute, on arrête complètement le radar.
-  // ==========================================================
+      liquidity10,
+      liquidity30,
 
-  const crash =
-    priceBelowHigh >= 50 ||
-    liquidity10 <= -50 ||
-    reserve10 <= -50;
+      sell5,
+      sell10,
+      sell20,
+      sell30,
 
-  return {
-    score,
-    level,
+      buy10,
+      sellRatio10,
 
-    price5,
-    price10,
+      sellCount10,
+      sellCount30,
 
-    liquidity5,
-    liquidity10,
+      withdrawal10,
+      withdrawal30,
 
-    reserve5,
-    reserve10,
-
-    sell1,
-    sell3,
-    sell5,
-    sell10,
-
-    sellCount10,
-    ratio10,
-
-    withdrawal10,
-
-    priceBelowHigh,
-
-    signals: [
-      ...new Set(signals),
-    ],
-
-    crash,
+      drawdown
+    }
   };
 }
 
 // ============================================================
-// ALERTES
+// CRASH DETECTION
 // ============================================================
 
-function alertTitle(level) {
+function detectCrash(metrics) {
+  const {
+    price10,
+    liquidity10,
+    reserve10,
+    reserve5
+  } = metrics;
+
+  // Chute de prix
   if (
-    level === "URGENT"
+    price10 !== null &&
+    price10 <= -20
   ) {
-    return "🚨 SORTIE URGENTE";
+    return "prix -20% en 10 secondes";
+  }
+
+  // Gros effondrement de liquidité
+  if (
+    liquidity10 !== null &&
+    liquidity10 <= -35
+  ) {
+    return "liquidité -35% en 10 secondes";
+  }
+
+  // Gros retrait de réserve
+  if (
+    reserve10 !== null &&
+    reserve10 <= -35
+  ) {
+    return "réserve -35% en 10 secondes";
   }
 
   if (
-    level === "CRITIQUE"
+    reserve5 !== null &&
+    reserve5 <= -25
   ) {
-    return "🔴 CRITIQUE : RISQUE DE CHUTE";
+    return "réserve -25% en 5 secondes";
   }
 
-  if (
-    level === "DANGER"
-  ) {
-    return "🟠 DANGER : DÉGRADATION";
-  }
-
-  return "🟡 SURVEILLANCE";
+  return null;
 }
 
-function buildAlert(risk) {
-  return `${alertTitle(risk.level)}
+// ============================================================
+// STATE TRANSITIONS
+// ============================================================
 
-Score risque : ${risk.score}/100
+function determineState(score, metrics) {
+  const crash =
+    detectCrash(metrics);
 
-Prix : $${state.price.toFixed(8)}
-Liquidité : $${fmtUsd(state.liquidityUsd)}
+  if (crash) {
+    return {
+      state: "CRASH",
+      crashReason: crash
+    };
+  }
 
-SELL 1s : ${fmtSol(risk.sell1)} SOL
-SELL 3s : ${fmtSol(risk.sell3)} SOL
-SELL 5s : ${fmtSol(risk.sell5)} SOL
-SELL 10s : ${fmtSol(risk.sell10)} SOL
-SELL ratio 10s : ${risk.ratio10.toFixed(1)}%
-SELL / 10s : ${risk.sellCount10}
+  // Pré-alerte
+  if (
+    score >= 30
+  ) {
+    return {
+      state: "PREALERTE",
+      crashReason: null
+    };
+  }
+
+  // Sortie
+  if (
+    score >= 45
+  ) {
+    return {
+      state: "SORTIE",
+      crashReason: null
+    };
+  }
+
+  // Critique
+  if (
+    score >= 65
+  ) {
+    return {
+      state: "CRITIQUE",
+      crashReason: null
+    };
+  }
+
+  return {
+    state: "NORMAL",
+    crashReason: null
+  };
+}
+
+// ============================================================
+// ALERT BUILDER
+// ============================================================
+
+function buildAlert(
+  state,
+  score,
+  signals,
+  metrics
+) {
+  const reserve =
+    current.effectiveQuoteRaw !== null
+      ? lamportsToSol(
+          current.effectiveQuoteRaw
+        )
+      : null;
+
+  const title = {
+    PREALERTE:
+      "🟡 PRÉ-ALERTE : DÉGRADATION",
+
+    SORTIE:
+      "🟠 SORTIE : RISQUE EN HAUSSE",
+
+    CRITIQUE:
+      "🔴 CRITIQUE : RISQUE DE CHUTE",
+
+    CRASH:
+      "🛑 CRASH : RADAR ARRÊTÉ"
+  }[state];
+
+  const signalText =
+    signals.length
+      ? signals
+          .slice(0, 6)
+          .map(s => `• ${s}`)
+          .join("\n")
+      : "• aucun signal majeur";
+
+  return `
+${title}
+
+Score risque : ${score}/100
+
+Prix : ${formatUsd(current.price)}
+Liquidité : ${formatLiquidity(current.liquidity)}
+
+SELL 5s : ${metrics.sell5.toFixed(4)} SOL
+SELL 10s : ${metrics.sell10.toFixed(4)} SOL
+SELL 20s : ${metrics.sell20.toFixed(4)} SOL
+
+SELL ratio 10s : ${metrics.sellRatio10.toFixed(1)}%
+SELL / 10s : ${metrics.sellCount10}
 
 Réserve WSOL :
-${fmtSol(state.quoteSol)} SOL
-
-Réserve 5s :
-${fmtPct(risk.reserve5)}
+${reserve !== null
+  ? reserve.toFixed(4)
+  : "N/A"} SOL
 
 Réserve 10s :
-${fmtPct(risk.reserve10)}
+${formatPct(metrics.reserve10)}
+
+Réserve 20s :
+${formatPct(metrics.reserve20)}
+
+Réserve 30s :
+${formatPct(metrics.reserve30)}
 
 Prix sous sommet :
-${risk.priceBelowHigh.toFixed(1)}%
+${formatPct(metrics.drawdown)}
 
-Liquidité 5s :
-${fmtPct(risk.liquidity5)}
+Prix 10s :
+${formatPct(metrics.price10)}
+
+Prix 20s :
+${formatPct(metrics.price20)}
 
 Liquidité 10s :
-${fmtPct(risk.liquidity10)}
+${formatPct(metrics.liquidity10)}
 
 ⚠️ Signaux :
-${
-  risk.signals.length
-    ? risk.signals
-        .map(x => `• ${x}`)
-        .join("\n")
-    : "• aucun signal"
-}
+${signalText}
 
-📡 RADAR V6`;
+📡 RADAR V7
+`.trim();
 }
 
 // ============================================================
-// ANTI-SPAM
+// ALERT SENDING
 // ============================================================
 
-function shouldAlert(risk) {
-  if (
-    state.stopped
-  ) {
-    return false;
+async function sendAlert(
+  state,
+  score,
+  signals,
+  metrics
+) {
+  const currentTime =
+    now();
+
+  let cooldown =
+    ALERT_COOLDOWN_PRE;
+
+  if (state === "SORTIE") {
+    cooldown =
+      ALERT_COOLDOWN_EXIT;
   }
 
   if (
-    risk.score < 25
+    state === "CRITIQUE" ||
+    state === "CRASH"
   ) {
-    return false;
+    cooldown =
+      ALERT_COOLDOWN_CRITICAL;
   }
 
-  const elapsed =
-    now() -
-    state.lastAlertAt;
-
-  const cooldown =
-    risk.level === "URGENT" ||
-    risk.level === "CRITIQUE"
-      ? 15000
-      : 45000;
-
   if (
-    elapsed < cooldown
-  ) {
-    return false;
-  }
-
-  const key = [
-    risk.level,
-    Math.floor(
-      risk.score / 10
-    ),
-    risk.signals
-      .slice(0, 2)
-      .join("|"),
-  ].join(":");
-
-  if (
-    key === state.lastAlertKey &&
-    elapsed < 90000
-  ) {
-    return false;
-  }
-
-  return true;
-}
-
-async function sendAlert(risk) {
-  if (
-    !shouldAlert(risk)
+    lastAlert.type === state &&
+    currentTime -
+      lastAlert.timestamp <
+      cooldown
   ) {
     return;
   }
 
-  state.lastAlertAt =
-    now();
-
-  state.lastAlertKey = [
-    risk.level,
-    Math.floor(
-      risk.score / 10
-    ),
-    risk.signals
-      .slice(0, 2)
-      .join("|"),
-  ].join(":");
-
-  state.alertCount++;
+  lastAlert = {
+    type: state,
+    timestamp: currentTime
+  };
 
   try {
     await bot.telegram.sendMessage(
       CHAT_ID,
-      buildAlert(risk)
+      buildAlert(
+        state,
+        score,
+        signals,
+        metrics
+      )
     );
-
+  } catch (e) {
     console.log(
-      `📨 Telegram : ${risk.level} ${risk.score}/100`
-    );
-  } catch (error) {
-    console.error(
-      "❌ Telegram :",
-      error.message
+      "Telegram:",
+      e.message
     );
   }
 }
 
 // ============================================================
-// ARRÊT AUTOMATIQUE
+// RISK EVALUATION
+// ============================================================
+
+async function evaluateRisk(source) {
+  if (!watching || stopped) {
+    return;
+  }
+
+  const result =
+    calculateRisk();
+
+  const score =
+    result.score;
+
+  const metrics =
+    result.metrics;
+
+  const transition =
+    determineState(
+      score,
+      metrics
+    );
+
+  const nextState =
+    transition.state;
+
+  // ----------------------------------------------------------
+  // CRASH
+  // ----------------------------------------------------------
+
+  if (
+    nextState === "CRASH"
+  ) {
+    await sendAlert(
+      "CRASH",
+      100,
+      [
+        "mouvement brutal confirmé",
+        transition.crashReason
+      ],
+      metrics
+    );
+
+    await stopRadar(
+      transition.crashReason
+    );
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // Important :
+  // SORTIE avant CRITIQUE.
+  // On cherche à donner le temps de sortir.
+  // ----------------------------------------------------------
+
+  if (
+    nextState === "CRITIQUE"
+  ) {
+    if (
+      riskState !==
+      "CRITIQUE"
+    ) {
+      await sendAlert(
+        "CRITIQUE",
+        score,
+        result.signals,
+        metrics
+      );
+    }
+
+    riskState =
+      "CRITIQUE";
+
+    return;
+  }
+
+  if (
+    nextState === "SORTIE"
+  ) {
+    if (
+      riskState ===
+        "NORMAL" ||
+      riskState ===
+        "PREALERTE"
+    ) {
+      await sendAlert(
+        "SORTIE",
+        score,
+        result.signals,
+        metrics
+      );
+    }
+
+    riskState =
+      "SORTIE";
+
+    return;
+  }
+
+  if (
+    nextState === "PREALERTE"
+  ) {
+    if (
+      riskState ===
+      "NORMAL"
+    ) {
+      await sendAlert(
+        "PREALERTE",
+        score,
+        result.signals,
+        metrics
+      );
+    }
+
+    riskState =
+      "PREALERTE";
+
+    return;
+  }
+
+  // Retour au calme
+  if (
+    nextState === "NORMAL"
+  ) {
+    riskState =
+      "NORMAL";
+  }
+}
+
+// ============================================================
+// STOP RADAR
 // ============================================================
 
 async function stopRadar(
-  reason,
-  sendMessage = true
+  reason
 ) {
-  if (
-    state.stopped
-  ) {
-    return;
-  }
+  if (stopped) return;
 
-  state.stopped =
-    true;
+  stopped = true;
+  watching = false;
 
-  state.running =
-    false;
-
-  state.stopReason =
-    reason;
-
-  if (
-    state.pollTimer
-  ) {
-    clearInterval(
-      state.pollTimer
-    );
-
-    state.pollTimer =
-      null;
-  }
-
-  if (
-    state.staleTimer
-  ) {
-    clearInterval(
-      state.staleTimer
-    );
-
-    state.staleTimer =
-      null;
-  }
-
-  if (
-    state.wsReconnectTimer
-  ) {
-    clearTimeout(
-      state.wsReconnectTimer
-    );
-
-    state.wsReconnectTimer =
-      null;
-  }
-
-  if (
-    state.wsPingTimer
-  ) {
-    clearInterval(
-      state.wsPingTimer
-    );
-
-    state.wsPingTimer =
-      null;
-  }
-
-  try {
-    if (
-      state.ws &&
-      state.ws.readyState ===
-        WebSocket.OPEN
-    ) {
-      state.ws.close();
-    }
-  } catch (_) {}
-
-  state.ws =
-    null;
-
-  state.wsReady =
-    false;
-
-  console.log(
-    `🛑 RADAR ARRÊTÉ : ${reason}`
+  clearInterval(
+    dexTimer
   );
 
-  if (!sendMessage) {
-    return;
+  clearTimeout(
+    reconnectTimer
+  );
+
+  if (ws) {
+    try {
+      ws.close();
+    } catch {}
   }
+
+  console.log(
+    "🛑 RADAR ARRÊTÉ :",
+    reason
+  );
 
   try {
     await bot.telegram.sendMessage(
       CHAT_ID,
-      `🛑 RADAR V6 ARRÊTÉ
+      `
+🛑 RADAR V7 ARRÊTÉ
 
-🚨 Chute brutale confirmée.
+Token :
+${mint}
 
+Cause :
 ${reason}
 
-Le token n'est plus surveillé.
-
-Le radar s'arrête automatiquement afin d'éviter les alertes répétitives après le crash.`
+Le bot ne suivra plus ce token.
+`.trim()
     );
-  } catch (error) {
-    console.error(
-      "❌ Telegram arrêt :",
-      error.message
-    );
-  }
+  } catch {}
 }
 
 // ============================================================
-// WEBSOCKET HELIUS
-// ============================================================
-
-function connectWebSocket() {
-  if (
-    state.stopped
-  ) {
-    return;
-  }
-
-  if (state.ws) {
-    try {
-      state.ws.close();
-    } catch (_) {}
-  }
-
-  const ws =
-    new WebSocket(
-      WS_URL
-    );
-
-  state.ws =
-    ws;
-
-  ws.on(
-    "open",
-    () => {
-      console.log(
-        "🔌 Helius WSS connecté"
-      );
-
-      state.wsReady =
-        true;
-
-      const baseRequest = {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "accountSubscribe",
-        params: [
-          state.baseVault,
-          {
-            commitment:
-              "processed",
-            encoding:
-              "base64",
-          },
-        ],
-      };
-
-      const quoteRequest = {
-        jsonrpc: "2.0",
-        id: 2,
-        method: "accountSubscribe",
-        params: [
-          state.quoteVault,
-          {
-            commitment:
-              "processed",
-            encoding:
-              "base64",
-          },
-        ],
-      };
-
-      const logsRequest = {
-        jsonrpc: "2.0",
-        id: 3,
-        method: "logsSubscribe",
-        params: [
-          {
-            mentions: [
-              state.pool,
-            ],
-          },
-          {
-            commitment:
-              "processed",
-          },
-        ],
-      };
-
-      ws.send(
-        JSON.stringify(
-          baseRequest
-        )
-      );
-
-      ws.send(
-        JSON.stringify(
-          quoteRequest
-        )
-      );
-
-      ws.send(
-        JSON.stringify(
-          logsRequest
-        )
-      );
-
-      if (
-        state.wsPingTimer
-      ) {
-        clearInterval(
-          state.wsPingTimer
-        );
-      }
-
-      state.wsPingTimer =
-        setInterval(
-          () => {
-            if (
-              state.ws &&
-              state.ws.readyState ===
-                WebSocket.OPEN
-            ) {
-              try {
-                state.ws.ping();
-              } catch (_) {}
-            }
-          },
-          15000
-        );
-    }
-  );
-
-  ws.on(
-    "message",
-    raw => {
-      try {
-        const message =
-          JSON.parse(
-            raw.toString()
-          );
-
-        // Réponses des subscriptions
-        if (
-          message.id === 1 &&
-          typeof message.result ===
-            "number"
-        ) {
-          state.baseSub =
-            message.result;
-
-          return;
-        }
-
-        if (
-          message.id === 2 &&
-          typeof message.result ===
-            "number"
-        ) {
-          state.quoteSub =
-            message.result;
-
-          return;
-        }
-
-        if (
-          message.id === 3 &&
-          typeof message.result ===
-            "number"
-        ) {
-          state.logSub =
-            message.result;
-
-          return;
-        }
-
-        if (
-          message.method !==
-          "accountNotification"
-        ) {
-          return;
-        }
-
-        const subscription =
-          message?.params?.subscription;
-
-        const data =
-          message?.params?.result?.value?.data;
-
-        const buffer =
-          dataToBuffer(data);
-
-        if (!buffer) {
-          return;
-        }
-
-        const amount =
-          readSplTokenAccountAmount(
-            buffer
-          );
-
-        if (
-          amount == null
-        ) {
-          return;
-        }
-
-        if (
-          subscription ===
-          state.baseSub
-        ) {
-          queueVaultUpdate(
-            "base",
-            amount
-          );
-        }
-
-        else if (
-          subscription ===
-          state.quoteSub
-        ) {
-          queueVaultUpdate(
-            "quote",
-            amount
-          );
-        }
-
-      } catch (error) {
-        console.error(
-          "⚠️ Message WSS :",
-          error.message
-        );
-      }
-    }
-  );
-
-  ws.on(
-    "error",
-    error => {
-      console.error(
-        "❌ Helius WSS :",
-        error.message
-      );
-    }
-  );
-
-  ws.on(
-    "close",
-    () => {
-      state.wsReady =
-        false;
-
-      if (
-        state.wsPingTimer
-      ) {
-        clearInterval(
-          state.wsPingTimer
-        );
-
-        state.wsPingTimer =
-          null;
-      }
-
-      if (
-        state.stopped
-      ) {
-        return;
-      }
-
-      console.log(
-        "🔌 WSS fermé, reconnexion dans 2 secondes..."
-      );
-
-      clearTimeout(
-        state.wsReconnectTimer
-      );
-
-      state.wsReconnectTimer =
-        setTimeout(
-          connectWebSocket,
-          2000
-        );
-    }
-  );
-}
-
-// ============================================================
-// WATCHDOG WSS
-// ============================================================
-
-function staleWatchdog() {
-  if (
-    state.stopped
-  ) {
-    return;
-  }
-
-  if (
-    state.lastOnchainAt > 0 &&
-    now() -
-      state.lastOnchainAt >
-      30000
-  ) {
-    console.log(
-      "⚠️ Flux on-chain silencieux > 30s"
-    );
-
-    readVaults()
-      .catch(
-        error =>
-          console.error(
-            "⚠️ Relecture vaults :",
-            error.message
-          )
-      );
-  }
-}
-
-// ============================================================
-// TICK PRINCIPAL
-// ============================================================
-
-async function marketTick() {
-  if (
-    state.stopped
-  ) {
-    return;
-  }
-
-  try {
-    await fetchDex();
-
-    const risk =
-      calculateRisk();
-
-    console.log(
-      `📊 ${risk.level} ${risk.score}/100 | ` +
-      `Prix $${state.price.toFixed(8)} | ` +
-      `Liq $${Math.round(state.liquidityUsd)} | ` +
-      `Réserve ${fmtSol(state.quoteSol)} SOL | ` +
-      `R10 ${risk.reserve10.toFixed(2)}% | ` +
-      `High ${risk.priceBelowHigh.toFixed(2)}%`
-    );
-
-    // ========================================================
-    // CRASH AVANT TOUTE ALERTE
-    // ========================================================
-
-    if (
-      risk.crash
-    ) {
-      await stopRadar(
-        `Prix sous sommet : ${risk.priceBelowHigh.toFixed(1)}%
-Liquidité 10s : ${fmtPct(risk.liquidity10)}
-Réserve 10s : ${fmtPct(risk.reserve10)}`,
-        true
-      );
-
-      return;
-    }
-
-    await sendAlert(
-      risk
-    );
-
-  } catch (error) {
-    state.dexErrors++;
-
-    console.error(
-      "⚠️ Tick :",
-      error.message
-    );
-
-    // Le radar on-chain continue même si DexScreener tombe.
-    if (
-      state.dexErrors >= 5
-    ) {
-      console.log(
-        "⚠️ DexScreener indisponible. Surveillance on-chain maintenue."
-      );
-
-      state.dexErrors =
-        0;
-    }
-  }
-}
-
-// ============================================================
-// DÉMARRAGE RADAR
+// START RADAR
 // ============================================================
 
 async function startRadar(
-  mint
+  tokenMint
 ) {
-  if (
-    state.running
-  ) {
-    await stopRadar(
-      "Nouveau token demandé",
-      false
-    );
-  }
+  mint = tokenMint;
 
-  // Reset complet
-  state.mint =
-    mint;
+  watching = true;
+  stopped = false;
 
-  state.pool =
-    null;
+  resetHistory();
 
-  state.baseVault =
-    null;
+  current = {
+    price: null,
+    liquidity: null,
 
-  state.quoteVault =
-    null;
+    baseRaw: null,
+    quoteRaw: null,
+    virtualQuoteRaw: 0n,
+    effectiveQuoteRaw: null,
 
-  state.baseSub =
-    null;
+    updatedAt: 0
+  };
 
-  state.quoteSub =
-    null;
+  previousVault = {
+    base: null,
+    quote: null,
+    effectiveQuote: null,
+    timestamp: 0
+  };
 
-  state.logSub =
-    null;
-
-  state.baseRaw =
-    null;
-
-  state.quoteRaw =
-    null;
-
-  state.quoteSol =
-    0;
-
-  state.virtualQuoteRaw =
-    0n;
-
-  state.price =
-    0;
-
-  state.liquidityUsd =
-    0;
-
-  state.priceHistory =
-    [];
-
-  state.liquidityHistory =
-    [];
-
-  state.reserveHistory =
-    [];
-
-  state.events =
-    [];
-
-  state.localHigh =
-    0;
-
-  state.lastOnchainAt =
-    0;
-
-  state.lastDexAt =
-    0;
-
-  state.dexErrors =
-    0;
-
-  state.lastAlertAt =
-    0;
-
-  state.lastAlertKey =
-    null;
-
-  state.alertCount =
-    0;
-
-  state.pendingBase =
-    null;
-
-  state.pendingQuote =
-    null;
-
-  state.stopped =
-    false;
-
-  state.stopReason =
-    null;
-
-  state.running =
-    true;
+  baseSub = null;
+  quoteSub = null;
+  poolSub = null;
 
   console.log(
-    `\n🚀 RADAR V6 : ${mint}`
+    "================================="
   );
 
-  // Découverte
-  await discoverPool();
+  console.log(
+    "🚀 RADAR V7"
+  );
 
-  // Lecture initiale
-  await readVaults();
+  console.log(
+    "Token :",
+    mint
+  );
 
-  // Connexion temps réel
+  console.log(
+    "================================="
+  );
+
+  await loadPool();
+
+  await initializeVaults();
+
+  const dex =
+    await fetchDex();
+
+  if (dex) {
+    current.price =
+      dex.price;
+
+    current.liquidity =
+      dex.liquidity;
+
+    if (
+      current.price > 0
+    ) {
+      highPrice =
+        current.price;
+
+      addHistory(
+        histories.price,
+        current.price
+      );
+    }
+
+    if (
+      current.liquidity > 0
+    ) {
+      addHistory(
+        histories.liquidity,
+        current.liquidity
+      );
+    }
+  }
+
+  addHistory(
+    histories.reserve,
+    lamportsToSol(
+      current.effectiveQuoteRaw
+    )
+  );
+
   connectWebSocket();
 
-  // Premier tick
-  await marketTick();
-
-  // Surveillance Dex
-  state.pollTimer =
+  dexTimer =
     setInterval(
-      marketTick,
-      POLL_MS
+      updateMarket,
+      DEX_INTERVAL_MS
     );
 
-  // Surveillance WSS
-  state.staleTimer =
-    setInterval(
-      staleWatchdog,
-      10000
-    );
-
-  try {
-    await bot.telegram.sendMessage(
-      CHAT_ID,
-      `🛰️ RADAR V6 ACTIVÉ
+  await bot.telegram.sendMessage(
+    CHAT_ID,
+    `
+📡 RADAR V7 ACTIVÉ
 
 Token :
 ${mint}
 
 Pool :
-${state.pool}
+${poolAddress}
 
-Réserve initiale :
-${fmtSol(state.quoteSol)} SOL
+💰 Réserve WSOL :
+${lamportsToSol(
+  current.effectiveQuoteRaw
+).toFixed(4)} SOL
 
-Le radar surveille :
+🎯 Objectif :
+détecter la dégradation AVANT
+la chute brutale.
 
-• ventes absorbées
-• ventes toxiques
-• prix sous sommet
-• réserve WSOL
-• retraits structurels
-• liquidité
-• confluence de signaux
-
-🛑 Arrêt automatique après crash confirmé.`
-    );
-  } catch (error) {
-    console.error(
-      "Telegram démarrage :",
-      error.message
-    );
-  }
+🟢 Surveillance active.
+`.trim()
+  );
 }
 
 // ============================================================
-// VALIDATION TOKEN
-// ============================================================
-
-function isValidMint(
-  mint
-) {
-  try {
-    new PublicKey(
-      mint
-    );
-
-    return (
-      mint.length >= 32 &&
-      mint.length <= 44
-    );
-
-  } catch (_) {
-    return false;
-  }
-}
-
-// ============================================================
-// TELEGRAM
-// ============================================================
-
-bot.start(
-  ctx => {
-    ctx.reply(
-      `🛰️ RADAR V6
-
-Commandes :
-
-/watch ADRESSE_TOKEN
-/status
-/unwatch
-/help`
-    );
-  }
-);
-
-bot.help(
-  ctx => {
-    ctx.reply(
-      `🛰️ RADAR V6
-
-/watch ADRESSE_TOKEN
-→ démarre la surveillance
-
-/status
-→ affiche l'état actuel
-
-/unwatch
-→ arrête le radar
-
-La V6 cherche surtout les dégradations structurelles et ne considère plus un simple ratio SELL élevé comme un crash.`
-    );
-  }
-);
-
-// ============================================================
-// /WATCH
+// TELEGRAM COMMANDS
 // ============================================================
 
 bot.command(
@@ -2228,183 +2266,195 @@ bot.command(
         .trim()
         .split(/\s+/);
 
-    const mint =
-      parts[1];
-
     if (
-      !mint ||
-      !isValidMint(mint)
+      parts.length < 2
     ) {
       await ctx.reply(
-        "❌ Adresse du token invalide."
+        "Utilisation : /watch ADRESSE_DU_TOKEN"
       );
-
       return;
     }
 
+    if (watching) {
+      await ctx.reply(
+        "⚠️ Un radar est déjà actif. Utilise /unwatch d'abord."
+      );
+      return;
+    }
+
+    const token =
+      parts[1].trim();
+
     try {
-      await ctx.reply(
-        "🔎 Recherche du pool PumpSwap..."
-      );
-
       await startRadar(
-        mint
+        token
       );
+    } catch (e) {
+      console.error(e);
 
-    } catch (error) {
-      console.error(
-        "❌ WATCH :",
-        error
-      );
+      watching = false;
+      stopped = false;
 
       await ctx.reply(
-        `❌ Impossible de démarrer le radar.
-
-${error.message}`
+        `❌ Impossible de démarrer V7.\n\n${e.message}`
       );
     }
   }
 );
-
-// ============================================================
-// /UNWATCH
-// ============================================================
 
 bot.command(
   "unwatch",
   async ctx => {
-    if (
-      !state.running
-    ) {
+    if (!watching) {
       await ctx.reply(
-        "ℹ️ Aucun token n'est actuellement surveillé."
+        "Aucun radar actif."
       );
-
       return;
     }
 
     await stopRadar(
-      "Arrêt manuel",
-      false
-    );
-
-    await ctx.reply(
-      "🛑 Radar arrêté."
+      "arrêt manuel"
     );
   }
 );
-
-// ============================================================
-// /STATUS
-// ============================================================
 
 bot.command(
   "status",
   async ctx => {
     if (
-      !state.mint
+      !watching ||
+      stopped
     ) {
       await ctx.reply(
-        "ℹ️ Aucun token surveillé."
+        "📡 Aucun radar actif."
       );
-
       return;
     }
 
-    if (
-      state.stopped
-    ) {
-      await ctx.reply(
-        `🛑 RADAR ARRÊTÉ
-
-Token :
-${state.mint}
-
-Raison :
-${state.stopReason || "arrêt automatique"}`
-      );
-
-      return;
-    }
-
-    const risk =
+    const result =
       calculateRisk();
 
-    await ctx.reply(
-      `🛰️ RADAR V6
+    const reserve =
+      current.effectiveQuoteRaw !== null
+        ? lamportsToSol(
+            current.effectiveQuoteRaw
+          )
+        : null;
 
-Token :
-${state.mint}
+    await ctx.reply(
+      `
+📡 RADAR V7
 
 État :
-${risk.level}
+${riskState}
 
 Score :
-${risk.score}/100
+${result.score}/100
 
 Prix :
-$${state.price.toFixed(8)}
+${formatUsd(current.price)}
 
 Liquidité :
-$${fmtUsd(state.liquidityUsd)}
+${formatLiquidity(
+  current.liquidity
+)}
 
 Réserve WSOL :
-${fmtSol(state.quoteSol)} SOL
+${reserve !== null
+  ? reserve.toFixed(4)
+  : "N/A"} SOL
 
 Réserve 10s :
-${fmtPct(risk.reserve10)}
+${formatPct(
+  result.metrics.reserve10
+)}
+
+Réserve 30s :
+${formatPct(
+  result.metrics.reserve30
+)}
+
+Prix 10s :
+${formatPct(
+  result.metrics.price10
+)}
+
+Prix 30s :
+${formatPct(
+  result.metrics.price30
+)}
 
 Prix sous sommet :
-${risk.priceBelowHigh.toFixed(1)}%
+${formatPct(
+  result.metrics.drawdown
+)}
 
 SELL 10s :
-${fmtSol(risk.sell10)} SOL
+${result.metrics.sell10.toFixed(4)} SOL
 
-Ratio SELL :
-${risk.ratio10.toFixed(1)}%
+SELL ratio :
+${result.metrics.sellRatio10.toFixed(1)}%
+`.trim()
+    );
+  }
+);
 
-Signaux :
-${
-  risk.signals.length
-    ? risk.signals.join(" | ")
-    : "aucun"
-}`
+bot.command(
+  "help",
+  async ctx => {
+    await ctx.reply(
+      `
+📡 RADAR V7
+
+/watch ADRESSE
+→ démarre le radar
+
+/status
+→ état actuel
+
+/unwatch
+→ arrête le radar
+
+V7 cherche surtout les signaux
+précurseurs et évite de confondre
+une grosse variation isolée avec
+un crash déjà commencé.
+`.trim()
     );
   }
 );
 
 // ============================================================
-// DÉMARRAGE BOT
+// START
 // ============================================================
 
 bot.launch()
-  .then(
-    () =>
-      console.log(
-        "🤖 Telegram RADAR V6 démarré"
-      )
-  )
-  .catch(
-    error => {
-      console.error(
-        "❌ Bot Telegram :",
-        error
-      );
-
-      process.exit(1);
-    }
-  );
-
-// ============================================================
-// ARRÊT PROPRE
-// ============================================================
+  .then(() => {
+    console.log(
+      "🤖 Telegram V7 démarré"
+    );
+  })
+  .catch(err => {
+    console.error(
+      "Telegram launch error:",
+      err
+    );
+  });
 
 process.once(
   "SIGINT",
-  () => bot.stop("SIGINT")
+  () => {
+    bot.stop(
+      "SIGINT"
+    );
+  }
 );
 
 process.once(
   "SIGTERM",
-  () => bot.stop("SIGTERM")
+  () => {
+    bot.stop(
+      "SIGTERM"
+    );
+  }
 );
