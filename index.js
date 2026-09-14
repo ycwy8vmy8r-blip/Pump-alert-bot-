@@ -2533,7 +2533,7 @@ async function marketTick() {
   if (!data) {
     return;
   }
-
+lastMarketData = data;
   currentPrice =
     data.price;
 
