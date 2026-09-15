@@ -1,37 +1,30 @@
 require("dotenv").config();
 
-const { Telegraf } = require("telegraf");
 const {
   Connection,
   PublicKey,
 } = require("@solana/web3.js");
+
+const { Telegraf } = require("telegraf");
 const WebSocket = require("ws");
 const fs = require("fs");
 const path = require("path");
 
-/* =========================================================
-   CONFIG
-========================================================= */
+// ============================================================
+// ENV
+// ============================================================
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 
-if (!BOT_TOKEN) {
-  throw new Error("BOT_TOKEN manquant");
-}
+if (!BOT_TOKEN) throw new Error("BOT_TOKEN manquant");
+if (!CHAT_ID) throw new Error("CHAT_ID manquant");
+if (!HELIUS_API_KEY) throw new Error("HELIUS_API_KEY manquant");
 
-if (!CHAT_ID) {
-  throw new Error("CHAT_ID manquant");
-}
-
-if (!HELIUS_API_KEY) {
-  throw new Error("HELIUS_API_KEY manquant");
-}
-
-/* =========================================================
-   SOLANA
-========================================================= */
+// ============================================================
+// CONFIG
+// ============================================================
 
 const RPC_URL =
   `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
@@ -39,201 +32,167 @@ const RPC_URL =
 const WSS_URL =
   `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
-const connection = new Connection(
-  RPC_URL,
-  {
-    commitment: "processed",
-  }
-);
+const connection = new Connection(RPC_URL, "processed");
 
-/* =========================================================
-   PUMPSWAP
-========================================================= */
+const bot = new Telegraf(BOT_TOKEN);
+
+// ============================================================
+// PROGRAMMES / MINTS
+// ============================================================
 
 const PUMPSWAP_PROGRAM_ID =
-  new PublicKey(
-    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
-  );
+  new PublicKey("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
+
+const PUMP_PROGRAM_ID =
+  new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 
 const WSOL_MINT =
-  "So11111111111111111111111111111111111111112";
+  new PublicKey("So11111111111111111111111111111111111111112");
 
-/*
-  PumpSwap Pool layout officiel
+// ============================================================
+// PUMPSWAP POOL LAYOUT
+// ============================================================
+//
+// 0   discriminator      8
+// 8   bump                1
+// 9   index               2
+// 11  creator            32
+// 43  base_mint          32
+// 75  quote_mint         32
+// 107 lp_mint            32
+// 139 pool_base_vault    32
+// 171 pool_quote_vault   32
+// 203 lp_supply           8
+// 211 coin_creator       32
+//
+// On accepte les comptes dont la taille est >= 243.
+// On ne dépend volontairement plus de dataSize=211.
+//
 
-  43  = base_mint
-  75  = quote_mint
-  139 = pool_base_token_account
-  171 = pool_quote_token_account
-  245 = virtual_quote_reserves
-*/
+const OFF = {
+  baseMint: 43,
+  quoteMint: 75,
+  baseVault: 139,
+  quoteVault: 171,
+  lpSupply: 203,
+  coinCreator: 211,
+};
 
-const POOL_BASE_MINT_OFFSET = 43;
-const POOL_QUOTE_MINT_OFFSET = 75;
-const POOL_BASE_VAULT_OFFSET = 139;
-const POOL_QUOTE_VAULT_OFFSET = 171;
-const POOL_VIRTUAL_QUOTE_OFFSET = 245;
-
-/* =========================================================
-   STRATEGIE
-========================================================= */
+// ============================================================
+// STRATÉGIE
+// ============================================================
 
 const CAPITAL_USD = 10;
 const TARGET_GAIN = 0.05;
 
-const MARKET_INTERVAL_MS = 2000;
+const MARKET_POLL_MS = 2000;
 
-const OBSERVATION_AFTER_SELL_MS =
-  30 * 1000;
+const OBSERVATION_MS = 30000;
 
-const NO_NEW_BUY_AFTER_MS =
-  43 * 60 * 1000;
-
-const MAX_SESSION_MS =
-  45 * 60 * 1000;
+const NO_NEW_BUY_AFTER_MS = 43 * 60 * 1000;
+const MAX_SESSION_MS = 45 * 60 * 1000;
 
 const MIN_LIQUIDITY_USD = 3000;
 
 const MIN_HEALTH_SCORE = 80;
-
 const REQUIRED_CONFIRMATIONS = 4;
 
-/* Crash */
+const COOLDOWN_AFTER_SELL_MS = 15000;
 
-const CRASH_PRICE_10S = -20;
-const CRASH_LIQUIDITY_10S = -50;
-const CRASH_MIN_LIQUIDITY = 1;
+// Protection crash
+const CRASH_PRICE_DROP_10S = -0.20;
+const CRASH_LIQUIDITY_DROP_10S = -0.50;
 
-/* Entrée */
+const HARD_LIQUIDITY_USD = 1;
 
-const ENTRY_PRICE_10S = -4;
-const ENTRY_LIQUIDITY_10S = -10;
-const ENTRY_LIQUIDITY_30S = -15;
+// Entrée
+const ENTRY_MAX_PRICE_DROP_10S = -0.05;
+const ENTRY_MAX_LIQUIDITY_DROP_10S = -0.12;
+const ENTRY_MAX_LIQUIDITY_DROP_30S = -0.20;
 
-/* On-chain */
+// ============================================================
+// DATA
+// ============================================================
 
-const LARGE_SELL_SOL = 0.5;
-const ONCHAIN_PAIR_WINDOW_MS = 350;
-
-/* =========================================================
-   TELEGRAM
-========================================================= */
-
-const bot = new Telegraf(BOT_TOKEN);
-
-/* =========================================================
-   FICHIERS
-========================================================= */
-
-const DATA_DIR =
-  fs.existsSync("/data")
-    ? "/data"
-    : path.join(__dirname, "data");
+const DATA_DIR = fs.existsSync("/data")
+  ? "/data"
+  : path.join(__dirname, "data");
 
 if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, {
-    recursive: true,
-  });
+  fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-const TRADE_FILE =
-  path.join(
-    DATA_DIR,
-    "trade_history.json"
-  );
+const MARKET_FILE = path.join(DATA_DIR, "market_history.jsonl");
+const TRADES_FILE = path.join(DATA_DIR, "trade_history.json");
+const CRASH_FILE = path.join(DATA_DIR, "crash_reports.json");
+const SUMMARY_FILE = path.join(DATA_DIR, "v5_7_summary.json");
 
-const CRASH_FILE =
-  path.join(
-    DATA_DIR,
-    "crash_reports.json"
-  );
-
-const MARKET_FILE =
-  path.join(
-    DATA_DIR,
-    "market_history.jsonl"
-);
-
-/* =========================================================
-   ETAT
-========================================================= */
+// ============================================================
+// ÉTAT
+// ============================================================
 
 let running = false;
-
 let tokenMint = null;
 
-let sessionStart = null;
+let sessionStartedAt = 0;
+let sessionEnded = false;
 
 let marketTimer = null;
-
 let sessionTimer = null;
+let websocket = null;
 
-let ws = null;
-
-let heliusConnected = false;
-
-let stopReason = null;
-
-let tickBusy = false;
-
-let currentPosition = null;
-
-let cyclesCompleted = 0;
-
-let sessionProfit = 0;
-
-let observationUntil = 0;
-
-let noNewBuyUntil = 0;
-
-let marketHistory = [];
-
+let dexPair = null;
 let poolInfo = null;
 
-let lastCrashReport = null;
+let position = null;
 
-let pendingSubscriptionTypes = [];
+let cycleNumber = 0;
+let wins = 0;
+let losses = 0;
+
+let cooldownUntil = 0;
+
+let lastMarket = null;
+let lastOnchain = null;
+
+let history = [];
+
+let crashReport = null;
 
 let wsSubscriptionIds = {
-  base: null,
-  quote: null,
+  baseVault: null,
+  quoteVault: null,
   pool: null,
 };
 
-let onchainState = {
-  lastBase: null,
-  lastQuote: null,
-  pendingBase: null,
-  pendingQuote: null,
-  lastEvent: null,
+let pendingVaultUpdates = {
+  base: null,
+  quote: null,
 };
 
-/* =========================================================
-   UTILITAIRES
-========================================================= */
+let previousVaultSnapshot = null;
+
+let lastDexFetch = 0;
+let cachedDexPairs = [];
+
+let healthConfirmationCount = 0;
+
+// ============================================================
+// UTILITAIRES
+// ============================================================
 
 function now() {
   return Date.now();
 }
 
-function formatPrice(value) {
-  if (!Number.isFinite(value)) {
-    return "N/A";
-  }
-
-  return value.toFixed(10);
-}
-
-function formatUsd(value) {
-  if (!Number.isFinite(value)) {
-    return "N/A";
-  }
-
-  return `$${value.toFixed(4)}`;
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function pct(current, previous) {
   if (
+    current === null ||
+    current === undefined ||
     previous === null ||
     previous === undefined ||
     previous === 0
@@ -241,51 +200,80 @@ function pct(current, previous) {
     return 0;
   }
 
-  return (
-    ((current - previous) / previous) *
-    100
-  );
+  return ((current - previous) / previous) * 100;
 }
 
-function clamp(value, min, max) {
-  return Math.max(
-    min,
-    Math.min(max, value)
-  );
+function pctDecimal(current, previous) {
+  return pct(current, previous) / 100;
 }
 
-async function telegram(text) {
+function shortMint(mint) {
+  if (!mint) return "N/A";
+  return `${mint.slice(0, 6)}...${mint.slice(-6)}`;
+}
+
+function shortAddress(address) {
+  if (!address) return "N/A";
+  return `${address.slice(0, 6)}...${address.slice(-6)}`;
+}
+
+function usd(value) {
+  if (!Number.isFinite(value)) return "N/A";
+
+  return `$${value.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 6,
+  })}`;
+}
+
+function sol(value) {
+  if (!Number.isFinite(value)) return "N/A";
+
+  return `${value.toFixed(4)} SOL`;
+}
+
+function safeJson(value) {
   try {
-    await bot.telegram.sendMessage(
-      CHAT_ID,
-      text
+    return JSON.stringify(value);
+  } catch {
+    return "{}";
+  }
+}
+
+async function telegram(message) {
+  try {
+    await bot.telegram.sendMessage(CHAT_ID, message);
+  } catch (err) {
+    console.error("Telegram error:", err.message);
+  }
+}
+
+// ============================================================
+// FICHIERS
+// ============================================================
+
+function appendJsonl(file, data) {
+  try {
+    fs.appendFileSync(
+      file,
+      JSON.stringify(data) + "\n",
+      "utf8"
     );
-  } catch (error) {
-    console.log(
-      "Erreur Telegram :",
-      error.message
-    );
+  } catch (err) {
+    console.error("Erreur écriture JSONL:", err.message);
   }
 }
 
 function readJson(file, fallback) {
   try {
-    if (!fs.existsSync(file)) {
-      return fallback;
-    }
+    if (!fs.existsSync(file)) return fallback;
 
-    return JSON.parse(
-      fs.readFileSync(
-        file,
-        "utf8"
-      )
-    );
-  } catch (error) {
-    console.log(
-      "Erreur lecture JSON :",
-      error.message
-    );
+    const content = fs.readFileSync(file, "utf8");
 
+    if (!content.trim()) return fallback;
+
+    return JSON.parse(content);
+  } catch {
     return fallback;
   }
 }
@@ -294,160 +282,83 @@ function writeJson(file, data) {
   try {
     fs.writeFileSync(
       file,
-      JSON.stringify(
-        data,
-        null,
-        2
-      )
+      JSON.stringify(data, null, 2),
+      "utf8"
     );
-  } catch (error) {
-    console.log(
-      "Erreur écriture JSON :",
-      error.message
-    );
+  } catch (err) {
+    console.error("Erreur écriture JSON:", err.message);
   }
 }
 
-function appendJsonLine(file, data) {
-  try {
-    fs.appendFileSync(
-      file,
-      JSON.stringify(data) + "\n"
-    );
-  } catch (error) {
-    console.log(
-      "Erreur historique :",
-      error.message
-    );
-  }
+function saveTrade(trade) {
+  const trades = readJson(TRADES_FILE, []);
+  trades.push(trade);
+
+  writeJson(TRADES_FILE, trades);
 }
 
-/* =========================================================
-   PARSING PUBKEY
-========================================================= */
+function saveCrash(report) {
+  const crashes = readJson(CRASH_FILE, []);
+  crashes.push(report);
 
-function readPubkey(
-  buffer,
-  offset
-) {
-  if (
-    !buffer ||
-    buffer.length <
-      offset + 32
-  ) {
-    return null;
-  }
-
-  try {
-    return new PublicKey(
-      buffer.subarray(
-        offset,
-        offset + 32
-      )
-    ).toBase58();
-  } catch (_) {
-    return null;
-  }
+  writeJson(CRASH_FILE, crashes);
 }
 
-/* =========================================================
-   I128
-========================================================= */
+// ============================================================
+// HISTORIQUE
+// ============================================================
 
-function readI128LE(
-  buffer,
-  offset
-) {
-  try {
-    if (
-      buffer.length <
-      offset + 16
-    ) {
-      return 0;
+function addHistory(point) {
+  history.push(point);
+
+  const cutoff = now() - 120000;
+
+  history = history.filter(p => p.ts >= cutoff);
+
+  appendJsonl(MARKET_FILE, point);
+}
+
+function pointAgo(ms) {
+  const target = now() - ms;
+
+  if (!history.length) return null;
+
+  let closest = null;
+  let distance = Infinity;
+
+  for (const p of history) {
+    const d = Math.abs(p.ts - target);
+
+    if (d < distance) {
+      distance = d;
+      closest = p;
     }
-
-    const low =
-      buffer.readBigUInt64LE(
-        offset
-      );
-
-    const high =
-      buffer.readBigInt64LE(
-        offset + 8
-      );
-
-    const value =
-      high *
-        18446744073709551616n +
-      BigInt(low);
-
-    return Number(value);
-  } catch (_) {
-    return 0;
   }
+
+  if (distance > Math.max(ms * 0.5, 5000)) {
+    return null;
+  }
+
+  return closest;
 }
 
-/* =========================================================
-   PARSER POOL
-========================================================= */
-
-function parsePool(
-  address,
-  rawData
-) {
-  const buffer =
-    Buffer.from(rawData);
-
-  return {
-    pool: address,
-
-    dataLength:
-      buffer.length,
-
-    baseMint:
-      readPubkey(
-        buffer,
-        POOL_BASE_MINT_OFFSET
-      ),
-
-    quoteMint:
-      readPubkey(
-        buffer,
-        POOL_QUOTE_MINT_OFFSET
-      ),
-
-    baseVault:
-      readPubkey(
-        buffer,
-        POOL_BASE_VAULT_OFFSET
-      ),
-
-    quoteVault:
-      readPubkey(
-        buffer,
-        POOL_QUOTE_VAULT_OFFSET
-      ),
-
-    virtualQuote:
-      readI128LE(
-        buffer,
-        POOL_VIRTUAL_QUOTE_OFFSET
-      ),
-  };
+function getPointAgo(ms) {
+  return pointAgo(ms);
 }
 
-/* =========================================================
-   DEXSCREENER
-========================================================= */
+// ============================================================
+// DEXSCREENER
+// ============================================================
 
-async function getDexMarkets(
-  mint
-) {
+async function fetchDexTokenPairs(mint) {
   const url =
     `https://api.dexscreener.com/latest/dex/tokens/${mint}`;
 
-  const response =
-    await fetch(url);
+  const response = await fetch(url, {
+    headers: {
+      accept: "application/json",
+    },
+  });
 
   if (!response.ok) {
     throw new Error(
@@ -455,3045 +366,2623 @@ async function getDexMarkets(
     );
   }
 
-  const json =
-    await response.json();
+  const json = await response.json();
 
-  return Array.isArray(
-    json.pairs
-  )
+  return Array.isArray(json.pairs)
     ? json.pairs
     : [];
 }
 
-/* =========================================================
-   RECHERCHE DU MARCHE PUMPSWAP
-========================================================= */
+function isPumpSwapPair(pair, mint) {
+  if (!pair) return false;
 
-async function findDexPumpSwapPair(
-  mint
-) {
-  console.log("");
-  console.log(
-    "========================================"
-  );
-  console.log(
-    "🔎 RECHERCHE MARCHÉ VIA DEXSCREENER"
-  );
-  console.log(
-    "Token :",
-    mint
-  );
-  console.log(
-    "========================================"
-  );
+  const dexId =
+    String(pair.dexId || "").toLowerCase();
 
-  const pairs =
-    await getDexMarkets(
-      mint
-    );
+  const base =
+    pair.baseToken?.address || "";
 
-  console.log(
-    "Marchés trouvés :",
-    pairs.length
-  );
+  const quote =
+    pair.quoteToken?.address || "";
 
-  if (!pairs.length) {
-    return {
-      status: "NO_MARKET",
-      pair: null,
-      pairs: [],
-    };
+  const dexLooksPumpSwap =
+    dexId === "pumpswap" ||
+    dexId === "pump_amm" ||
+    dexId === "pumpamm" ||
+    dexId.includes("pump");
+
+  if (!dexLooksPumpSwap) {
+    return false;
   }
 
-  const pumpPairs =
-    pairs.filter(
-      (pair) =>
-        pair &&
-        pair.dexId ===
-          "pump_amm" &&
-        pair.baseToken &&
-        pair.baseToken.address ===
-          mint &&
-        pair.pairAddress
-    );
-
-  console.log(
-    "Marchés PumpSwap trouvés :",
-    pumpPairs.length
-  );
-
-  /*
-    Affichage de tous les marchés.
-    Cela nous permettra de voir si un token
-    n'est pas encore sur PumpSwap.
-  */
-
-  for (
-    let i = 0;
-    i < pairs.length;
-    i++
-  ) {
-    const pair =
-      pairs[i];
-
-    console.log(
-      `Marché #${i + 1}`
-    );
-
-    console.log(
-      "DEX :",
-      pair?.dexId || "N/A"
-    );
-
-    console.log(
-      "Pair :",
-      pair?.pairAddress || "N/A"
-    );
-
-    console.log(
-      "Quote :",
-      pair?.quoteToken?.symbol ||
-        pair?.quoteToken?.address ||
-        "N/A"
-    );
-
-    console.log(
-      "Liquidity :",
-      pair?.liquidity?.usd || 0
-    );
-  }
-
-  if (!pumpPairs.length) {
-    return {
-      status: "NO_PUMPSWAP",
-      pair: null,
-      pairs,
-    };
-  }
-
-  /*
-    On prend la paire PumpSwap ayant
-    la plus grosse liquidité USD.
-  */
-
-  pumpPairs.sort(
-    (a, b) =>
-      Number(
-        b.liquidity?.usd || 0
-      ) -
-      Number(
-        a.liquidity?.usd || 0
-      )
-  );
-
-  return {
-    status: "FOUND",
-    pair: pumpPairs[0],
-    pairs,
-  };
+  return base === mint || quote === mint;
 }
 
-/* =========================================================
-   VERIFICATION DIRECTE DU POOL
-========================================================= */
-
-async function verifyPoolAddress(
-  pairAddress,
-  mint
-) {
-  console.log("");
-  console.log(
-    "🔗 VÉRIFICATION DIRECTE DU POOL"
+function chooseBestPumpSwapPair(pairs, mint) {
+  const candidates = pairs.filter(pair =>
+    isPumpSwapPair(pair, mint)
   );
 
-  console.log(
-    "Pair address :",
-    pairAddress
-  );
-
-  let poolPubkey;
-
-  try {
-    poolPubkey =
-      new PublicKey(
-        pairAddress
-      );
-  } catch (error) {
-    return {
-      ok: false,
-      reason:
-        "pairAddress invalide",
-    };
+  if (!candidates.length) {
+    return null;
   }
 
-  let account;
+  candidates.sort((a, b) => {
+    const la =
+      Number(a.liquidity?.usd || 0);
 
-  try {
-    account =
-      await connection.getAccountInfo(
-        poolPubkey,
-        "processed"
-      );
-  } catch (error) {
-    return {
-      ok: false,
-      reason:
-        `RPC getAccountInfo : ${error.message}`,
-    };
-  }
+    const lb =
+      Number(b.liquidity?.usd || 0);
 
-  if (!account) {
-    return {
-      ok: false,
-      reason:
-        "le compte du pair n'existe pas sur Solana",
-    };
-  }
+    return lb - la;
+  });
 
-  console.log(
-    "Owner :",
-    account.owner.toBase58()
-  );
-
-  if (
-    !account.owner.equals(
-      PUMPSWAP_PROGRAM_ID
-    )
-  ) {
-    return {
-      ok: false,
-      reason:
-        "le compte n'est pas possédé par PumpSwap",
-    };
-  }
-
-  const parsed =
-    parsePool(
-      pairAddress,
-      account.data
-    );
-
-  console.log(
-    "Taille compte :",
-    parsed.dataLength
-  );
-
-  console.log(
-    "Base mint :",
-    parsed.baseMint
-  );
-
-  console.log(
-    "Quote mint :",
-    parsed.quoteMint
-  );
-
-  console.log(
-    "Base vault :",
-    parsed.baseVault
-  );
-
-  console.log(
-    "Quote vault :",
-    parsed.quoteVault
-  );
-
-  console.log(
-    "Virtual quote :",
-    parsed.virtualQuote
-  );
-
-  if (
-    parsed.baseMint !==
-    mint
-  ) {
-    return {
-      ok: false,
-      reason:
-        "base mint du pool différent du token",
-      parsed,
-    };
-  }
-
-  if (
-    parsed.quoteMint !==
-    WSOL_MINT
-  ) {
-    return {
-      ok: false,
-      reason:
-        "quote mint différent de WSOL",
-      parsed,
-    };
-  }
-
-  if (
-    !parsed.baseVault ||
-    !parsed.quoteVault
-  ) {
-    return {
-      ok: false,
-      reason:
-        "vault manquant",
-      parsed,
-    };
-  }
-
-  /*
-    Vérification des vaults.
-  */
-
-  let baseBalance;
-
-  let quoteBalance;
-
-  try {
-    const result =
-      await connection.getTokenAccountBalance(
-        new PublicKey(
-          parsed.baseVault
-        ),
-        "processed"
-      );
-
-    baseBalance =
-      Number(
-        result.value.amount
-      ) /
-      Math.pow(
-        10,
-        result.value.decimals
-      );
-  } catch (error) {
-    return {
-      ok: false,
-      reason:
-        `vault base illisible : ${error.message}`,
-      parsed,
-    };
-  }
-
-  try {
-    const result =
-      await connection.getTokenAccountBalance(
-        new PublicKey(
-          parsed.quoteVault
-        ),
-        "processed"
-      );
-
-    quoteBalance =
-      Number(
-        result.value.amount
-      ) /
-      Math.pow(
-        10,
-        result.value.decimals
-      );
-  } catch (error) {
-    return {
-      ok: false,
-      reason:
-        `vault quote illisible : ${error.message}`,
-      parsed,
-    };
-  }
-
-  const virtualQuoteSol =
-    parsed.virtualQuote /
-    1e9;
-
-  const effectiveQuote =
-    quoteBalance +
-    virtualQuoteSol;
-
-  console.log(
-    "Réserve quote :",
-    quoteBalance,
-    "SOL"
-  );
-
-  console.log(
-    "Virtual quote :",
-    virtualQuoteSol,
-    "SOL"
-  );
-
-  console.log(
-    "Réserve effective :",
-    effectiveQuote,
-    "SOL"
-  );
-
-  if (
-    !Number.isFinite(
-      effectiveQuote
-    ) ||
-    effectiveQuote <= 0
-  ) {
-    return {
-      ok: false,
-      reason:
-        "réserve SOL effective invalide",
-      parsed,
-    };
-  }
-
-  return {
-    ok: true,
-
-    pool: pairAddress,
-
-    baseMint:
-      parsed.baseMint,
-
-    quoteMint:
-      parsed.quoteMint,
-
-    baseVault:
-      parsed.baseVault,
-
-    quoteVault:
-      parsed.quoteVault,
-
-    virtualQuote:
-      parsed.virtualQuote,
-
-    baseBalance,
-
-    quoteBalance,
-
-    effectiveQuote,
-  };
+  return candidates[0];
 }
 
-/* =========================================================
-   DECOUVERTE COMPLETE DU POOL
-========================================================= */
+async function discoverPumpSwapFromDex(mint) {
+  console.log("\n🔎 DexScreener : recherche des marchés...");
 
-async function discoverPool(
-  mint
-) {
-  const market =
-    await findDexPumpSwapPair(
-      mint
-    );
+  try {
+    const pairs = await fetchDexTokenPairs(mint);
 
-  if (
-    market.status ===
-    "NO_MARKET"
-  ) {
-    return {
-      ok: false,
-      status: "NO_MARKET",
-      reason:
-        "aucun marché trouvé sur DexScreener",
-    };
-  }
-
-  if (
-    market.status ===
-    "NO_PUMPSWAP"
-  ) {
-    return {
-      ok: false,
-      status: "NO_PUMPSWAP",
-      reason:
-        "aucun marché PumpSwap trouvé",
-      pairs:
-        market.pairs,
-    };
-  }
-
-  /*
-    Il peut y avoir plusieurs marchés PumpSwap.
-    On essaie chacun jusqu'à trouver un pool
-    directement confirmé sur Solana.
-  */
-
-  const candidates =
-    market.pairs
-      .filter(
-        (pair) =>
-          pair &&
-          pair.dexId ===
-            "pump_amm" &&
-          pair.baseToken &&
-          pair.baseToken.address ===
-            mint &&
-          pair.pairAddress
-      )
-      .sort(
-        (a, b) =>
-          Number(
-            b.liquidity?.usd || 0
-          ) -
-          Number(
-            a.liquidity?.usd || 0
-          )
-      );
-
-  for (
-    let i = 0;
-    i < candidates.length;
-    i++
-  ) {
-    const pair =
-      candidates[i];
-
-    console.log("");
-    console.log(
-      `🔎 CANDIDAT PUMPSWAP #${i + 1}`
-    );
+    cachedDexPairs = pairs;
+    lastDexFetch = now();
 
     console.log(
-      "Pair :",
-      pair.pairAddress
+      `📊 DexScreener : ${pairs.length} paire(s) trouvée(s)`
     );
 
-    console.log(
-      "Liquidité Dex :",
-      formatUsd(
-        Number(
-          pair.liquidity?.usd || 0
-        )
-      )
+    if (pairs.length) {
+      for (const [i, pair] of pairs.slice(0, 10).entries()) {
+        console.log(
+          `${i + 1}. dex=${pair.dexId} ` +
+          `pair=${shortAddress(pair.pairAddress)} ` +
+          `liq=${usd(Number(pair.liquidity?.usd || 0))}`
+        );
+      }
+    }
+
+    const pumpPairs = pairs.filter(pair =>
+      isPumpSwapPair(pair, mint)
     );
 
-    const verified =
-      await verifyPoolAddress(
-        pair.pairAddress,
-        mint
-      );
-
-    if (verified.ok) {
+    if (!pumpPairs.length) {
       return {
-        ...verified,
-
-        dexPair: pair,
+        pair: null,
+        allPairs: pairs,
       };
     }
 
-    console.log(
-      "❌ Pool rejeté :",
-      verified.reason
-    );
-  }
-
-  return {
-    ok: false,
-    status: "NO_VALID_POOL",
-    reason:
-      "aucun marché PumpSwap n'a pu être confirmé directement sur Solana",
-  };
-}
-
-/* =========================================================
-   MARKET DATA
-========================================================= */
-
-async function getMarketData(
-  mint
-) {
-  const market =
-    await findDexPumpSwapPair(
+    const best = chooseBestPumpSwapPair(
+      pumpPairs,
       mint
     );
 
+    return {
+      pair: best,
+      allPairs: pairs,
+    };
+
+  } catch (err) {
+    console.error(
+      "❌ DexScreener erreur:",
+      err.message
+    );
+
+    return {
+      pair: null,
+      allPairs: [],
+      error: err.message,
+    };
+  }
+}
+
+// ============================================================
+// LECTURE POOL PUMPSWAP
+// ============================================================
+
+function readPubkey(data, offset) {
+  if (!data || data.length < offset + 32) {
+    return null;
+  }
+
+  try {
+    return new PublicKey(
+      data.subarray(offset, offset + 32)
+    );
+  } catch {
+    return null;
+  }
+}
+
+function parsePoolAccount(pubkey, accountInfo) {
+  if (!accountInfo?.data) {
+    return null;
+  }
+
+  const data = Buffer.from(accountInfo.data);
+
+  if (data.length < 203) {
+    return null;
+  }
+
+  const baseMint = readPubkey(
+    data,
+    OFF.baseMint
+  );
+
+  const quoteMint = readPubkey(
+    data,
+    OFF.quoteMint
+  );
+
+  const baseVault = readPubkey(
+    data,
+    OFF.baseVault
+  );
+
+  const quoteVault = readPubkey(
+    data,
+    OFF.quoteVault
+  );
+
   if (
-    market.status !==
-    "FOUND"
+    !baseMint ||
+    !quoteMint ||
+    !baseVault ||
+    !quoteVault
   ) {
     return null;
   }
 
-  const pair =
-    market.pair;
-
   return {
-    price:
-      Number(
-        pair.priceUsd || 0
-      ),
+    address: pubkey,
+    dataLength: data.length,
 
-    liquidity:
-      Number(
-        pair.liquidity?.usd || 0
-      ),
+    baseMint,
+    quoteMint,
 
-    pairAddress:
-      pair.pairAddress ||
-      null,
+    baseVault,
+    quoteVault,
 
-    volume24h:
-      Number(
-        pair.volume?.h24 || 0
-      ),
+    coinCreator:
+      readPubkey(data, OFF.coinCreator),
 
-    buys5m:
-      Number(
-        pair.txns?.m5?.buys || 0
-      ),
-
-    sells5m:
-      Number(
-        pair.txns?.m5?.sells || 0
-      ),
+    lpSupply:
+      data.length >= 211
+        ? data.readBigUInt64LE(OFF.lpSupply)
+        : 0n,
   };
 }
 
-/* =========================================================
-   HISTORIQUE MARCHE
-========================================================= */
+// ============================================================
+// VALIDATION POOL
+// ============================================================
 
-function addMarketPoint(
-  data
-) {
-  const point = {
-    timestamp:
-      now(),
+async function readVaultSol(vault) {
+  try {
+    const balance =
+      await connection.getBalance(
+        vault,
+        "processed"
+      );
 
-    price:
-      data.price,
-
-    liquidity:
-      data.liquidity,
-
-    pairAddress:
-      data.pairAddress,
-
-    volume24h:
-      data.volume24h,
-
-    buys5m:
-      data.buys5m,
-
-    sells5m:
-      data.sells5m,
-  };
-
-  marketHistory.push(
-    point
-  );
-
-  const cutoff =
-    now() - 120000;
-
-  marketHistory =
-    marketHistory.filter(
-      (item) =>
-        item.timestamp >=
-        cutoff
+    return balance / 1e9;
+  } catch (err) {
+    console.error(
+      "Vault SOL error:",
+      err.message
     );
 
-  appendJsonLine(
-    MARKET_FILE,
-    {
-      mint: tokenMint,
-      ...point,
-    }
-  );
+    return null;
+  }
 }
 
-function getPointAgo(
-  milliseconds
-) {
-  const target =
-    now() -
-    milliseconds;
+async function readTokenVault(vault) {
+  try {
+    const result =
+      await connection.getTokenAccountBalance(
+        vault,
+        "processed"
+      );
 
-  for (
-    let i =
-      marketHistory.length - 1;
-    i >= 0;
-    i--
-  ) {
+    return Number(
+      result.value.uiAmount || 0
+    );
+  } catch (err) {
+    console.error(
+      "Token vault error:",
+      err.message
+    );
+
+    return null;
+  }
+}
+
+async function validatePool(pool) {
+  if (!pool) {
+    return {
+      valid: false,
+      reason: "pool_null",
+    };
+  }
+
+  try {
+    const account =
+      await connection.getAccountInfo(
+        pool.address,
+        "processed"
+      );
+
+    if (!account) {
+      return {
+        valid: false,
+        reason: "pool_account_not_found",
+      };
+    }
+
+    if (!account.owner.equals(
+      PUMPSWAP_PROGRAM_ID
+    )) {
+      return {
+        valid: false,
+        reason:
+          `owner_incorrect_${account.owner.toBase58()}`,
+      };
+    }
+
+    const parsed =
+      parsePoolAccount(
+        pool.address,
+        account
+      );
+
+    if (!parsed) {
+      return {
+        valid: false,
+        reason: "pool_layout_invalid",
+      };
+    }
+
+    const tokenMint =
+      new PublicKey(tokenMintGlobal);
+
+    const baseIsToken =
+      parsed.baseMint.equals(tokenMint);
+
+    const quoteIsToken =
+      parsed.quoteMint.equals(tokenMint);
+
+    const baseIsWsol =
+      parsed.baseMint.equals(WSOL_MINT);
+
+    const quoteIsWsol =
+      parsed.quoteMint.equals(WSOL_MINT);
+
     if (
-      marketHistory[i]
-        .timestamp <= target
+      !(
+        (baseIsToken && quoteIsWsol) ||
+        (quoteIsToken && baseIsWsol)
+      )
     ) {
-      return marketHistory[i];
+      return {
+        valid: false,
+        reason:
+          "pool_not_token_wsol_pair",
+        details: {
+          base: parsed.baseMint.toBase58(),
+          quote: parsed.quoteMint.toBase58(),
+        },
+      };
+    }
+
+    let wsolVault;
+    let tokenVault;
+
+    if (baseIsWsol) {
+      wsolVault = parsed.baseVault;
+      tokenVault = parsed.quoteVault;
+    } else {
+      wsolVault = parsed.quoteVault;
+      tokenVault = parsed.baseVault;
+    }
+
+    const [solReserve, tokenReserve] =
+      await Promise.all([
+        readVaultSol(wsolVault),
+        readTokenVault(tokenVault),
+      ]);
+
+    if (
+      solReserve === null ||
+      tokenReserve === null
+    ) {
+      return {
+        valid: false,
+        reason: "vault_read_failed",
+      };
+    }
+
+    return {
+      valid: true,
+
+      address: parsed.address,
+
+      baseMint: parsed.baseMint,
+      quoteMint: parsed.quoteMint,
+
+      baseVault: parsed.baseVault,
+      quoteVault: parsed.quoteVault,
+
+      wsolVault,
+      tokenVault,
+
+      solReserve,
+      tokenReserve,
+
+      dataLength: parsed.dataLength,
+
+      owner: account.owner,
+    };
+
+  } catch (err) {
+    return {
+      valid: false,
+      reason: err.message,
+    };
+  }
+}
+
+// ============================================================
+// DÉCOUVERTE DIRECTE ON-CHAIN
+// ============================================================
+
+async function discoverPoolsOnchain(mint) {
+  console.log(
+    "\n🔍 Recherche directe dans PumpSwap..."
+  );
+
+  const candidates = [];
+
+  async function searchOffset(offset) {
+    try {
+      const accounts =
+        await connection.getProgramAccounts(
+          PUMPSWAP_PROGRAM_ID,
+          {
+            commitment: "processed",
+
+            filters: [
+              {
+                memcmp: {
+                  offset,
+                  bytes: mint,
+                },
+              },
+            ],
+          }
+        );
+
+      console.log(
+        `📡 Offset ${offset}: ${accounts.length} compte(s)`
+      );
+
+      for (const account of accounts) {
+        const parsed =
+          parsePoolAccount(
+            account.pubkey,
+            account.account
+          );
+
+        if (!parsed) continue;
+
+        const base =
+          parsed.baseMint.toBase58();
+
+        const quote =
+          parsed.quoteMint.toBase58();
+
+        const isPair =
+          (
+            base === mint &&
+            quote === WSOL_MINT.toBase58()
+          ) ||
+          (
+            quote === mint &&
+            base === WSOL_MINT.toBase58()
+          );
+
+        if (!isPair) continue;
+
+        candidates.push(parsed);
+      }
+
+    } catch (err) {
+      console.error(
+        `❌ Recherche offset ${offset}:`,
+        err.message
+      );
+    }
+  }
+
+  // Les deux orientations possibles.
+  await Promise.all([
+    searchOffset(OFF.baseMint),
+    searchOffset(OFF.quoteMint),
+  ]);
+
+  // Supprimer doublons
+  const unique = [];
+
+  const seen = new Set();
+
+  for (const candidate of candidates) {
+    const key =
+      candidate.address.toBase58();
+
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    unique.push(candidate);
+  }
+
+  console.log(
+    `🧩 Pools SOL/token trouvés on-chain: ${unique.length}`
+  );
+
+  if (!unique.length) {
+    return null;
+  }
+
+  // Chercher le pool avec le plus de SOL.
+  const evaluated = [];
+
+  for (const candidate of unique) {
+    try {
+      const baseIsWsol =
+        candidate.baseMint.equals(WSOL_MINT);
+
+      const wsolVault =
+        baseIsWsol
+          ? candidate.baseVault
+          : candidate.quoteVault;
+
+      const tokenVault =
+        baseIsWsol
+          ? candidate.quoteVault
+          : candidate.baseVault;
+
+      const [solReserve, tokenReserve] =
+        await Promise.all([
+          readVaultSol(wsolVault),
+          readTokenVault(tokenVault),
+        ]);
+
+      if (
+        solReserve === null ||
+        tokenReserve === null
+      ) {
+        continue;
+      }
+
+      evaluated.push({
+        ...candidate,
+
+        wsolVault,
+        tokenVault,
+
+        solReserve,
+        tokenReserve,
+      });
+
+    } catch (err) {
+      console.error(
+        "Pool evaluation error:",
+        err.message
+      );
+    }
+  }
+
+  evaluated.sort(
+    (a, b) =>
+      b.solReserve - a.solReserve
+  );
+
+  return evaluated[0] || null;
+}
+
+// ============================================================
+// DISCOVERY V5.7
+// ============================================================
+
+let tokenMintGlobal = null;
+
+async function discoverMarket(mint) {
+  tokenMintGlobal = mint;
+
+  console.log("\n=================================");
+  console.log("🔎 V5.7 DISCOVERY");
+  console.log("Token:", mint);
+  console.log("=================================\n");
+
+  // ----------------------------------------------------------
+  // ÉTAPE 1 : DexScreener
+  // ----------------------------------------------------------
+
+  const dexResult =
+    await discoverPumpSwapFromDex(mint);
+
+  if (dexResult.pair) {
+
+    const pair = dexResult.pair;
+
+    console.log(
+      "\n🟢 PumpSwap trouvé via DexScreener"
+    );
+
+    console.log(
+      "DEX:",
+      pair.dexId
+    );
+
+    console.log(
+      "Pair:",
+      pair.pairAddress
+    );
+
+    console.log(
+      "Liquidity:",
+      usd(Number(pair.liquidity?.usd || 0))
+    );
+
+    const poolAddress =
+      pair.pairAddress;
+
+    try {
+      const poolPubkey =
+        new PublicKey(poolAddress);
+
+      const poolAccount =
+        await connection.getAccountInfo(
+          poolPubkey,
+          "processed"
+        );
+
+      if (poolAccount) {
+
+        if (
+          poolAccount.owner.equals(
+            PUMPSWAP_PROGRAM_ID
+          )
+        ) {
+
+          const parsed =
+            parsePoolAccount(
+              poolPubkey,
+              poolAccount
+            );
+
+          if (parsed) {
+
+            const validation =
+              await validatePool(parsed);
+
+            if (validation.valid) {
+
+              console.log(
+                "\n✅ Pool DexScreener confirmé on-chain"
+              );
+
+              return {
+                dexPair: pair,
+                pool: validation,
+                source: "dexscreener",
+              };
+            }
+
+            console.log(
+              "⚠️ Pair DexScreener refusée:",
+              validation.reason
+            );
+
+          } else {
+            console.log(
+              "⚠️ Impossible de décoder le compte Pool"
+            );
+          }
+
+        } else {
+          console.log(
+            "⚠️ PairAddress DexScreener n'est pas un compte PumpSwap"
+          );
+        }
+
+      } else {
+        console.log(
+          "⚠️ PairAddress introuvable on-chain"
+        );
+      }
+
+    } catch (err) {
+      console.log(
+        "⚠️ Vérification pair Dex error:",
+        err.message
+      );
+    }
+  }
+
+  // ----------------------------------------------------------
+  // ÉTAPE 2 : recherche directe PumpSwap
+  // ----------------------------------------------------------
+
+  console.log(
+    "\n🔄 Fallback direct PumpSwap..."
+  );
+
+  const directPool =
+    await discoverPoolsOnchain(mint);
+
+  if (directPool) {
+
+    const validation =
+      await validatePool(directPool);
+
+    if (validation.valid) {
+
+      console.log(
+        "\n✅ Pool PumpSwap trouvé directement on-chain"
+      );
+
+      console.log(
+        "Pool:",
+        validation.address.toBase58()
+      );
+
+      return {
+        dexPair: null,
+
+        pool: validation,
+
+        source: "onchain",
+      };
+    }
+  }
+
+  // ----------------------------------------------------------
+  // Aucun marché
+  // ----------------------------------------------------------
+
+  console.log(
+    "\n❌ Aucun marché PumpSwap valide"
+  );
+
+  const allPairs =
+    dexResult.allPairs || [];
+
+  if (!allPairs.length) {
+
+    console.log(
+      "🟡 DexScreener ne renvoie aucune paire."
+    );
+
+  } else {
+
+    console.log(
+      "\n📋 Marchés trouvés:"
+    );
+
+    for (const pair of allPairs.slice(0, 10)) {
+
+      console.log(
+        `- ${pair.dexId || "unknown"} ` +
+        `${shortAddress(pair.pairAddress)}`
+      );
     }
   }
 
   return null;
 }
 
-/* =========================================================
-   SCORE
-========================================================= */
+// ============================================================
+// MARKET DATA
+// ============================================================
 
-function calculateHealthScore(
-  data
-) {
-  let score = 100;
+async function readCurrentPoolData() {
+  if (!poolInfo) return null;
 
-  const p10 =
-    pct(
-      data.price,
-      getPointAgo(10000)
-        ?.price
-    );
-
-  const l10 =
-    pct(
-      data.liquidity,
-      getPointAgo(10000)
-        ?.liquidity
-    );
-
-  const l30 =
-    pct(
-      data.liquidity,
-      getPointAgo(30000)
-        ?.liquidity
-    );
+  const [
+    solReserve,
+    tokenReserve
+  ] = await Promise.all([
+    readVaultSol(poolInfo.wsolVault),
+    readTokenVault(poolInfo.tokenVault),
+  ]);
 
   if (
-    data.liquidity <
-    MIN_LIQUIDITY_USD
+    solReserve === null ||
+    tokenReserve === null
   ) {
-    score -= 40;
-  } else if (
-    data.liquidity <
-    MIN_LIQUIDITY_USD * 2
-  ) {
-    score -= 10;
-  }
-
-  if (p10 <= -4) {
-    score -= 20;
-  }
-
-  if (p10 <= -8) {
-    score -= 20;
-  }
-
-  if (l10 <= -10) {
-    score -= 20;
-  }
-
-  if (l10 <= -20) {
-    score -= 20;
-  }
-
-  if (l30 <= -15) {
-    score -= 20;
-  }
-
-  const buys =
-    Number(
-      data.buys5m || 0
-    );
-
-  const sells =
-    Number(
-      data.sells5m || 0
-    );
-
-  if (
-    sells >
-      buys * 1.5 &&
-    sells > 20
-  ) {
-    score -= 10;
+    return null;
   }
 
   if (
-    buys >
-      sells * 1.5 &&
-    buys > 20
+    solReserve <= 0 ||
+    tokenReserve <= 0
   ) {
-    score += 5;
+    return {
+      liquidityUsd: 0,
+      solReserve,
+      tokenReserve,
+      price: 0,
+    };
   }
 
-  return clamp(
-    Math.round(score),
-    0,
-    100
-  );
-}
+  // Estimation SOL/USD depuis DexScreener
+  let solUsd = 0;
 
-/* =========================================================
-   CRASH
-========================================================= */
+  if (dexPair?.priceNative) {
+    const tokenPriceNative =
+      Number(dexPair.priceNative || 0);
 
-function getCrashSignals(
-  data
-) {
-  const reasons = [];
+    const tokenPriceUsd =
+      Number(dexPair.priceUsd || 0);
 
-  const p10 =
-    pct(
-      data.price,
-      getPointAgo(10000)
-        ?.price
-    );
-
-  const l10 =
-    pct(
-      data.liquidity,
-      getPointAgo(10000)
-        ?.liquidity
-    );
-
-  if (
-    data.liquidity <=
-    CRASH_MIN_LIQUIDITY
-  ) {
-    reasons.push(
-      "liquidité quasi nulle"
-    );
+    if (
+      tokenPriceNative > 0 &&
+      tokenPriceUsd > 0
+    ) {
+      solUsd =
+        tokenPriceUsd /
+        tokenPriceNative;
+    }
   }
 
+  // Si DexScreener n'a pas le prix,
+  // on utilise le dernier prix connu.
   if (
-    l10 <=
-    CRASH_LIQUIDITY_10S
+    !Number.isFinite(solUsd) ||
+    solUsd <= 0
   ) {
-    reasons.push(
-      `liquidité ${l10.toFixed(2)}% / 10s`
-    );
+    if (
+      lastMarket?.solUsd &&
+      lastMarket.solUsd > 0
+    ) {
+      solUsd = lastMarket.solUsd;
+    }
   }
 
   if (
-    p10 <=
-    CRASH_PRICE_10S
+    !Number.isFinite(solUsd) ||
+    solUsd <= 0
   ) {
-    reasons.push(
-      `prix ${p10.toFixed(2)}% / 10s`
-    );
+    return null;
   }
+
+  const price =
+    (solReserve / tokenReserve) *
+    solUsd;
+
+  const liquidityUsd =
+    solReserve *
+    solUsd *
+    2;
 
   return {
-    crash:
-      reasons.length > 0,
-
-    reasons,
-
-    p10,
-
-    l10,
+    price,
+    liquidityUsd,
+    solReserve,
+    tokenReserve,
+    solUsd,
   };
 }
 
-/* =========================================================
-   ENTREE
-========================================================= */
+async function refreshDexPair() {
+  if (!tokenMint) return;
 
-function entryCheck(
-  data
-) {
+  try {
+    const pairs =
+      await fetchDexTokenPairs(
+        tokenMint
+      );
+
+    cachedDexPairs = pairs;
+    lastDexFetch = now();
+
+    const best =
+      chooseBestPumpSwapPair(
+        pairs,
+        tokenMint
+      );
+
+    if (best) {
+      dexPair = best;
+    }
+
+  } catch (err) {
+    console.error(
+      "Dex refresh:",
+      err.message
+    );
+  }
+}
+
+async function getMarketData() {
+
+  // DexScreener n'est rafraîchi que toutes les 10 sec.
+  // Le prix/liquidité on-chain peut être lu toutes les 2 sec.
+
   if (
-    data.liquidity <
+    !lastDexFetch ||
+    now() - lastDexFetch > 10000
+  ) {
+    await refreshDexPair();
+  }
+
+  const poolData =
+    await readCurrentPoolData();
+
+  if (!poolData) {
+    return null;
+  }
+
+  const point = {
+    ts: now(),
+
+    price: poolData.price,
+
+    liquidityUsd:
+      poolData.liquidityUsd,
+
+    solReserve:
+      poolData.solReserve,
+
+    tokenReserve:
+      poolData.tokenReserve,
+
+    solUsd:
+      poolData.solUsd,
+
+    pool:
+      poolInfo?.address?.toBase58() ||
+      null,
+
+    dex:
+      dexPair?.dexId ||
+      "pumpswap",
+  };
+
+  return point;
+}
+
+// ============================================================
+// HEALTH SCORE
+// ============================================================
+
+function calculateHealthScore(point) {
+
+  if (!point) return 0;
+
+  let score = 100;
+
+  const p10 =
+    getPointAgo(10000);
+
+  const p30 =
+    getPointAgo(30000);
+
+  const p60 =
+    getPointAgo(60000);
+
+  if (p10) {
+
+    const price10 =
+      pct(
+        point.price,
+        p10.price
+      );
+
+    const liq10 =
+      pct(
+        point.liquidityUsd,
+        p10.liquidityUsd
+      );
+
+    if (price10 < -3) score -= 10;
+    if (price10 < -7) score -= 20;
+    if (price10 < -12) score -= 30;
+
+    if (liq10 < -5) score -= 10;
+    if (liq10 < -12) score -= 20;
+    if (liq10 < -25) score -= 35;
+  }
+
+  if (p30) {
+
+    const liq30 =
+      pct(
+        point.liquidityUsd,
+        p30.liquidityUsd
+      );
+
+    if (liq30 < -10) score -= 10;
+    if (liq30 < -20) score -= 25;
+    if (liq30 < -35) score -= 40;
+  }
+
+  if (p60) {
+
+    const price60 =
+      pct(
+        point.price,
+        p60.price
+      );
+
+    if (price60 < -10) score -= 10;
+    if (price60 < -20) score -= 20;
+  }
+
+  if (
+    point.liquidityUsd <
+    MIN_LIQUIDITY_USD
+  ) {
+    score -= 30;
+  }
+
+  return Math.max(
+    0,
+    Math.min(100, score)
+  );
+}
+
+// ============================================================
+// ENTRY FILTER
+// ============================================================
+
+function healthyConfirmation(point) {
+
+  const score =
+    calculateHealthScore(point);
+
+  return score >= MIN_HEALTH_SCORE;
+}
+
+function entryCheck(point) {
+
+  if (!point) {
+    return {
+      ok: false,
+      reason: "market_unavailable",
+    };
+  }
+
+  if (
+    point.liquidityUsd <
     MIN_LIQUIDITY_USD
   ) {
     return {
       ok: false,
-      reason:
-        `liquidité trop faible : ${formatUsd(data.liquidity)}`,
+      reason: "liquidity_too_low",
     };
   }
 
   const p10 =
-    pct(
-      data.price,
-      getPointAgo(10000)
-        ?.price
-    );
+    getPointAgo(10000);
 
-  const l10 =
-    pct(
-      data.liquidity,
-      getPointAgo(10000)
-        ?.liquidity
-    );
+  const p30 =
+    getPointAgo(30000);
 
-  const l30 =
-    pct(
-      data.liquidity,
-      getPointAgo(30000)
-        ?.liquidity
-    );
+  if (p10) {
 
-  if (
-    p10 <=
-    ENTRY_PRICE_10S
-  ) {
-    return {
-      ok: false,
-      reason:
-        `prix ${p10.toFixed(2)}% / 10s`,
-    };
+    const priceDrop =
+      pct(
+        point.price,
+        p10.price
+      ) / 100;
+
+    const liqDrop =
+      pct(
+        point.liquidityUsd,
+        p10.liquidityUsd
+      ) / 100;
+
+    if (
+      priceDrop <
+      ENTRY_MAX_PRICE_DROP_10S
+    ) {
+      return {
+        ok: false,
+        reason: "price_drop_10s",
+      };
+    }
+
+    if (
+      liqDrop <
+      ENTRY_MAX_LIQUIDITY_DROP_10S
+    ) {
+      return {
+        ok: false,
+        reason: "liquidity_drop_10s",
+      };
+    }
   }
 
-  if (
-    l10 <=
-    ENTRY_LIQUIDITY_10S
-  ) {
-    return {
-      ok: false,
-      reason:
-        `liquidité ${l10.toFixed(2)}% / 10s`,
-    };
+  if (p30) {
+
+    const liqDrop30 =
+      pct(
+        point.liquidityUsd,
+        p30.liquidityUsd
+      ) / 100;
+
+    if (
+      liqDrop30 <
+      ENTRY_MAX_LIQUIDITY_DROP_30S
+    ) {
+      return {
+        ok: false,
+        reason: "liquidity_drop_30s",
+      };
+    }
   }
 
-  if (
-    l30 <=
-    ENTRY_LIQUIDITY_30S
-  ) {
+  if (!healthyConfirmation(point)) {
+
     return {
       ok: false,
-      reason:
-        `liquidité ${l30.toFixed(2)}% / 30s`,
-    };
-  }
-
-  const score =
-    calculateHealthScore(
-      data
-    );
-
-  if (
-    score <
-    MIN_HEALTH_SCORE
-  ) {
-    return {
-      ok: false,
-      reason:
-        `score ${score}/100`,
+      reason: "health_score_low",
     };
   }
 
   return {
     ok: true,
-    reason: "OK",
+    reason: "healthy",
   };
 }
 
-function healthyConfirmation() {
-  if (
-    marketHistory.length <
-    REQUIRED_CONFIRMATIONS
-  ) {
-    return 0;
+// ============================================================
+// CRASH DETECTION
+// ============================================================
+
+function detectCrash(point) {
+
+  if (!point) {
+    return {
+      crash: false,
+      reason: null,
+    };
   }
 
-  const recent =
-    marketHistory.slice(
-      -REQUIRED_CONFIRMATIONS
-    );
-
-  let count = 0;
-
-  for (
-    const point of recent
+  if (
+    point.liquidityUsd <=
+    HARD_LIQUIDITY_USD
   ) {
+
+    return {
+      crash: true,
+      reason: "LIQUIDITY_NEAR_ZERO",
+    };
+  }
+
+  const p10 =
+    getPointAgo(10000);
+
+  if (p10) {
+
+    const priceDrop =
+      pct(
+        point.price,
+        p10.price
+      ) / 100;
+
+    const liqDrop =
+      pct(
+        point.liquidityUsd,
+        p10.liquidityUsd
+      ) / 100;
+
     if (
-      calculateHealthScore(
-        point
-      ) >=
-      MIN_HEALTH_SCORE
+      liqDrop <=
+      CRASH_LIQUIDITY_DROP_10S
     ) {
-      count++;
+
+      return {
+        crash: true,
+        reason:
+          "LIQUIDITY_CRASH_10S",
+        priceDrop,
+        liqDrop,
+      };
+    }
+
+    if (
+      priceDrop <=
+      CRASH_PRICE_DROP_10S
+    ) {
+
+      return {
+        crash: true,
+        reason:
+          "PRICE_CRASH_10S",
+        priceDrop,
+        liqDrop,
+      };
     }
   }
 
-  return count;
-}
-
-/* =========================================================
-   ACHAT
-========================================================= */
-
-async function simulateBuy(
-  data
-) {
-  if (currentPosition) {
-    return;
-  }
-
-  if (
-    now() <
-    observationUntil
-  ) {
-    return;
-  }
-
-  if (
-    now() >=
-    noNewBuyUntil
-  ) {
-    return;
-  }
-
-  if (!poolInfo) {
-    return;
-  }
-
-  const check =
-    entryCheck(data);
-
-  if (!check.ok) {
-    return;
-  }
-
-  const confirmations =
-    healthyConfirmation();
-
-  if (
-    confirmations <
-    REQUIRED_CONFIRMATIONS
-  ) {
-    return;
-  }
-
-  const tokens =
-    CAPITAL_USD /
-    data.price;
-
-  const targetPrice =
-    data.price *
-    (1 + TARGET_GAIN);
-
-  currentPosition = {
-    cycle:
-      cyclesCompleted + 1,
-
-    entryPrice:
-      data.price,
-
-    tokens,
-
-    capital:
-      CAPITAL_USD,
-
-    targetPrice,
-
-    entryLiquidity:
-      data.liquidity,
-
-    entryTimestamp:
-      now(),
+  return {
+    crash: false,
+    reason: null,
   };
-
-  console.log("");
-  console.log(
-    "🟢 ACHAT TEST V5.6"
-  );
-
-  console.log(
-    "Cycle :",
-    currentPosition.cycle
-  );
-
-  console.log(
-    "Token :",
-    tokenMint
-  );
-
-  console.log(
-    "Mise fixe :",
-    formatUsd(
-      CAPITAL_USD
-    )
-  );
-
-  console.log(
-    "Prix :",
-    formatPrice(
-      data.price
-    )
-  );
-
-  console.log(
-    "Tokens :",
-    tokens.toFixed(8)
-  );
-
-  console.log(
-    "Prix cible :",
-    formatPrice(
-      targetPrice
-    )
-  );
-
-  console.log(
-    "Liquidité :",
-    formatUsd(
-      data.liquidity
-    )
-  );
-
-  console.log(
-    "Score :",
-    calculateHealthScore(
-      data
-    ) + "/100"
-  );
-
-  console.log(
-    "Pool :",
-    poolInfo.pool
-  );
-
-  await telegram(
-`🟢 ACHAT TEST V5.6
-
-Token :
-${tokenMint}
-
-Cycle :
-#${currentPosition.cycle}
-
-Mise fixe :
-$${CAPITAL_USD.toFixed(4)}
-
-Prix :
-${formatPrice(data.price)}
-
-Tokens :
-${tokens.toFixed(8)}
-
-🎯 Objectif :
-+${(TARGET_GAIN * 100).toFixed(2)}%
-
-Prix cible :
-${formatPrice(targetPrice)}
-
-💧 Liquidité :
-${formatUsd(data.liquidity)}
-
-🧠 Score :
-${calculateHealthScore(data)}/100
-
-🔗 Pool PumpSwap :
-${poolInfo.pool}
-
-🧪 Simulation uniquement.`
-  );
 }
 
-/* =========================================================
-   VENTE OBJECTIF
-========================================================= */
-
-async function simulateTargetSell(
-  data
-) {
-  if (!currentPosition) {
-    return;
-  }
-
-  if (
-    data.price <
-    currentPosition.targetPrice
-  ) {
-    return;
-  }
-
-  const position =
-    currentPosition;
-
-  const exitPrice =
-    position.targetPrice;
-
-  const amount =
-    position.tokens *
-    exitPrice;
-
-  const profit =
-    amount -
-    position.capital;
-
-  cyclesCompleted++;
-
-  sessionProfit +=
-    profit;
-
-  saveTrade({
-    type:
-      "TARGET_SELL",
-
-    timestamp:
-      new Date().toISOString(),
-
-    mint:
-      tokenMint,
-
-    cycle:
-      position.cycle,
-
-    entryPrice:
-      position.entryPrice,
-
-    exitPrice,
-
-    capital:
-      position.capital,
-
-    amount,
-
-    profit,
-
-    sessionProfit,
-
-    pool:
-      poolInfo?.pool ||
-      null,
-  });
-
-  currentPosition =
-    null;
-
-  observationUntil =
-    now() +
-    OBSERVATION_AFTER_SELL_MS;
-
-  console.log("");
-  console.log(
-    "🔴 VENTE TEST V5.6"
-  );
-
-  console.log(
-    "Cycle :",
-    position.cycle
-  );
-
-  console.log(
-    "Prix vente :",
-    formatPrice(
-      exitPrice
-    )
-  );
-
-  console.log(
-    "Résultat :",
-    `+${((profit / CAPITAL_USD) * 100).toFixed(2)}%`
-  );
-
-  console.log(
-    "Bénéfice :",
-    `+$${profit.toFixed(4)}`
-  );
-
-  console.log(
-    "Cumul :",
-    `+$${sessionProfit.toFixed(4)}`
-  );
-
-  await telegram(
-`🔴 VENTE TEST V5.6
-
-Cycle :
-#${position.cycle}
-
-Token :
-${tokenMint}
-
-Prix :
-${formatPrice(exitPrice)}
-
-Montant simulé :
-$${amount.toFixed(4)}
-
-Résultat :
-+${((profit / CAPITAL_USD) * 100).toFixed(2)}%
-
-Bénéfice :
-+$${profit.toFixed(4)}
-
-💰 Bénéfices cumulés :
-+$${sessionProfit.toFixed(4)}
-
-🛡️ Observation sécurité :
-30 secondes
-
-❌ Aucun rachat immédiat.
-
-🧪 Simulation uniquement.`
-  );
-}
-
-/* =========================================================
-   SORTIE SECURITE 45 MIN
-========================================================= */
-
-async function forceSessionExit(
-  data
-) {
-  if (!currentPosition) {
-    return;
-  }
-
-  const position =
-    currentPosition;
-
-  const exitPrice =
-    data.price;
-
-  const amount =
-    position.tokens *
-    exitPrice;
-
-  const profit =
-    amount -
-    position.capital;
-
-  cyclesCompleted++;
-
-  sessionProfit +=
-    profit;
-
-  saveTrade({
-    type:
-      "SESSION_LIMIT",
-
-    timestamp:
-      new Date().toISOString(),
-
-    mint:
-      tokenMint,
-
-    cycle:
-      position.cycle,
-
-    entryPrice:
-      position.entryPrice,
-
-    exitPrice,
-
-    capital:
-      position.capital,
-
-    amount,
-
-    profit,
-
-    sessionProfit,
-
-    pool:
-      poolInfo?.pool ||
-      null,
-  });
-
-  currentPosition =
-    null;
-
-  console.log("");
-  console.log(
-    "🛑 SORTIE SECURITE 45 MIN"
-  );
-
-  console.log(
-    "Cycle :",
-    position.cycle
-  );
-
-  console.log(
-    "Prix entrée :",
-    formatPrice(
-      position.entryPrice
-    )
-  );
-
-  console.log(
-    "Prix sortie :",
-    formatPrice(
-      exitPrice
-    )
-  );
-
-  console.log(
-    "Résultat :",
-    `${((profit / CAPITAL_USD) * 100).toFixed(2)}%`
-  );
-
-  await telegram(
-`🛑 SORTIE SECURITE 45 MIN
-
-Token :
-${tokenMint}
-
-Cycle :
-#${position.cycle}
-
-Prix entrée :
-${formatPrice(position.entryPrice)}
-
-Prix sortie :
-${formatPrice(exitPrice)}
-
-Résultat :
-${((profit / CAPITAL_USD) * 100).toFixed(2)}%
-
-Résultat simulé :
-${profit >= 0 ? "+" : ""}$${profit.toFixed(4)}
-
-💰 Résultat session :
-${sessionProfit >= 0 ? "+" : ""}$${sessionProfit.toFixed(4)}
-
-⛔ Session arrêtée.
-
-🧪 Simulation uniquement.`
-  );
-}
-
-/* =========================================================
-   CRASH
-========================================================= */
-
-async function triggerCrash(
-  data,
-  crash
-) {
-  if (!running) {
-    return;
-  }
-
-  stopReason =
-    "CRASH";
-
-  const report = {
-    id:
-      `crash_${Date.now()}`,
-
-    timestamp:
-      new Date().toISOString(),
-
-    sessionStart:
-      sessionStart
-        ? new Date(
-            sessionStart
-          ).toISOString()
-        : null,
-
-    mint:
-      tokenMint,
-
-    cyclesCompleted,
-
-    sessionProfit,
-
-    crashMarket: {
-      price:
-        data.price,
-
-      liquidity:
-        data.liquidity,
-
-      priceChange10s:
-        crash.p10,
-
-      liquidityChange10s:
-        crash.l10,
-
-      score:
-        calculateHealthScore(
-          data
-        ),
-    },
-
-    reasons:
-      crash.reasons,
-
-    openPosition:
-      currentPosition,
-
-    pool:
-      poolInfo,
-  };
-
-  lastCrashReport =
-    report;
-
-  const reports =
-    readJson(
-      CRASH_FILE,
-      []
-    );
-
-  reports.push(
-    report
-  );
-
-  writeJson(
-    CRASH_FILE,
-    reports
-  );
-
-  console.log("");
-  console.log(
-    "🚨 STOP CRASH V5.6"
-  );
-
-  console.log(
-    "Prix :",
-    formatPrice(
-      data.price
-    )
-  );
-
-  console.log(
-    "Variation prix :",
-    crash.p10.toFixed(2) +
-      "%"
-  );
-
-  console.log(
-    "Liquidité :",
-    formatUsd(
-      data.liquidity
-    )
-  );
-
-  console.log(
-    "Variation liquidité :",
-    crash.l10.toFixed(2) +
-      "%"
-  );
-
-  if (currentPosition) {
-    console.log(
-      "⚠️ Position ouverte."
-    );
-
-    console.log(
-      "⚠️ Pas de liquidation fictive."
-    );
-  }
-
-  await telegram(
-`🚨 STOP CRASH - MODE TEST V5.6
-
-Token :
-${tokenMint}
-
-Prix :
-${formatPrice(data.price)}
-
-Variation prix ~10s :
-${crash.p10.toFixed(2)}%
-
-Liquidité :
-${formatUsd(data.liquidity)}
-
-Variation liquidité ~10s :
-${crash.l10.toFixed(2)}%
-
-🧠 Score :
-${calculateHealthScore(data)}/100
-
-⚠️ Signaux :
-${crash.reasons
-  .map(
-    (r) => `• ${r}`
-  )
-  .join("\n")}
-
-${
-  currentPosition
-    ? `⚠️ Position restante :
-${currentPosition.tokens}
-
-⚠️ Prix de sortie non considéré fiable.
-⚠️ Aucun bénéfice fictif ajouté.`
-    : "Aucune position ouverte."
-}
-
-⛔ NOUVEAU CYCLE BLOQUÉ
-⛔ RADAR ARRÊTÉ
-
-Cycles :
-${cyclesCompleted}
-
-💰 Bénéfices simulés :
-$${sessionProfit.toFixed(4)}
-
-🧪 Simulation uniquement.`
-  );
-
-  stopSession();
-}
-
-/* =========================================================
-   ON-CHAIN
-========================================================= */
-
-function startOnchainMonitoring() {
-  if (!poolInfo) {
-    return;
-  }
+// ============================================================
+// ON-CHAIN WEBSOCKET
+// ============================================================
+
+function closeWebSocket() {
 
   try {
-    ws =
-      new WebSocket(
-        WSS_URL
-      );
-
-    ws.on(
-      "open",
-      () => {
-        heliusConnected =
-          true;
-
-        console.log(
-          "⛓️ Helius WebSocket connecté"
-        );
-
-        subscribeAccount(
-          "base",
-          poolInfo.baseVault
-        );
-
-        subscribeAccount(
-          "quote",
-          poolInfo.quoteVault
-        );
-
-        subscribeAccount(
-          "pool",
-          poolInfo.pool
-        );
-      }
-    );
-
-    ws.on(
-      "message",
-      (raw) => {
-        try {
-          const message =
-            JSON.parse(
-              raw.toString()
-            );
-
-          handleWebSocketMessage(
-            message
-          );
-        } catch (error) {
-          console.log(
-            "Erreur message WS :",
-            error.message
-          );
-        }
-      }
-    );
-
-    ws.on(
-      "close",
-      () => {
-        heliusConnected =
-          false;
-
-        console.log(
-          "⛓️ Helius WebSocket fermé"
-        );
-      }
-    );
-
-    ws.on(
-      "error",
-      (error) => {
-        heliusConnected =
-          false;
-
-        console.log(
-          "⚠️ Helius WS :",
-          error.message
-        );
-      }
-    );
-  } catch (error) {
-    console.log(
-      "❌ Erreur démarrage WS :",
-      error.message
-    );
-  }
-}
-
-/* =========================================================
-   SUBSCRIBE
-========================================================= */
-
-function subscribeAccount(
-  type,
-  address
-) {
-  if (
-    !ws ||
-    ws.readyState !==
-      WebSocket.OPEN
-  ) {
-    return;
-  }
-
-  const id =
-    Date.now() +
-    Math.floor(
-      Math.random() * 100000
-    );
-
-  const request = {
-    jsonrpc:
-      "2.0",
-
-    id,
-
-    method:
-      "accountSubscribe",
-
-    params: [
-      address,
-      {
-        encoding:
-          "base64",
-
-        commitment:
-          "processed",
-      },
-    ],
-  };
-
-  pendingSubscriptionTypes.push(
-    type
-  );
-
-  ws.send(
-    JSON.stringify(
-      request
-    )
-  );
-}
-
-/* =========================================================
-   MESSAGE WS
-========================================================= */
-
-function handleWebSocketMessage(
-  message
-) {
-  if (
-    message.result !==
-      undefined &&
-    message.id !==
-      undefined
-  ) {
-    const type =
-      pendingSubscriptionTypes.shift();
-
-    if (type) {
-      wsSubscriptionIds[
-        type
-      ] =
-        message.result;
-
-      console.log(
-        `⛓️ Subscription ${type} :`,
-        message.result
-      );
+    if (websocket) {
+      websocket.close();
     }
+  } catch {}
 
-    return;
-  }
+  websocket = null;
 
-  if (
-    message.method !==
-    "accountNotification"
-  ) {
-    return;
-  }
-
-  const subscription =
-    message.params
-      ?.subscription;
-
-  const value =
-    message.params
-      ?.result?.value;
-
-  const context =
-    message.params
-      ?.result?.context;
-
-  if (
-    subscription ===
-      undefined ||
-    !value
-  ) {
-    return;
-  }
-
-  const data =
-    value.data;
-
-  if (
-    !Array.isArray(data) ||
-    !data[0]
-  ) {
-    return;
-  }
-
-  const raw =
-    Buffer.from(
-      data[0],
-      "base64"
-    );
-
-  let type =
-    null;
-
-  if (
-    subscription ===
-    wsSubscriptionIds.base
-  ) {
-    type = "base";
-  }
-
-  if (
-    subscription ===
-    wsSubscriptionIds.quote
-  ) {
-    type = "quote";
-  }
-
-  if (
-    subscription ===
-    wsSubscriptionIds.pool
-  ) {
-    type = "pool";
-  }
-
-  const slot =
-    Number(
-      context?.slot || 0
-    );
-
-  if (type === "base") {
-    processBaseUpdate(
-      raw,
-      slot
-    );
-  }
-
-  if (type === "quote") {
-    processQuoteUpdate(
-      raw,
-      slot
-    );
-  }
-
-  if (type === "pool") {
-    processPoolUpdate(
-      raw
-    );
-  }
-}
-
-/* =========================================================
-   TOKEN ACCOUNT BALANCE
-========================================================= */
-
-function readTokenAmount(
-  raw
-) {
-  try {
-    if (
-      raw.length < 72
-    ) {
-      return null;
-    }
-
-    return Number(
-      raw.readBigUInt64LE(
-        64
-      )
-    );
-  } catch (_) {
-    return null;
-  }
-}
-
-/* =========================================================
-   BASE
-========================================================= */
-
-function processBaseUpdate(
-  raw,
-  slot
-) {
-  const amount =
-    readTokenAmount(
-      raw
-    );
-
-  if (
-    amount === null
-  ) {
-    return;
-  }
-
-  onchainState.pendingBase = {
-    amount,
-    slot,
-    timestamp:
-      now(),
+  wsSubscriptionIds = {
+    baseVault: null,
+    quoteVault: null,
+    pool: null,
   };
 
-  tryPairOnchainChanges();
-}
-
-/* =========================================================
-   QUOTE
-========================================================= */
-
-function processQuoteUpdate(
-  raw,
-  slot
-) {
-  const amount =
-    readTokenAmount(
-      raw
-    );
-
-  if (
-    amount === null
-  ) {
-    return;
-  }
-
-  onchainState.pendingQuote = {
-    amount,
-    slot,
-    timestamp:
-      now(),
+  pendingVaultUpdates = {
+    base: null,
+    quote: null,
   };
-
-  tryPairOnchainChanges();
 }
 
-/* =========================================================
-   POOL UPDATE
-========================================================= */
-
-function processPoolUpdate(
-  raw
-) {
-  if (
-    !poolInfo
-  ) {
-    return;
-  }
+function classifyVaultChange(baseOld, baseNew, quoteOld, quoteNew) {
 
   if (
-    raw.length >=
-    POOL_VIRTUAL_QUOTE_OFFSET +
-      16
+    baseOld === null ||
+    baseNew === null ||
+    quoteOld === null ||
+    quoteNew === null
   ) {
-    const virtualQuote =
-      readI128LE(
-        raw,
-        POOL_VIRTUAL_QUOTE_OFFSET
-      );
-
-    poolInfo.virtualQuote =
-      virtualQuote;
+    return "UNKNOWN";
   }
+
+  const baseDelta =
+    baseNew - baseOld;
+
+  const quoteDelta =
+    quoteNew - quoteOld;
+
+  const baseChange =
+    Math.abs(baseDelta);
+
+  const quoteChange =
+    Math.abs(quoteDelta);
+
+  // Protection contre poussière
+  if (
+    baseChange < 0.00001 &&
+    quoteChange < 0.00001
+  ) {
+    return "TINY";
+  }
+
+  // Base = WSOL dans notre monitoring.
+  // Quote = token dans le cas classique.
+
+  // SELL token -> SOL :
+  // SOL augmente, token diminue
+  if (
+    baseDelta > 0 &&
+    quoteDelta < 0
+  ) {
+    return "SELL";
+  }
+
+  // BUY token :
+  // SOL diminue, token augmente
+  if (
+    baseDelta < 0 &&
+    quoteDelta > 0
+  ) {
+    return "BUY";
+  }
+
+  // Retrait de liquidité
+  if (
+    baseDelta < 0 &&
+    quoteDelta < 0
+  ) {
+    return "WITHDRAWAL";
+  }
+
+  // Ajout de liquidité
+  if (
+    baseDelta > 0 &&
+    quoteDelta > 0
+  ) {
+    return "DEPOSIT";
+  }
+
+  return "UNKNOWN";
 }
 
-/* =========================================================
-   EVENEMENTS ON-CHAIN
-========================================================= */
+async function processVaultPair() {
 
-function tryPairOnchainChanges() {
   const base =
-    onchainState.pendingBase;
+    pendingVaultUpdates.base;
 
   const quote =
-    onchainState.pendingQuote;
+    pendingVaultUpdates.quote;
 
   if (
-    !base ||
-    !quote
-  ) {
-    return;
-  }
-
-  const timeDiff =
-    Math.abs(
-      base.timestamp -
-        quote.timestamp
-    );
-
-  if (
-    timeDiff >
-    ONCHAIN_PAIR_WINDOW_MS
+    base === null ||
+    quote === null
   ) {
     return;
   }
 
   const previous =
-    onchainState.lastEvent;
+    previousVaultSnapshot;
 
-  if (!previous) {
-    onchainState.lastEvent = {
-      baseAmount:
-        base.amount,
-
-      quoteAmount:
-        quote.amount,
-
-      slot:
-        Math.max(
-          base.slot,
-          quote.slot
-        ),
-
-      timestamp:
-        now(),
-    };
-
-    onchainState.pendingBase =
-      null;
-
-    onchainState.pendingQuote =
-      null;
-
-    return;
-  }
-
-  const baseDelta =
-    base.amount -
-    previous.baseAmount;
-
-  const quoteDelta =
-    quote.amount -
-    previous.quoteAmount;
-
-  let type =
-    "UNKNOWN";
-
-  if (
-    baseDelta < 0 &&
-    quoteDelta > 0
-  ) {
-    type = "SELL";
-  } else if (
-    baseDelta > 0 &&
-    quoteDelta < 0
-  ) {
-    type = "BUY";
-  } else if (
-    baseDelta < 0 &&
-    quoteDelta < 0
-  ) {
-    type = "WITHDRAWAL";
-  } else if (
-    baseDelta > 0 &&
-    quoteDelta > 0
-  ) {
-    type = "ADD_LIQUIDITY";
-  }
-
-  const quoteSol =
-    Math.abs(
-      quoteDelta
-    ) / 1e9;
-
-  if (
-    type !== "UNKNOWN"
-  ) {
-    console.log("");
-    console.log(
-      "⛓️ EVENT PUMPSWAP"
-    );
-
-    console.log(
-      "Type :",
-      type
-    );
-
-    console.log(
-      "Base delta :",
-      baseDelta
-    );
-
-    console.log(
-      "Quote delta :",
-      quoteSol.toFixed(6),
-      "SOL"
-    );
-
-    console.log(
-      "Slot :",
-      Math.max(
-        base.slot,
-        quote.slot
-      )
-    );
-  }
-
-  if (
-    running &&
-    type ===
-      "WITHDRAWAL"
-  ) {
-    triggerOnchainProtection(
-      type,
-      quoteSol
-    );
-  }
-
-  if (
-    running &&
-    type ===
-      "SELL" &&
-    quoteSol >=
-      LARGE_SELL_SOL
-  ) {
-    triggerOnchainProtection(
-      type,
-      quoteSol
-    );
-  }
-
-  onchainState.lastEvent = {
-    baseAmount:
-      base.amount,
-
-    quoteAmount:
-      quote.amount,
-
-    slot:
-      Math.max(
-        base.slot,
-        quote.slot
-      ),
-
-    timestamp:
-      now(),
+  previousVaultSnapshot = {
+    base: base.sol,
+    quote: quote.tokens,
+    ts: now(),
   };
 
-  onchainState.pendingBase =
-    null;
+  pendingVaultUpdates = {
+    base: null,
+    quote: null,
+  };
 
-  onchainState.pendingQuote =
-    null;
-}
-
-/* =========================================================
-   PROTECTION ON-CHAIN
-========================================================= */
-
-async function triggerOnchainProtection(
-  type,
-  quoteSol
-) {
-  if (!running) {
+  if (!previous) {
     return;
   }
 
-  if (stopReason) {
-    return;
-  }
-
-  stopReason =
-    "ONCHAIN_RISK";
-
-  await telegram(
-`🚨 PROTECTION ON-CHAIN V5.6
-
-Token :
-${tokenMint}
-
-Type :
-${type}
-
-Variation quote :
-${quoteSol.toFixed(6)} SOL
-
-${
-  currentPosition
-    ? `⚠️ Position ouverte :
-Cycle #${currentPosition.cycle}
-
-⚠️ Aucune vente fictive.
-Prix de sortie non considéré fiable.`
-    : "Aucune position ouverte."
-}
-
-⛔ NOUVEAU CYCLE BLOQUÉ
-⛔ SURVEILLANCE ARRÊTÉE
-
-🧪 Simulation uniquement.`
-  );
-
-  stopSession();
-}
-
-/* =========================================================
-   MARKET TICK
-========================================================= */
-
-async function marketTick() {
-  if (!running) {
-    return;
-  }
-
-  if (tickBusy) {
-    return;
-  }
-
-  tickBusy = true;
-
-  try {
-    const data =
-      await getMarketData(
-        tokenMint
-      );
-
-    if (!data) {
-      return;
-    }
-
-    if (
-      !Number.isFinite(
-        data.price
-      ) ||
-      data.price <= 0
-    ) {
-      return;
-    }
-
-    addMarketPoint(
-      data
+  const type =
+    classifyVaultChange(
+      previous.base,
+      base.sol,
+      previous.quote,
+      quote.tokens
     );
 
-    const crash =
-      getCrashSignals(
-        data
-      );
+  const baseDelta =
+    base.sol - previous.base;
 
-    if (
-      crash.crash
-    ) {
-      await triggerCrash(
-        data,
-        crash
-      );
+  const quoteDelta =
+    quote.tokens - previous.quote;
 
-      return;
-    }
-
-    if (
-      currentPosition
-    ) {
-      await simulateTargetSell(
-        data
-      );
-
-      return;
-    }
-
-    if (
-      now() <
-      observationUntil
-    ) {
-      return;
-    }
-
-    if (
-      now() >=
-      noNewBuyUntil
-    ) {
-      return;
-    }
-
-    await simulateBuy(
-      data
-    );
-  } catch (error) {
-    console.log(
-      "⚠️ Erreur market tick :",
-      error.message
-    );
-  } finally {
-    tickBusy = false;
-  }
-}
-
-/* =========================================================
-   LIMITE 45 MIN
-========================================================= */
-
-async function sessionLimitReached() {
-  if (!running) {
-    return;
-  }
-
-  console.log("");
   console.log(
-    "⏱️ LIMITE SESSION 45 MIN"
+    `⛓️ ${type} | ` +
+    `SOL ${baseDelta.toFixed(5)} | ` +
+    `TOKEN ${quoteDelta.toFixed(5)}`
   );
 
-  /*
-    Position ouverte :
-    sortie de sécurité obligatoire.
-  */
+  lastOnchain = {
+    ts: now(),
+    type,
+    baseDelta,
+    quoteDelta,
+  };
 
-  if (
-    currentPosition
-  ) {
-    try {
-      const data =
-        await getMarketData(
-          tokenMint
-        );
+  // Retrait brutal de liquidité
+  if (type === "WITHDRAWAL") {
 
-      if (
-        data &&
-        Number.isFinite(
-          data.price
-        ) &&
-        data.price > 0
-      ) {
-        await forceSessionExit(
-          data
-        );
-      } else {
-        await telegram(
-`⚠️ LIMITE 45 MIN
+    const baseDropPct =
+      previous.base !== 0
+        ? (baseDelta / previous.base)
+        : 0;
 
-Token :
-${tokenMint}
+    if (baseDropPct <= -0.30) {
 
-Position ouverte mais prix indisponible.
+      console.log(
+        "🚨 RETRAIT ON-CHAIN IMPORTANT"
+      );
 
-⚠️ Aucun résultat fictif ajouté.
+      if (position) {
 
-⛔ Session arrêtée.`
+        await forceSafetySell(
+          "ONCHAIN_WITHDRAWAL"
         );
       }
-    } catch (error) {
-      console.log(
-        "Erreur sortie 45 min :",
-        error.message
-      );
-
-      await telegram(
-`⚠️ LIMITE 45 MIN
-
-Token :
-${tokenMint}
-
-Impossible d'obtenir un prix de sortie fiable.
-
-⚠️ Aucun résultat fictif ajouté.
-
-⛔ Session arrêtée.`
-      );
     }
   }
 
-  stopReason =
-    "SESSION_LIMIT";
+  // Gros SELL
+  if (type === "SELL") {
 
-  await telegram(
-`⏱️ SESSION V5.6 TERMINÉE
+    const solIncrease =
+      previous.base !== 0
+        ? baseDelta / previous.base
+        : 0;
 
-Token :
-${tokenMint}
+    if (solIncrease > 0.10) {
 
-Cycles :
-${cyclesCompleted}
-
-💰 Résultat session :
-${sessionProfit >= 0 ? "+" : ""}$${sessionProfit.toFixed(4)}
-
-⛔ Arrêt après 45 minutes.
-
-🧪 Simulation uniquement.`
-  );
-
-  stopSession();
+      console.log(
+        "⚠️ GROS SELL ON-CHAIN"
+      );
+    }
+  }
 }
 
-/* =========================================================
-   DEMARRAGE
-========================================================= */
+function subscribeAccount(ws, pubkey, label) {
 
-async function startSession(
-  mint
-) {
+  const id =
+    Math.floor(
+      Math.random() * 100000000
+    );
+
+  ws.send(JSON.stringify({
+    jsonrpc: "2.0",
+    id,
+    method: "accountSubscribe",
+    params: [
+      pubkey.toBase58(),
+      {
+        commitment: "processed",
+        encoding: "jsonParsed",
+      },
+    ],
+  }));
+
+  console.log(
+    `📡 accountSubscribe envoyé: ${label}`
+  );
+}
+
+function startWebSocket() {
+
+  closeWebSocket();
+
+  if (!poolInfo) {
+    console.log(
+      "⚠️ Pas de pool pour WebSocket"
+    );
+    return;
+  }
+
+  websocket = new WebSocket(WSS_URL);
+
+  websocket.on("open", () => {
+
+    console.log(
+      "🟢 Helius WebSocket connecté"
+    );
+
+    subscribeAccount(
+      websocket,
+      poolInfo.wsolVault,
+      "WSOL VAULT"
+    );
+
+    subscribeAccount(
+      websocket,
+      poolInfo.tokenVault,
+      "TOKEN VAULT"
+    );
+
+    subscribeAccount(
+      websocket,
+      poolInfo.address,
+      "POOL"
+    );
+  });
+
+  websocket.on("message", async raw => {
+
+    try {
+
+      const msg =
+        JSON.parse(raw.toString());
+
+      // Confirmation abonnement
+      if (
+        msg.result &&
+        typeof msg.id === "number"
+      ) {
+
+        console.log(
+          "📡 Subscription ID:",
+          msg.result
+        );
+
+        return;
+      }
+
+      const value =
+        msg.params?.result?.value;
+
+      if (!value) return;
+
+      const pubkey =
+        msg.params?.result?.context
+          ? null
+          : null;
+
+      const account =
+        msg.params?.result?.value;
+
+      if (!account) return;
+
+      // Pour identifier le compte,
+      // on compare les données reçues
+      // avec les vaults connus.
+
+      if (
+        msg.params?.subscription &&
+        account.data
+      ) {
+
+        const subscription =
+          msg.params.subscription;
+
+        // Les IDs sont attribués par
+        // le serveur. On récupère donc
+        // l'identification par le mapping
+        // ci-dessous.
+
+        if (
+          subscription ===
+          wsSubscriptionIds.baseVault
+        ) {
+          // handled below
+        }
+      }
+
+      // Solana retourne jsonParsed.
+      const parsedInfo =
+        account.data?.parsed?.info;
+
+      if (!parsedInfo) return;
+
+      const tokenAmount =
+        parsedInfo.tokenAmount;
+
+      // Vault SOL
+      if (
+        tokenAmount === undefined &&
+        account.lamports !== undefined
+      ) {
+
+        pendingVaultUpdates.base = {
+          sol:
+            Number(account.lamports) / 1e9,
+          tokens: 0,
+        };
+
+        await processVaultPair();
+
+        return;
+      }
+
+      // Vault token
+      if (tokenAmount) {
+
+        pendingVaultUpdates.quote = {
+          sol: 0,
+          tokens:
+            Number(
+              tokenAmount.uiAmount || 0
+            ),
+        };
+
+        await processVaultPair();
+      }
+
+    } catch (err) {
+
+      console.error(
+        "WS message error:",
+        err.message
+      );
+    }
+  });
+
+  websocket.on("error", err => {
+
+    console.error(
+      "❌ Helius WS:",
+      err.message
+    );
+  });
+
+  websocket.on("close", () => {
+
+    console.log(
+      "🔴 Helius WebSocket fermé"
+    );
+
+    if (running) {
+
+      setTimeout(() => {
+
+        if (running) {
+          startWebSocket();
+        }
+
+      }, 3000);
+    }
+  });
+}
+
+// ============================================================
+// SIMULATION BUY
+// ============================================================
+
+function simulateBuy(point) {
+
+  cycleNumber++;
+
+  position = {
+    cycle: cycleNumber,
+
+    entryTime: now(),
+
+    entryPrice: point.price,
+
+    capitalUsd: CAPITAL_USD,
+
+    targetPrice:
+      point.price *
+      (1 + TARGET_GAIN),
+  };
+
+  console.log(
+    `\n🟢 SIMULATION BUY #${cycleNumber}`
+  );
+
+  console.log(
+    `💵 Capital: ${usd(CAPITAL_USD)}`
+  );
+
+  console.log(
+    `💰 Prix entrée: ${point.price}`
+  );
+
+  console.log(
+    `🎯 Objectif: ${point.price * (1 + TARGET_GAIN)}`
+  );
+
+  saveTrade({
+    type: "BUY",
+    mode: "SIMULATION",
+    cycle: cycleNumber,
+    time: new Date().toISOString(),
+    price: point.price,
+    capitalUsd: CAPITAL_USD,
+    pool:
+      poolInfo?.address?.toBase58() ||
+      null,
+  });
+
+  telegram(
+    `🟢 BUY SIMULATION #${cycleNumber}\n\n` +
+    `💵 Capital : ${usd(CAPITAL_USD)}\n` +
+    `💰 Prix : ${point.price}\n` +
+    `🎯 Objectif +5% : ${position.targetPrice}\n\n` +
+    `Pool : ${shortAddress(
+      poolInfo?.address?.toBase58()
+    )}`
+  );
+}
+
+// ============================================================
+// SIMULATION SELL
+// ============================================================
+
+function simulateSell(point, reason = "TARGET") {
+
+  if (!position) return;
+
+  const entry =
+    position.entryPrice;
+
+  const exit =
+    point.price;
+
+  const gainPct =
+    ((exit - entry) / entry) * 100;
+
+  const gainUsd =
+    CAPITAL_USD *
+    (gainPct / 100);
+
+  const cycle =
+    position.cycle;
+
+  const trade = {
+    type: "SELL",
+    mode: "SIMULATION",
+
+    cycle,
+
+    reason,
+
+    time:
+      new Date().toISOString(),
+
+    entryPrice: entry,
+
+    exitPrice: exit,
+
+    gainPct,
+
+    gainUsd,
+
+    capitalUsd:
+      CAPITAL_USD,
+
+    pool:
+      poolInfo?.address?.toBase58() ||
+      null,
+  };
+
+  saveTrade(trade);
+
+  if (reason === "TARGET") {
+    wins++;
+  } else {
+    losses++;
+  }
+
+  console.log(
+    `\n🔴 SIMULATION SELL #${cycle}`
+  );
+
+  console.log(
+    `📈 Résultat : ${gainPct.toFixed(2)}%`
+  );
+
+  console.log(
+    `💵 Résultat : ${gainUsd.toFixed(4)} USD`
+  );
+
+  telegram(
+    `${reason === "TARGET"
+      ? "🎯"
+      : "🛡️"} SELL SIMULATION #${cycle}\n\n` +
+    `Entrée : ${entry}\n` +
+    `Sortie : ${exit}\n` +
+    `Résultat : ${gainPct.toFixed(2)}%\n` +
+    `P&L : ${gainUsd.toFixed(4)} USD\n\n` +
+    `Raison : ${reason}`
+  );
+
+  position = null;
+
+  cooldownUntil =
+    now() +
+    COOLDOWN_AFTER_SELL_MS;
+}
+
+// ============================================================
+// SAFETY SELL
+// ============================================================
+
+async function forceSafetySell(reason) {
+
+  if (!position) return;
+
+  console.log(
+    `🛡️ SORTIE DE SÉCURITÉ : ${reason}`
+  );
+
+  const market =
+    await getMarketData();
+
+  if (!market) {
+
+    console.error(
+      "❌ Impossible de récupérer le prix pour la sortie de sécurité."
+    );
+
+    // On NE considère pas la position comme
+    // fermée si nous n'avons pas de prix.
+    // Elle reste en mémoire.
+
+    return;
+  }
+
+  simulateSell(
+    market,
+    reason
+  );
+}
+
+// ============================================================
+// SESSION LIMIT
+// ============================================================
+
+async function sessionLimitReached() {
+
+  if (!running) return;
+
+  console.log(
+    "\n⏰ LIMITE SESSION 45 MINUTES"
+  );
+
+  // RÈGLE ABSOLUE :
+  // une position ouverte doit être fermée
+  // avant l'arrêt.
+
+  if (position) {
+
+    console.log(
+      "🛡️ Position ouverte détectée."
+    );
+
+    await forceSafetySell(
+      "SESSION_LIMIT"
+    );
+
+    // Si la sortie échoue,
+    // on garde la surveillance active
+    // et on réessaie.
+    if (position) {
+
+      console.log(
+        "⚠️ Position toujours ouverte."
+      );
+
+      telegram(
+        `🚨 SESSION 45 MIN\n\n` +
+        `Position encore ouverte.\n` +
+        `Le bot NE S'ARRÊTE PAS tant que la sortie de sécurité n'est pas possible.`
+      );
+
+      return;
+    }
+  }
+
+  await stopTrade(
+    "SESSION_LIMIT"
+  );
+}
+
+// ============================================================
+// MARKET LOOP
+// ============================================================
+
+async function marketLoop() {
+
+  if (!running) return;
+
+  try {
+
+    const point =
+      await getMarketData();
+
+    if (!point) {
+
+      console.log(
+        "⚠️ Données marché indisponibles"
+      );
+
+      return;
+    }
+
+    lastMarket = point;
+
+    addHistory(point);
+
+    const score =
+      calculateHealthScore(point);
+
+    const crash =
+      detectCrash(point);
+
+    console.log(
+      `📊 ${usd(point.price)} | ` +
+      `liq ${usd(point.liquidityUsd)} | ` +
+      `SOL ${point.solReserve.toFixed(3)} | ` +
+      `score ${score}`
+    );
+
+    // --------------------------------------------------------
+    // CRASH
+    // --------------------------------------------------------
+
+    if (crash.crash) {
+
+      console.log(
+        "\n🚨 CRASH DÉTECTÉ"
+      );
+
+      console.log(
+        "Raison:",
+        crash.reason
+      );
+
+      crashReport = {
+
+        time:
+          new Date().toISOString(),
+
+        token: tokenMint,
+
+        reason:
+          crash.reason,
+
+        price:
+          point.price,
+
+        liquidityUsd:
+          point.liquidityUsd,
+
+        history:
+          history.slice(-60),
+
+        position:
+          position
+            ? {
+                ...position,
+              }
+            : null,
+      };
+
+      saveCrash(crashReport);
+
+      telegram(
+        `🚨 CRASH DÉTECTÉ\n\n` +
+        `Token : ${shortMint(tokenMint)}\n` +
+        `Prix : ${point.price}\n` +
+        `Liquidité : ${usd(point.liquidityUsd)}\n\n` +
+        `Raison : ${crash.reason}\n\n` +
+        `${position
+          ? "🛡️ Position ouverte : sortie de sécurité."
+          : "Aucune position ouverte."}`
+      );
+
+      if (position) {
+        await forceSafetySell(
+          "CRASH_PROTECTION"
+        );
+      }
+
+      await stopTrade(
+        "CRASH"
+      );
+
+      return;
+    }
+
+    // --------------------------------------------------------
+    // POSITION OUVERTE
+    // --------------------------------------------------------
+
+    if (position) {
+
+      const target =
+        position.targetPrice;
+
+      if (
+        point.price >= target
+      ) {
+
+        simulateSell(
+          point,
+          "TARGET"
+        );
+
+        return;
+      }
+
+      // Protection si la position commence
+      // à perdre fortement.
+      const drawdown =
+        ((point.price -
+          position.entryPrice) /
+          position.entryPrice) *
+        100;
+
+      if (drawdown <= -20) {
+
+        await forceSafetySell(
+          "POSITION_CRASH_PROTECTION"
+        );
+
+        if (
+          point.liquidityUsd <=
+          HARD_LIQUIDITY_USD
+        ) {
+          await stopTrade(
+            "CRASH"
+          );
+        }
+      }
+
+      return;
+    }
+
+    // --------------------------------------------------------
+    // COOLDOWN
+    // --------------------------------------------------------
+
+    if (
+      now() < cooldownUntil
+    ) {
+
+      console.log(
+        "⏳ Cooldown..."
+      );
+
+      return;
+    }
+
+    // --------------------------------------------------------
+    // 43 MINUTES
+    // --------------------------------------------------------
+
+    if (
+      now() -
+      sessionStartedAt >=
+      NO_NEW_BUY_AFTER_MS
+    ) {
+
+      console.log(
+        "⏰ 43 min atteintes : aucun nouveau BUY."
+      );
+
+      return;
+    }
+
+    // --------------------------------------------------------
+    // ENTRY
+    // --------------------------------------------------------
+
+    if (
+      history.length <
+      8
+    ) {
+
+      console.log(
+        "⏳ Warmup..."
+      );
+
+      return;
+    }
+
+    const entry =
+      entryCheck(point);
+
+    if (!entry.ok) {
+
+      console.log(
+        `🟡 Pas d'entrée : ${entry.reason}`
+      );
+
+      return;
+    }
+
+    // Confirmation santé
+    if (healthyConfirmation(point)) {
+      healthConfirmationCount++;
+    } else {
+      healthConfirmationCount = 0;
+    }
+
+    if (
+      healthConfirmationCount <
+      REQUIRED_CONFIRMATIONS
+    ) {
+
+      console.log(
+        `🟡 Confirmation santé ` +
+        `${healthConfirmationCount}/${REQUIRED_CONFIRMATIONS}`
+      );
+
+      return;
+    }
+
+    // On reset pour le prochain cycle.
+    healthConfirmationCount = 0;
+
+    simulateBuy(point);
+
+  } catch (err) {
+
+    console.error(
+      "❌ marketLoop:",
+      err.message
+    );
+  }
+}
+
+// ============================================================
+// START TRADE
+// ============================================================
+
+async function startTrade(mint) {
+
   if (running) {
+
     await telegram(
-`⚠️ Une session est déjà active.
-
-Token :
-${tokenMint}
-
-Utilise /stoptrade d'abord.`
+      "⚠️ Une surveillance est déjà active."
     );
 
     return;
   }
 
   try {
-    tokenMint =
-      new PublicKey(
-        mint.trim()
-      ).toBase58();
-  } catch (_) {
-    await telegram(
-`❌ Adresse token invalide.
+    new PublicKey(mint);
+  } catch {
 
-Token :
-${mint}`
+    await telegram(
+      "❌ Adresse token Solana invalide."
     );
 
     return;
   }
 
   running = true;
+  sessionEnded = false;
 
-  stopReason =
-    null;
+  tokenMint = mint;
 
-  sessionStart =
-    now();
+  tokenMintGlobal = mint;
 
-  cyclesCompleted = 0;
+  sessionStartedAt = now();
 
-  sessionProfit = 0;
+  cycleNumber = 0;
+  wins = 0;
+  losses = 0;
 
-  currentPosition =
-    null;
+  cooldownUntil = 0;
 
-  observationUntil = 0;
+  position = null;
 
-  noNewBuyUntil =
-    sessionStart +
-    NO_NEW_BUY_AFTER_MS;
+  history = [];
 
-  marketHistory = [];
+  dexPair = null;
+  poolInfo = null;
 
-  poolInfo =
-    null;
+  lastMarket = null;
+  lastOnchain = null;
 
-  heliusConnected =
-    false;
+  previousVaultSnapshot = null;
 
-  pendingSubscriptionTypes =
-    [];
+  healthConfirmationCount = 0;
 
-  wsSubscriptionIds = {
-    base: null,
-    quote: null,
-    pool: null,
-  };
-
-  onchainState = {
-    lastBase: null,
-    lastQuote: null,
-    pendingBase: null,
-    pendingQuote: null,
-    lastEvent: null,
-  };
-
-  console.log("");
   console.log(
-    "🚀 V5.6 DÉMARRÉE"
+    "\n================================="
+  );
+
+  console.log(
+    "🚀 V5.7 DÉMARRAGE"
+  );
+
+  console.log(
+    "Token:",
+    mint
+  );
+
+  console.log(
+    "=================================\n"
   );
 
   await telegram(
-`🚀 V5.6 DÉMARRÉE
-
-Token :
-${tokenMint}
-
-💵 Capital :
-$${CAPITAL_USD.toFixed(2)}
-
-🎯 Objectif :
-+${TARGET_GAIN * 100}%
-
-🔎 Méthode :
-DexScreener → PumpSwap → Solana
-
-⛓️ Surveillance :
-Vault token + vault SOL
-
-⏳ Observation après vente :
-30 secondes
-
-⏱️ Aucun nouvel achat après :
-43 minutes
-
-🛑 Limite session :
-45 minutes
-
-🧪 SIMULATION UNIQUEMENT
-
-🔎 Recherche du marché...`
+    `🚀 V5.7 DÉMARRAGE\n\n` +
+    `Token :\n${mint}\n\n` +
+    `💵 Capital/cycle : ${usd(CAPITAL_USD)}\n` +
+    `🎯 Objectif : +5%\n` +
+    `⏱️ Session max : 45 min\n` +
+    `🚫 Nouveau BUY après : 43 min\n\n` +
+    `🔎 Recherche du marché PumpSwap...`
   );
 
-  /*
-    NOUVELLE METHODE V5.6 :
-    DexScreener trouve la paire,
-    puis Solana confirme le pool.
-  */
+  // ----------------------------------------------------------
+  // DISCOVERY
+  // ----------------------------------------------------------
 
-  const discovered =
-    await discoverPool(
-      tokenMint
-    );
+  const market =
+    await discoverMarket(mint);
 
-  if (!discovered.ok) {
+  if (!market) {
+
     running = false;
 
-    stopReason =
-      discovered.status ||
-      "NO_POOL";
-
-    console.log("");
     console.log(
-      "❌ V5.6 ARRÊTÉE"
+      "\n❌ V5.7 ARRÊTÉE : aucun pool."
     );
 
-    console.log(
-      "Raison :",
-      discovered.reason
-    );
+    const allPairs =
+      cachedDexPairs || [];
 
-    let message =
-`❌ V5.6 ARRÊTÉE
+    let diagnostic =
+      "";
 
-Token :
-${tokenMint}
+    if (!allPairs.length) {
 
-`;
+      diagnostic =
+        "DexScreener ne renvoie aucune paire.";
 
-    if (
-      discovered.status ===
-      "NO_MARKET"
-    ) {
-      message +=
-`🟡 Aucun marché trouvé sur DexScreener.
-
-Le token n'est peut-être pas encore tradable/indexé.`;
-    } else if (
-      discovered.status ===
-      "NO_PUMPSWAP"
-    ) {
-      message +=
-`🟡 Aucun marché PumpSwap détecté.
-
-Le token peut être encore sur la bonding curve Pump.fun,
-ou être négocié sur un autre DEX.`;
     } else {
-      message +=
-`🔴 Marché PumpSwap trouvé,
-mais aucun pool n'a pu être confirmé directement sur Solana.
 
-Raison :
-${discovered.reason}`;
+      diagnostic =
+        "Marchés trouvés :\n" +
+        allPairs
+          .slice(0, 8)
+          .map(
+            p =>
+              `• ${p.dexId || "unknown"}`
+          )
+          .join("\n");
     }
 
-    message +=
-`
-
-⛔ Surveillance on-chain NON lancée.`;
-
     await telegram(
-      message
+      `❌ V5.7 ARRÊTÉE\n\n` +
+      `Token :\n${mint}\n\n` +
+      `🟡 Aucun pool PumpSwap SOL valide trouvé.\n\n` +
+      `🔎 Diagnostic :\n${diagnostic}\n\n` +
+      `⛔ Surveillance on-chain NON lancée.`
     );
 
     return;
   }
 
+  dexPair =
+    market.dexPair;
+
   poolInfo =
-    discovered;
+    market.pool;
 
-  console.log("");
   console.log(
-    "========================================"
+    "\n================================="
   );
 
   console.log(
-    "✅ POOL PUMPSWAP CONFIRMÉ"
+    "✅ MARCHÉ VALIDÉ"
   );
 
   console.log(
-    "Pool :",
-    poolInfo.pool
+    "Source:",
+    market.source
   );
 
   console.log(
-    "Base vault :",
-    poolInfo.baseVault
+    "Pool:",
+    poolInfo.address.toBase58()
   );
 
   console.log(
-    "Quote vault :",
-    poolInfo.quoteVault
+    "WSOL vault:",
+    poolInfo.wsolVault.toBase58()
   );
 
   console.log(
-    "Réserve SOL :",
-    poolInfo.effectiveQuote
+    "Token vault:",
+    poolInfo.tokenVault.toBase58()
   );
 
   console.log(
-    "========================================"
+    "SOL reserve:",
+    poolInfo.solReserve
+  );
+
+  console.log(
+    "=================================\n"
   );
 
   await telegram(
-`✅ POOL PUMPSWAP CONFIRMÉ
-
-Pool :
-${poolInfo.pool}
-
-Base vault :
-${poolInfo.baseVault}
-
-Quote vault :
-${poolInfo.quoteVault}
-
-💧 Réserve SOL :
-${poolInfo.effectiveQuote.toFixed(4)} SOL
-
-⛓️ Vérification Solana :
-OK
-
-📡 Surveillance on-chain :
-DÉMARRAGE
-
-📊 Marché :
-DexScreener
-
-⏱️ Session :
-45 minutes`
+    `✅ PUMPSWAP VALIDÉ\n\n` +
+    `Token : ${shortMint(mint)}\n\n` +
+    `🏊 Pool : ${shortAddress(
+      poolInfo.address.toBase58()
+    )}\n` +
+    `💧 Réserve SOL : ${sol(poolInfo.solReserve)}\n` +
+    `🔎 Source : ${market.source}\n\n` +
+    `⛓️ Surveillance Helius en préparation...`
   );
 
-  startOnchainMonitoring();
+  // ----------------------------------------------------------
+  // WEBSOCKET
+  // ----------------------------------------------------------
 
-  await new Promise(
-    (resolve) =>
-      setTimeout(
-        resolve,
-        1000
-      )
-  );
+  startWebSocket();
 
-  if (!running) {
-    return;
-  }
-
-  await marketTick();
+  // ----------------------------------------------------------
+  // MARKET LOOP
+  // ----------------------------------------------------------
 
   marketTimer =
     setInterval(
-      marketTick,
-      MARKET_INTERVAL_MS
+      marketLoop,
+      MARKET_POLL_MS
     );
+
+  // Première lecture immédiate
+  await marketLoop();
+
+  // ----------------------------------------------------------
+  // 45 MINUTES
+  // ----------------------------------------------------------
 
   sessionTimer =
     setTimeout(
       sessionLimitReached,
       MAX_SESSION_MS
     );
+
+  await telegram(
+    `🟢 V5.7 SURVEILLANCE ACTIVE\n\n` +
+    `💵 ${usd(CAPITAL_USD)} / cycle\n` +
+    `🎯 +5% cible\n` +
+    `⏱️ 45 min maximum\n` +
+    `🚫 Aucun nouveau BUY après 43 min\n\n` +
+    `Simulation uniquement.`
+  );
 }
 
-/* =========================================================
-   STOP
-========================================================= */
+// ============================================================
+// STOP TRADE
+// ============================================================
 
-function stopSession() {
-  if (
-    marketTimer
-  ) {
-    clearInterval(
-      marketTimer
+async function stopTrade(reason = "MANUAL") {
+
+  if (!running) {
+    return;
+  }
+
+  // Protection : ne jamais arrêter
+  // avec une position ouverte.
+  if (position) {
+
+    console.log(
+      "🛡️ stopTrade demandé avec position ouverte."
     );
 
-    marketTimer =
-      null;
-  }
-
-  if (
-    sessionTimer
-  ) {
-    clearTimeout(
-      sessionTimer
+    await forceSafetySell(
+      `STOP_${reason}`
     );
 
-    sessionTimer =
-      null;
+    if (position) {
+
+      console.log(
+        "🚨 ARRÊT REFUSÉ : position toujours ouverte."
+      );
+
+      return;
+    }
   }
-
-  if (ws) {
-    try {
-      ws.close();
-    } catch (_) {}
-  }
-
-  ws = null;
-
-  heliusConnected =
-    false;
 
   running = false;
 
-  console.log("");
-  console.log(
-    "⛔ RADAR ARRÊTÉ"
+  if (marketTimer) {
+    clearInterval(marketTimer);
+    marketTimer = null;
+  }
+
+  if (sessionTimer) {
+    clearTimeout(sessionTimer);
+    sessionTimer = null;
+  }
+
+  closeWebSocket();
+
+  const duration =
+    sessionStartedAt
+      ? now() - sessionStartedAt
+      : 0;
+
+  const summary = {
+
+    time:
+      new Date().toISOString(),
+
+    reason,
+
+    token:
+      tokenMint,
+
+    durationSeconds:
+      Math.floor(duration / 1000),
+
+    cycles:
+      cycleNumber,
+
+    wins,
+
+    losses,
+
+    positionOpen:
+      !!position,
+
+    pool:
+      poolInfo?.address?.toBase58() ||
+      null,
+  };
+
+  writeJson(
+    SUMMARY_FILE,
+    summary
   );
 
   console.log(
-    "Raison :",
-    stopReason ||
-      "MANUAL"
+    "\n================================="
   );
 
   console.log(
-    "Cycles :",
-    cyclesCompleted
+    "🛑 V5.7 ARRÊT"
   );
 
   console.log(
-    "Bénéfices :",
-    `$${sessionProfit.toFixed(4)}`
+    "Raison:",
+    reason
+  );
+
+  console.log(
+    "Cycles:",
+    cycleNumber
+  );
+
+  console.log(
+    "Wins:",
+    wins
+  );
+
+  console.log(
+    "Losses:",
+    losses
+  );
+
+  console.log(
+    "=================================\n"
+  );
+
+  await telegram(
+    `🛑 V5.7 ARRÊTÉE\n\n` +
+    `Raison : ${reason}\n` +
+    `Cycles : ${cycleNumber}\n` +
+    `🎯 Gains : ${wins}\n` +
+    `🛡️ Sorties protection : ${losses}`
   );
 }
 
-/* =========================================================
-   SAUVEGARDE TRADE
-========================================================= */
+// ============================================================
+// STATUS
+// ============================================================
 
-function saveTrade(
-  trade
-) {
-  const history =
+async function statusText() {
+
+  if (!running) {
+
+    return (
+      `🔴 V5.7 INACTIVE\n\n` +
+      `Dernier token : ` +
+      `${tokenMint || "aucun"}`
+    );
+  }
+
+  const elapsed =
+    now() -
+    sessionStartedAt;
+
+  const minutes =
+    Math.floor(
+      elapsed / 60000
+    );
+
+  let text =
+    `🟢 V5.7 ACTIVE\n\n` +
+    `Token : ${shortMint(tokenMint)}\n` +
+    `⏱️ Session : ${minutes} min\n` +
+    `🔁 Cycles : ${cycleNumber}\n` +
+    `🎯 Gains : ${wins}\n` +
+    `🛡️ Protections : ${losses}\n`;
+
+  if (poolInfo) {
+
+    text +=
+      `\n🏊 Pool : ${shortAddress(
+        poolInfo.address.toBase58()
+      )}\n` +
+      `💧 SOL : ${poolInfo.solReserve.toFixed(4)}\n`;
+  }
+
+  if (lastMarket) {
+
+    text +=
+      `\n💰 Prix : ${lastMarket.price}\n` +
+      `💧 Liquidité : ${usd(
+        lastMarket.liquidityUsd
+      )}\n` +
+      `❤️ Score : ${calculateHealthScore(
+        lastMarket
+      )}/100\n`;
+  }
+
+  if (position) {
+
+    text +=
+      `\n📈 POSITION OUVERTE\n` +
+      `Entrée : ${position.entryPrice}\n` +
+      `🎯 Cible : ${position.targetPrice}`;
+  } else {
+
+    text +=
+      `\n📭 Aucune position`;
+  }
+
+  return text;
+}
+
+// ============================================================
+// LAST CRASH
+// ============================================================
+
+function lastCrashText() {
+
+  const crashes =
     readJson(
-      TRADE_FILE,
+      CRASH_FILE,
       []
     );
 
-  history.push(
-    trade
+  if (!crashes.length) {
+    return "🟢 Aucun crash enregistré.";
+  }
+
+  const crash =
+    crashes[crashes.length - 1];
+
+  return (
+    `🚨 DERNIER CRASH\n\n` +
+    `Token : ${shortMint(
+      crash.token
+    )}\n` +
+    `Date : ${crash.time}\n` +
+    `Raison : ${crash.reason}\n` +
+    `Prix : ${crash.price}\n` +
+    `Liquidité : ${usd(
+      crash.liquidityUsd
+    )}`
   );
+}
 
-  writeJson(
-    TRADE_FILE,
-    history
+// ============================================================
+// TELEGRAM COMMANDS
+// ============================================================
+
+bot.command("starttrade", async ctx => {
+
+  const parts =
+    ctx.message.text
+      .trim()
+      .split(/\s+/);
+
+  if (parts.length < 2) {
+
+    await ctx.reply(
+      "❌ Utilisation :\n/starttrade ADRESSE_TOKEN"
+    );
+
+    return;
+  }
+
+  const mint =
+    parts[1].trim();
+
+  await startTrade(mint);
+});
+
+bot.command("stoptrade", async ctx => {
+
+  await stopTrade(
+    "MANUAL"
   );
-}
+});
+
+bot.command("status", async ctx => {
+
+  await ctx.reply(
+    await statusText()
+  );
+});
+
+bot.command("lastcrash", async ctx => {
+
+  await ctx.reply(
+    lastCrashText()
+  );
+});
+
+bot.command("help", async ctx => {
+
+  await ctx.reply(
+    `🤖 V5.7\n\n` +
+    `/starttrade TOKEN\n` +
+    `/stoptrade\n` +
+    `/status\n` +
+    `/lastcrash\n` +
+    `/help\n\n` +
+    `💵 Simulation : ${usd(CAPITAL_USD)}\n` +
+    `🎯 Cible : +5%\n` +
+    `⏱️ Session : 45 min\n` +
+    `🚫 Nouveaux achats après 43 min`
+  );
+});
+
+// ============================================================
+// ERROR HANDLERS
+// ============================================================
+
+bot.catch(err => {
+
+  console.error(
+    "Telegram bot error:",
+    err
+  );
+});
+
+process.on(
+  "uncaughtException",
+  err => {
 
-/* =========================================================
-   COMMANDES
-========================================================= */
-
-bot.command(
-  "starttrade",
-  async (ctx) => {
-    const args =
-      ctx.message.text
-        .trim()
-        .split(/\s+/)
-        .slice(1);
-
-    if (!args.length) {
-      await ctx.reply(
-`Utilisation :
-
-/starttrade ADRESSE_TOKEN
-
-Exemple :
-
-/starttrade 5XnMHrs45GNHqNpPNHd8bepoHdRhFBppZdUieP4MKa1S`
-      );
-
-      return;
-    }
-
-    await startSession(
-      args[0]
-    );
-  }
-);
-
-bot.command(
-  "stoptrade",
-  async (ctx) => {
-    if (!running) {
-      await ctx.reply(
-        "ℹ️ Aucune session en cours."
-      );
-
-      return;
-    }
-
-    stopReason =
-      "MANUAL";
-
-    stopSession();
-
-    await ctx.reply(
-`🛑 SESSION ARRÊTÉE
-
-Token :
-${tokenMint}
-
-Cycles :
-${cyclesCompleted}
-
-💰 Bénéfices :
-$${sessionProfit.toFixed(4)}
-
-🧪 Simulation uniquement.`
-    );
-  }
-);
-
-bot.command(
-  "status",
-  async (ctx) => {
-    if (!running) {
-      await ctx.reply(
-`ℹ️ Aucune session active.
-
-/starttrade ADRESSE_TOKEN`
-      );
-
-      return;
-    }
-
-    const elapsed =
-      now() -
-      sessionStart;
-
-    const minutes =
-      Math.floor(
-        elapsed / 60000
-      );
-
-    await ctx.reply(
-`📊 STATUS V5.6
-
-Token :
-${tokenMint}
-
-⏱️ Temps :
-${minutes} min
-
-Cycles :
-${cyclesCompleted}
-
-💰 Bénéfices :
-$${sessionProfit.toFixed(4)}
-
-📍 Position :
-${
-  currentPosition
-    ? "OUVERTE"
-    : "AUCUNE"
-}
-
-⛓️ Helius :
-${
-  heliusConnected
-    ? "🟢 connecté"
-    : "🔴 déconnecté"
-}
-
-🔗 Pool :
-${
-  poolInfo
-    ? poolInfo.pool
-    : "N/A"
-}
-
-🧪 Simulation`
-    );
-  }
-);
-
-bot.command(
-  "lastcrash",
-  async (ctx) => {
-    if (
-      !lastCrashReport
-    ) {
-      const reports =
-        readJson(
-          CRASH_FILE,
-          []
-        );
-
-      if (
-        reports.length
-      ) {
-        lastCrashReport =
-          reports[
-            reports.length - 1
-          ];
-      }
-    }
-
-    if (
-      !lastCrashReport
-    ) {
-      await ctx.reply(
-        "ℹ️ Aucun crash enregistré."
-      );
-
-      return;
-    }
-
-    const r =
-      lastCrashReport;
-
-    await ctx.reply(
-`🚨 DERNIER CRASH
-
-Token :
-${r.mint}
-
-Date :
-${r.timestamp}
-
-Prix :
-${formatPrice(
-  r.crashMarket.price
-)}
-
-Variation prix :
-${r.crashMarket.priceChange10s.toFixed(2)}%
-
-Liquidité :
-${formatUsd(
-  r.crashMarket.liquidity
-)}
-
-Variation liquidité :
-${r.crashMarket.liquidityChange10s.toFixed(2)}%
-
-Score :
-${r.crashMarket.score}/100
-
-Signaux :
-${r.reasons.join("\n")}
-
-Cycles :
-${r.cyclesCompleted}
-
-Bénéfices :
-$${r.sessionProfit.toFixed(4)}`
-    );
-  }
-);
-
-bot.command(
-  "help",
-  async (ctx) => {
-    await ctx.reply(
-`🤖 COMMANDES V5.6
-
-/starttrade TOKEN
-Lance une simulation.
-
-/stoptrade
-Arrête la session.
-
-/status
-Affiche l'état.
-
-/lastcrash
-Affiche le dernier crash.
-
-/help
-Affiche l'aide.
-
-💵 Mise :
-$10
-
-🎯 Objectif :
-+5%
-
-⏳ Observation :
-30 secondes
-
-⏱️ Aucun nouvel achat :
-après 43 minutes
-
-🛑 Session :
-45 minutes
-
-🧪 Simulation uniquement.`
-    );
-  }
-);
-
-/* =========================================================
-   ERREURS TELEGRAM
-========================================================= */
-
-bot.catch(
-  (error) => {
-    console.log(
-      "❌ Erreur Telegram :",
-      error.message
-    );
-  }
-);
-
-/* =========================================================
-   LANCEMENT
-========================================================= */
-
-(async () => {
-  try {
-    console.log(
-      "🤖 Démarrage Telegram..."
-    );
-
-    await bot.launch();
-
-    console.log(
-      "✅ Bot Telegram opérationnel."
-    );
-
-    console.log(
-      "🚀 V5.6 prête."
-    );
-  } catch (error) {
     console.error(
-      "❌ Erreur démarrage :",
-      error
+      "UNCAUGHT EXCEPTION:",
+      err
+    );
+  }
+);
+
+process.on(
+  "unhandledRejection",
+  err => {
+
+    console.error(
+      "UNHANDLED REJECTION:",
+      err
+    );
+  }
+);
+
+// ============================================================
+// START BOT
+// ============================================================
+
+console.log(
+  "🤖 V5.7 Telegram bot démarré"
+);
+
+console.log(
+  "📡 RPC:",
+  RPC_URL.replace(
+    HELIUS_API_KEY,
+    "***"
+  )
+);
+
+bot.launch()
+  .then(() => {
+
+    console.log(
+      "🟢 Telegram connecté"
     );
 
-    process.exit(1);
-  }
-})();
+  })
+  .catch(err => {
 
-/* =========================================================
-   ARRET PROPRE
-========================================================= */
+    console.error(
+      "❌ Telegram launch:",
+      err.message
+    );
+  });
 
+// Arrêt propre
 process.once(
   "SIGINT",
-  () => {
-    stopSession();
-    bot.stop(
-      "SIGINT"
-    );
-  }
+  () => bot.stop("SIGINT")
 );
 
 process.once(
   "SIGTERM",
-  () => {
-    stopSession();
-    bot.stop(
-      "SIGTERM"
-    );
-  }
+  () => bot.stop("SIGTERM")
 );
