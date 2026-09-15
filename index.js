@@ -1,10 +1,7 @@
 require("dotenv").config();
 
 const { Telegraf } = require("telegraf");
-const {
-  Connection,
-  PublicKey,
-} = require("@solana/web3.js");
+const { Connection, PublicKey } = require("@solana/web3.js");
 const fs = require("fs");
 const path = require("path");
 
@@ -21,7 +18,7 @@ if (!CHAT_ID) throw new Error("CHAT_ID manquant");
 if (!HELIUS_API_KEY) throw new Error("HELIUS_API_KEY manquant");
 
 // ============================================================
-// CONNECTION
+// RPC
 // ============================================================
 
 const RPC_URL =
@@ -38,20 +35,33 @@ const connection = new Connection(RPC_URL, {
 });
 
 // ============================================================
-// CONSTANTS
+// PROGRAMS
 // ============================================================
 
 const PUMPSWAP_PROGRAM = new PublicKey(
   "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 );
 
-const WSOL_MINT = "So11111111111111111111111111111111111111112";
+const PUMP_PROGRAM = new PublicKey(
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+);
+
+const WSOL_MINT =
+  "So11111111111111111111111111111111111111112";
+
+// ============================================================
+// APIs
+// ============================================================
+
+const DEX_TOKEN_API =
+  "https://api.dexscreener.com/latest/dex/tokens";
 
 const PUMPFUN_API =
   "https://frontend-api-v3.pump.fun/coins";
 
-const DEX_TOKEN_API =
-  "https://api.dexscreener.com/latest/dex/tokens";
+// ============================================================
+// DATA
+// ============================================================
 
 const DATA_DIR = fs.existsSync("/data")
   ? "/data"
@@ -61,36 +71,61 @@ if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
+const MARKET_FILE =
+  path.join(DATA_DIR, "v6_market_history.jsonl");
+
+const TRADES_FILE =
+  path.join(DATA_DIR, "v6_trades.json");
+
+const COMPARISON_FILE =
+  path.join(DATA_DIR, "v6_comparison.json");
+
+const CRASH_FILE =
+  path.join(DATA_DIR, "v6_crashes.json");
+
 // ============================================================
-// V6 FILTERS
+// FILTERS
 // ============================================================
 
-const ALLOWED_NAMES = ["claude", "openai", "anthropic"];
+const ALLOWED_NAMES = [
+  "claude",
+  "openai",
+  "anthropic",
+];
 
 const MIN_LIQUIDITY = 200000;
 const MAX_LIQUIDITY = 400000;
 
 const MIN_HOLDERS = 1000;
 
-const MAX_AGE_MS = 5 * 60 * 60 * 1000;
+const MAX_AGE_MS =
+  5 * 60 * 60 * 1000;
 
 // ============================================================
-// V5.9 STRATEGY
+// STRATEGY
 // ============================================================
 
 const CAPITAL = 10;
 
 const TARGET_PERCENT = 5;
 
-const STOP_LEVELS = [-10, -15, -20, -25];
+const STOP_LEVELS = [
+  -10,
+  -15,
+  -20,
+  -25,
+];
 
 const MARKET_INTERVAL_MS = 2000;
 
-const POST_SELL_COOLDOWN_MS = 30000;
+const POST_SELL_COOLDOWN_MS =
+  30000;
 
-const NO_NEW_BUY_AFTER_MS = 43 * 60 * 1000;
+const NO_NEW_BUY_AFTER_MS =
+  43 * 60 * 1000;
 
-const MAX_SESSION_MS = 45 * 60 * 1000;
+const MAX_SESSION_MS =
+  45 * 60 * 1000;
 
 const MIN_TRADE_LIQUIDITY = 3000;
 
@@ -103,76 +138,38 @@ const CRASH_LIQUIDITY_DROP_10S = -50;
 const CRASH_PRICE_DROP_10S = -20;
 
 // ============================================================
-// FILES
-// ============================================================
-
-const MARKET_FILE = path.join(
-  DATA_DIR,
-  "v6_market_history.jsonl"
-);
-
-const TRADES_FILE = path.join(
-  DATA_DIR,
-  "v6_trades.json"
-);
-
-const COMPARISON_FILE = path.join(
-  DATA_DIR,
-  "v6_comparison.json"
-);
-
-const CRASH_FILE = path.join(
-  DATA_DIR,
-  "v6_crashes.json"
-);
-
-// ============================================================
 // TELEGRAM
 // ============================================================
 
 const bot = new Telegraf(BOT_TOKEN);
-
-async function sendTelegram(text) {
-  try {
-    await bot.telegram.sendMessage(CHAT_ID, text);
-  } catch (e) {
-    console.log("Telegram error:", e.message);
-  }
-}
 
 // ============================================================
 // STATE
 // ============================================================
 
 let currentCandidate = null;
+let currentPair = null;
+let currentPool = null;
 
 let tradeRunning = false;
 
 let sessionStartedAt = null;
 
 let marketTimer = null;
-
-let pairDiscoveryTimer = null;
+let pairTimer = null;
 
 let heliusWs = null;
 
-let currentPair = null;
-
-let currentPool = null;
-
 let marketHistory = [];
-
 let trades = [];
-
 let crashes = [];
 
 let lastMarket = null;
-
 let lastDiagnosticAt = 0;
 
-let poolCache = new Map();
-
 let evaluationLock = false;
+
+const poolCache = new Map();
 
 // ============================================================
 // STRATEGIES
@@ -181,35 +178,42 @@ let evaluationLock = false;
 let strategies = [];
 
 function resetStrategies() {
-  strategies = STOP_LEVELS.map((stopPercent, index) => ({
-    id: index + 1,
-    name: `STOP ${stopPercent}%`,
-    capital: CAPITAL,
-    targetPercent: TARGET_PERCENT,
-    stopPercent,
+  strategies = STOP_LEVELS.map(
+    (stopPercent, index) => ({
+      id: index + 1,
 
-    open: false,
+      name: `STOP ${stopPercent}%`,
 
-    entryPrice: null,
-    entryLiquidity: null,
-    entryAt: null,
+      capital: CAPITAL,
 
-    targetPrice: null,
-    stopPrice: null,
+      targetPercent:
+        TARGET_PERCENT,
 
-    lastSellAt: 0,
+      stopPercent,
 
-    wins: 0,
-    losses: 0,
-    sessionLimit: 0,
-    crashes: 0,
+      open: false,
 
-    totalPnl: 0,
-    totalInvested: 0,
-    totalReturned: 0,
+      entryPrice: null,
+      entryLiquidity: null,
+      entryAt: null,
 
-    trades: [],
-  }));
+      targetPrice: null,
+      stopPrice: null,
+
+      lastSellAt: 0,
+
+      wins: 0,
+      losses: 0,
+      crashes: 0,
+      sessionLimit: 0,
+
+      totalPnl: 0,
+      totalInvested: 0,
+      totalReturned: 0,
+
+      trades: [],
+    })
+  );
 }
 
 resetStrategies();
@@ -222,23 +226,21 @@ function now() {
   return Date.now();
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function safeNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n)
+    ? n
+    : null;
 }
 
-function safeNumber(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
+function shortAddress(value) {
+  if (!value) return "N/A";
 
-function shortMint(mint) {
-  if (!mint) return "N/A";
-  return `${mint.slice(0, 6)}...${mint.slice(-6)}`;
-}
-
-function shortAddress(address) {
-  if (!address) return "N/A";
-  return `${address.slice(0, 6)}...${address.slice(-6)}`;
+  return (
+    value.slice(0, 6) +
+    "..." +
+    value.slice(-6)
+  );
 }
 
 function appendJsonLine(file, data) {
@@ -248,7 +250,10 @@ function appendJsonLine(file, data) {
       JSON.stringify(data) + "\n"
     );
   } catch (e) {
-    console.log("write error:", e.message);
+    console.log(
+      "write error:",
+      e.message
+    );
   }
 }
 
@@ -256,10 +261,31 @@ function saveJson(file, data) {
   try {
     fs.writeFileSync(
       file,
-      JSON.stringify(data, null, 2)
+      JSON.stringify(
+        data,
+        null,
+        2
+      )
     );
   } catch (e) {
-    console.log("save error:", e.message);
+    console.log(
+      "save error:",
+      e.message
+    );
+  }
+}
+
+async function sendTelegram(text) {
+  try {
+    await bot.telegram.sendMessage(
+      CHAT_ID,
+      text
+    );
+  } catch (e) {
+    console.log(
+      "Telegram error:",
+      e.message
+    );
   }
 }
 
@@ -268,9 +294,9 @@ function saveJson(file, data) {
 // ============================================================
 
 async function getDexPairs(mint) {
-  const url = `${DEX_TOKEN_API}/${mint}`;
-
-  const response = await fetch(url);
+  const response = await fetch(
+    `${DEX_TOKEN_API}/${mint}`
+  );
 
   if (!response.ok) {
     throw new Error(
@@ -278,7 +304,8 @@ async function getDexPairs(mint) {
     );
   }
 
-  const json = await response.json();
+  const json =
+    await response.json();
 
   return Array.isArray(json.pairs)
     ? json.pairs
@@ -286,123 +313,195 @@ async function getDexPairs(mint) {
 }
 
 function isPumpSwapPair(pair) {
-  const dexId =
-    String(pair?.dexId || "").toLowerCase();
+  const dex =
+    String(
+      pair?.dexId || ""
+    ).toLowerCase();
 
   return (
-    dexId === "pumpswap" ||
-    dexId === "pump_amm" ||
-    dexId === "pumpamm" ||
-    dexId.includes("pump")
+    dex === "pumpswap" ||
+    dex === "pump_amm" ||
+    dex === "pumpamm" ||
+    dex.includes("pump")
   );
 }
 
-function chooseBestPumpSwapPair(pairs, mint) {
-  const candidates = pairs.filter(pair => {
-    if (!isPumpSwapPair(pair)) return false;
+function chooseBestPumpSwapPair(
+  pairs,
+  mint
+) {
+  const candidates =
+    pairs.filter(pair => {
+      if (!isPumpSwapPair(pair)) {
+        return false;
+      }
 
-    const base =
-      pair?.baseToken?.address || "";
+      const base =
+        pair?.baseToken?.address ||
+        "";
 
-    const quote =
-      pair?.quoteToken?.address || "";
+      const quote =
+        pair?.quoteToken?.address ||
+        "";
 
-    return (
-      base === mint ||
-      quote === mint
-    );
-  });
+      return (
+        base === mint ||
+        quote === mint
+      );
+    });
 
   if (!candidates.length) {
     return null;
   }
 
-  candidates.sort((a, b) => {
-    const la =
-      safeNumber(a?.liquidity?.usd) || 0;
+  candidates.sort(
+    (a, b) => {
+      const la =
+        safeNumber(
+          a?.liquidity?.usd
+        ) || 0;
 
-    const lb =
-      safeNumber(b?.liquidity?.usd) || 0;
+      const lb =
+        safeNumber(
+          b?.liquidity?.usd
+        ) || 0;
 
-    return lb - la;
-  });
+      return lb - la;
+    }
+  );
 
   return candidates[0];
 }
 
-async function getBestPumpSwapPair(mint) {
-  const pairs = await getDexPairs(mint);
-
-  return chooseBestPumpSwapPair(
-    pairs,
-    mint
-  );
-}
-
 // ============================================================
-// SOLANA ACCOUNT HELPERS
+// PUMPSWAP POOL LAYOUT
+// ============================================================
+//
+// 8   pool bump
+// 9   index u16
+// 11  creator
+// 43  base mint
+// 75  quote mint
+// 107 lp mint
+// 139 base vault
+// 171 quote vault
+// 203 lp supply
+// 211 coin creator
+// 243 flags
+// 245 virtual quote reserves
+//
 // ============================================================
 
-function readPubkey(data, offset) {
-  if (!data || data.length < offset + 32) {
+function readPubkey(
+  data,
+  offset
+) {
+  if (
+    !data ||
+    data.length <
+      offset + 32
+  ) {
     return null;
   }
 
   return new PublicKey(
-    data.subarray(offset, offset + 32)
+    data.subarray(
+      offset,
+      offset + 32
+    )
   ).toBase58();
 }
 
-function readU64LE(data, offset) {
-  if (!data || data.length < offset + 8) {
+function readU16(
+  data,
+  offset
+) {
+  if (
+    !data ||
+    data.length <
+      offset + 2
+  ) {
+    return null;
+  }
+
+  return data.readUInt16LE(
+    offset
+  );
+}
+
+function readU64(
+  data,
+  offset
+) {
+  if (
+    !data ||
+    data.length <
+      offset + 8
+  ) {
     return null;
   }
 
   return Number(
-    data.readBigUInt64LE(offset)
+    data.readBigUInt64LE(
+      offset
+    )
   );
 }
 
-function readI128LE(data, offset) {
-  if (!data || data.length < offset + 16) {
+function readI128(
+  data,
+  offset
+) {
+  if (
+    !data ||
+    data.length <
+      offset + 16
+  ) {
     return 0;
   }
 
   try {
+    const low =
+      data.readBigUInt64LE(
+        offset
+      );
+
+    const high =
+      data.readBigInt64LE(
+        offset + 8
+      );
+
     return Number(
-      data.readBigInt64LE(offset)
+      high *
+        18446744073709551616n +
+        BigInt(low)
     );
   } catch {
-    try {
-      const low =
-        data.readBigUInt64LE(offset);
-
-      const high =
-        data.readBigInt64LE(offset + 8);
-
-      return Number(
-        high * 18446744073709551616n + BigInt(low)
-      );
-    } catch {
-      return 0;
-    }
+    return 0;
   }
 }
 
-// ============================================================
-// PUMPSWAP POOL PARSER
-// ============================================================
-
-function parsePumpSwapPool(accountInfo) {
+function parsePumpSwapPool(
+  accountInfo
+) {
   if (!accountInfo?.data) {
     return null;
   }
 
   let data;
 
-  if (Buffer.isBuffer(accountInfo.data)) {
-    data = accountInfo.data;
-  } else if (Array.isArray(accountInfo.data)) {
+  if (
+    Buffer.isBuffer(
+      accountInfo.data
+    )
+  ) {
+    data =
+      accountInfo.data;
+  } else if (
+    Array.isArray(
+      accountInfo.data
+    )
+  ) {
     try {
       data = Buffer.from(
         accountInfo.data[0],
@@ -415,117 +514,365 @@ function parsePumpSwapPool(accountInfo) {
     return null;
   }
 
-  if (data.length < 203) {
+  if (data.length < 211) {
     return null;
   }
 
-  const baseMint =
-    readPubkey(data, 43);
-
-  const quoteMint =
-    readPubkey(data, 75);
-
-  const lpMint =
-    readPubkey(data, 107);
-
-  const baseVault =
-    readPubkey(data, 139);
-
-  const quoteVault =
-    readPubkey(data, 171);
-
-  const lpSupply =
-    readU64LE(data, 203);
-
-  let virtualQuoteReserves = 0;
-
-  if (data.length >= 261) {
-    virtualQuoteReserves =
-      readI128LE(data, 245);
-  }
-
   return {
-    baseMint,
-    quoteMint,
-    lpMint,
-    baseVault,
-    quoteVault,
-    lpSupply,
-    virtualQuoteReserves,
-    dataLength: data.length,
+    index:
+      readU16(data, 9),
+
+    creator:
+      readPubkey(data, 11),
+
+    baseMint:
+      readPubkey(data, 43),
+
+    quoteMint:
+      readPubkey(data, 75),
+
+    lpMint:
+      readPubkey(data, 107),
+
+    baseVault:
+      readPubkey(data, 139),
+
+    quoteVault:
+      readPubkey(data, 171),
+
+    lpSupply:
+      readU64(data, 203),
+
+    coinCreator:
+      readPubkey(data, 211),
+
+    virtualQuoteReserves:
+      data.length >= 261
+        ? readI128(data, 245)
+        : 0,
+
+    dataLength:
+      data.length,
   };
 }
 
 // ============================================================
-// DIRECT PUMPSWAP DISCOVERY
+// IMPORTANT FIX
+// ============================================================
+//
+// On ne fait PLUS confiance au pairAddress DexScreener
+// comme adresse du compte Pool PumpSwap.
+//
+// Pour les pools canoniques PumpSwap, le pool est dérivé:
+//
+// ["pool", index, creator, baseMint, quoteMint]
+//
+// Pour les pools Pump migrés, index = 0 et creator est:
+//
+// ["pool-authority", baseMint]
+//
+// On essaie donc directement les PDA canoniques.
+//
 // ============================================================
 
-async function findDirectPumpSwapPools(mint) {
-  const cacheKey = mint;
+function pumpPoolAuthorityPda(
+  mint
+) {
+  return PublicKey.findProgramAddressSync(
+    [
+      Buffer.from(
+        "pool-authority"
+      ),
+      new PublicKey(mint).toBuffer(),
+    ],
+    PUMP_PROGRAM
+  )[0];
+}
 
-  const cached =
-    poolCache.get(cacheKey);
+function derivePumpSwapPoolPda(
+  index,
+  creator,
+  baseMint,
+  quoteMint
+) {
+  const indexBuffer =
+    Buffer.alloc(2);
 
-  if (
-    cached &&
-    now() - cached.timestamp < 5 * 60 * 1000
+  indexBuffer.writeUInt16LE(
+    index,
+    0
+  );
+
+  return PublicKey.findProgramAddressSync(
+    [
+      Buffer.from("pool"),
+      indexBuffer,
+      new PublicKey(
+        creator
+      ).toBuffer(),
+      new PublicKey(
+        baseMint
+      ).toBuffer(),
+      new PublicKey(
+        quoteMint
+      ).toBuffer(),
+    ],
+    PUMPSWAP_PROGRAM
+  )[0];
+}
+
+// ============================================================
+// DIRECT POOL READ
+// ============================================================
+
+async function readPoolAddress(
+  poolAddress,
+  mint
+) {
+  try {
+    const account =
+      await connection.getAccountInfo(
+        poolAddress,
+        "confirmed"
+      );
+
+    if (!account) {
+      return null;
+    }
+
+    if (
+      !account.owner.equals(
+        PUMPSWAP_PROGRAM
+      )
+    ) {
+      return null;
+    }
+
+    const pool =
+      parsePumpSwapPool(
+        account
+      );
+
+    if (!pool) {
+      return null;
+    }
+
+    if (
+      pool.baseMint !== mint
+    ) {
+      return null;
+    }
+
+    if (
+      pool.quoteMint !==
+      WSOL_MINT
+    ) {
+      return null;
+    }
+
+    if (
+      !pool.baseVault ||
+      !pool.quoteVault
+    ) {
+      return null;
+    }
+
+    return {
+      poolAddress:
+        poolAddress.toBase58(),
+
+      ...pool,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ============================================================
+// DIRECT PDA SEARCH
+// ============================================================
+
+async function findPumpSwapPdaPool(
+  mint
+) {
+  const baseMint =
+    new PublicKey(mint);
+
+  const quoteMint =
+    new PublicKey(
+      WSOL_MINT
+    );
+
+  const authority =
+    pumpPoolAuthorityPda(
+      mint
+    );
+
+  // Canonical PumpSwap migrated pool
+  const canonicalPool =
+    derivePumpSwapPoolPda(
+      0,
+      authority,
+      baseMint,
+      quoteMint
+    );
+
+  const directCanonical =
+    await readPoolAddress(
+      canonicalPool,
+      mint
+    );
+
+  if (directCanonical) {
+    return directCanonical;
+  }
+
+  // Try a range of pool indexes with the
+  // Pump pool authority as creator.
+  //
+  // This handles additional pools created
+  // for the same token pair.
+
+  const candidates = [];
+
+  for (
+    let index = 1;
+    index <= 20;
+    index++
   ) {
-    return cached.pools;
+    const pda =
+      derivePumpSwapPoolPda(
+        index,
+        authority,
+        baseMint,
+        quoteMint
+      );
+
+    candidates.push(
+      pda
+    );
   }
 
   const accounts =
-    await connection.getProgramAccounts(
-      PUMPSWAP_PROGRAM,
-      {
-        commitment: "confirmed",
-
-        filters: [
-          {
-            memcmp: {
-              offset: 43,
-              bytes: mint,
-            },
-          },
-          {
-            memcmp: {
-              offset: 75,
-              bytes: WSOL_MINT,
-            },
-          },
-        ],
-
-        encoding: "base64",
-      }
+    await connection.getMultipleAccountsInfo(
+      candidates,
+      "confirmed"
     );
 
-  const pools = [];
+  for (
+    let i = 0;
+    i < accounts.length;
+    i++
+  ) {
+    if (!accounts[i]) {
+      continue;
+    }
 
-  for (const item of accounts) {
-    try {
+    const parsed =
+      parsePumpSwapPool(
+        accounts[i]
+      );
+
+    if (!parsed) {
+      continue;
+    }
+
+    if (
+      parsed.baseMint !==
+      mint
+    ) {
+      continue;
+    }
+
+    if (
+      parsed.quoteMint !==
+      WSOL_MINT
+    ) {
+      continue;
+    }
+
+    return {
+      poolAddress:
+        candidates[i].toBase58(),
+
+      ...parsed,
+    };
+  }
+
+  return null;
+}
+
+// ============================================================
+// PROGRAM ACCOUNT FALLBACK
+// ============================================================
+//
+// This is the final fallback.
+//
+// It searches every PumpSwap Pool account where:
+//
+// offset 43 = token mint
+// offset 75 = WSOL
+//
+// No dataSize filter.
+// ============================================================
+
+async function findPumpSwapProgramPool(
+  mint
+) {
+  try {
+    const accounts =
+      await connection.getProgramAccounts(
+        PUMPSWAP_PROGRAM,
+        {
+          commitment:
+            "confirmed",
+
+          filters: [
+            {
+              memcmp: {
+                offset: 43,
+                bytes: mint,
+              },
+            },
+
+            {
+              memcmp: {
+                offset: 75,
+                bytes: WSOL_MINT,
+              },
+            },
+          ],
+
+          encoding:
+            "base64",
+        }
+      );
+
+    const pools = [];
+
+    for (
+      const item of accounts
+    ) {
       const parsed =
         parsePumpSwapPool(
           item.account
         );
 
-      if (!parsed) continue;
+      if (!parsed) {
+        continue;
+      }
 
       if (
-        parsed.baseMint !== mint
+        parsed.baseMint !==
+        mint
       ) {
         continue;
       }
 
       if (
-        parsed.quoteMint !== WSOL_MINT
+        parsed.quoteMint !==
+        WSOL_MINT
       ) {
-        continue;
-      }
-
-      if (!parsed.baseVault) {
-        continue;
-      }
-
-      if (!parsed.quoteVault) {
         continue;
       }
 
@@ -535,278 +882,212 @@ async function findDirectPumpSwapPools(mint) {
 
         ...parsed,
       });
-    } catch (e) {
-      console.log(
-        "Pool parse error:",
-        e.message
-      );
     }
+
+    if (!pools.length) {
+      return null;
+    }
+
+    return pools[0];
+  } catch (e) {
+    console.log(
+      "Program pool search:",
+      e.message
+    );
+
+    return null;
   }
-
-  poolCache.set(cacheKey, {
-    timestamp: now(),
-    pools,
-  });
-
-  return pools;
 }
 
-async function getTokenAccountAmount(address) {
+// ============================================================
+// POOL BALANCE
+// ============================================================
+
+async function getTokenVaultAmount(
+  vault
+) {
   try {
-    const info =
+    const account =
       await connection.getAccountInfo(
-        new PublicKey(address),
+        new PublicKey(vault),
         "confirmed"
       );
 
-    if (!info?.data) {
-      return 0;
-    }
-
-    if (info.data.length < 72) {
+    if (
+      !account?.data ||
+      account.data.length < 72
+    ) {
       return 0;
     }
 
     return Number(
-      info.data.readBigUInt64LE(64)
+      account.data.readBigUInt64LE(
+        64
+      )
     );
   } catch {
     return 0;
   }
 }
 
-async function selectBestDirectPool(
-  mint,
-  dexPair = null
+// ============================================================
+// BEST POOL
+// ============================================================
+
+async function findBestPumpSwapPool(
+  mint
 ) {
-  const pools =
-    await findDirectPumpSwapPools(
+  const cache =
+    poolCache.get(mint);
+
+  if (
+    cache &&
+    now() - cache.timestamp <
+      5 * 60 * 1000
+  ) {
+    return cache.pool;
+  }
+
+  // 1. PDA canonical
+  let pool =
+    await findPumpSwapPdaPool(
       mint
     );
 
-  if (!pools.length) {
-    return null;
-  }
-
-  const scored = [];
-
-  for (const pool of pools) {
-    const quoteAmount =
-      await getTokenAccountAmount(
+  if (pool) {
+    pool.quoteAmount =
+      await getTokenVaultAmount(
         pool.quoteVault
       );
 
-    const baseAmount =
-      await getTokenAccountAmount(
+    pool.baseAmount =
+      await getTokenVaultAmount(
         pool.baseVault
       );
 
-    scored.push({
-      ...pool,
-      quoteAmount,
-      baseAmount,
+    pool.effectiveQuoteAmount =
+      pool.quoteAmount +
+      (pool.virtualQuoteReserves ||
+        0);
 
-      effectiveQuoteAmount:
-        quoteAmount +
-        (pool.virtualQuoteReserves || 0),
-    });
+    poolCache.set(
+      mint,
+      {
+        timestamp: now(),
+        pool,
+      }
+    );
+
+    return pool;
   }
 
-  scored.sort(
-    (a, b) =>
-      b.effectiveQuoteAmount -
-      a.effectiveQuoteAmount
-  );
+  // 2. Full PumpSwap program scan
+  pool =
+    await findPumpSwapProgramPool(
+      mint
+    );
 
-  return scored[0];
+  if (pool) {
+    pool.quoteAmount =
+      await getTokenVaultAmount(
+        pool.quoteVault
+      );
+
+    pool.baseAmount =
+      await getTokenVaultAmount(
+        pool.baseVault
+      );
+
+    pool.effectiveQuoteAmount =
+      pool.quoteAmount +
+      (pool.virtualQuoteReserves ||
+        0);
+
+    poolCache.set(
+      mint,
+      {
+        timestamp: now(),
+        pool,
+      }
+    );
+
+    return pool;
+  }
+
+  return null;
 }
 
 // ============================================================
-// VERIFY DEX POOL DIRECTLY
+// HOLDER COUNT
 // ============================================================
 
-async function verifyDexPairOnChain(
-  pair,
+async function getHolderCount(
   mint
 ) {
-  if (!pair?.pairAddress) {
-    return {
-      ok: false,
-      reason: "PAIR_ADDRESS_MISSING",
-    };
-  }
-
-  try {
-    const pairPubkey =
-      new PublicKey(
-        pair.pairAddress
-      );
-
-    const account =
-      await connection.getAccountInfo(
-        pairPubkey,
-        "confirmed"
-      );
-
-    if (!account) {
-      return {
-        ok: false,
-        reason: "POOL_ACCOUNT_NOT_FOUND",
-      };
-    }
-
-    if (
-      !account.owner.equals(
-        PUMPSWAP_PROGRAM
-      )
-    ) {
-      return {
-        ok: false,
-        reason: "OWNER_NOT_PUMPSWAP",
-      };
-    }
-
-    const parsed =
-      parsePumpSwapPool(account);
-
-    if (!parsed) {
-      return {
-        ok: false,
-        reason: "POOL_PARSE_FAILED",
-      };
-    }
-
-    if (
-      parsed.baseMint !== mint
-    ) {
-      return {
-        ok: false,
-        reason: "BASE_MINT_MISMATCH",
-        parsed,
-      };
-    }
-
-    if (
-      parsed.quoteMint !== WSOL_MINT
-    ) {
-      return {
-        ok: false,
-        reason: "QUOTE_NOT_WSOL",
-        parsed,
-      };
-    }
-
-    return {
-      ok: true,
-      pool: {
-        poolAddress:
-          pair.pairAddress,
-        ...parsed,
-      },
-    };
-  } catch (e) {
-    return {
-      ok: false,
-      reason: e.message,
-    };
-  }
-}
-
-// ============================================================
-// TOKEN HOLDERS
-// ============================================================
-
-async function getHolderCount(mint) {
   try {
     const accounts =
-      await connection.getTokenLargestAccounts(
-        new PublicKey(mint),
-        "confirmed"
+      await connection.getParsedProgramAccounts(
+        new PublicKey(
+          "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        ),
+        {
+          commitment:
+            "confirmed",
+
+          filters: [
+            {
+              dataSize: 165,
+            },
+            {
+              memcmp: {
+                offset: 0,
+                bytes: mint,
+              },
+            },
+          ],
+        }
       );
 
-    if (!accounts?.value) {
-      return 0;
+    const owners =
+      new Set();
+
+    for (
+      const account
+      of accounts
+    ) {
+      try {
+        const info =
+          account.account.data
+            .parsed.info;
+
+        const amount =
+          Number(
+            info?.tokenAmount
+              ?.uiAmount || 0
+          );
+
+        if (
+          amount > 0 &&
+          info?.owner
+        ) {
+          owners.add(
+            info.owner
+          );
+        }
+
+        if (
+          owners.size >=
+          MIN_HOLDERS
+        ) {
+          return MIN_HOLDERS;
+        }
+      } catch {}
     }
 
-    let count = 0;
-
-    for (const item of accounts.value) {
-      const amount =
-        safeNumber(
-          item?.uiAmount
-        );
-
-      if (
-        amount !== null &&
-        amount > 0
-      ) {
-        count++;
-      }
-    }
-
-    if (count >= MIN_HOLDERS) {
-      return MIN_HOLDERS;
-    }
-
-    try {
-      const tokenAccounts =
-        await connection.getParsedProgramAccounts(
-          new PublicKey(
-            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-          ),
-          {
-            commitment: "confirmed",
-
-            filters: [
-              {
-                dataSize: 165,
-              },
-              {
-                memcmp: {
-                  offset: 0,
-                  bytes: mint,
-                },
-              },
-            ],
-          }
-        );
-
-      const owners = new Set();
-
-      for (
-        const account
-        of tokenAccounts
-      ) {
-        try {
-          const info =
-            account.account.data.parsed.info;
-
-          const amount =
-            info?.tokenAmount?.uiAmount;
-
-          if (
-            Number(amount) > 0 &&
-            info?.owner
-          ) {
-            owners.add(info.owner);
-          }
-
-          if (
-            owners.size >=
-            MIN_HOLDERS
-          ) {
-            return MIN_HOLDERS;
-          }
-        } catch {}
-      }
-
-      return owners.size;
-    } catch {
-      return count;
-    }
+    return owners.size;
   } catch (e) {
     console.log(
-      "Holder count error:",
+      "Holder error:",
       e.message
     );
 
@@ -815,10 +1096,12 @@ async function getHolderCount(mint) {
 }
 
 // ============================================================
-// TOKEN METADATA
+// NAME
 // ============================================================
 
-function normalizeName(value) {
+function normalizeName(
+  value
+) {
   return String(value || "")
     .trim()
     .toLowerCase();
@@ -842,10 +1125,12 @@ function nameMatches(
 }
 
 // ============================================================
-// MARKET AGE
+// AGE
 // ============================================================
 
-function getPairAgeMs(pair) {
+function getPairAgeMs(
+  pair
+) {
   const created =
     safeNumber(
       pair?.pairCreatedAt
@@ -866,21 +1151,27 @@ async function evaluateMint(
   mint,
   options = {}
 ) {
-  if (evaluationLock && !options.force) {
+  if (
+    evaluationLock &&
+    !options.force
+  ) {
     return {
       ok: false,
-      reason: "EVALUATION_BUSY",
+      reason:
+        "EVALUATION_BUSY",
     };
   }
 
   evaluationLock = true;
 
   try {
-    let dexPairs;
+    let pairs;
 
     try {
-      dexPairs =
-        await getDexPairs(mint);
+      pairs =
+        await getDexPairs(
+          mint
+        );
     } catch (e) {
       return {
         ok: false,
@@ -889,28 +1180,31 @@ async function evaluateMint(
       };
     }
 
-    const pumpPair =
+    const pair =
       chooseBestPumpSwapPair(
-        dexPairs,
+        pairs,
         mint
       );
 
-    if (!pumpPair) {
+    if (!pair) {
       return {
         ok: false,
-        reason: "NO_PUMPSWAP_PAIR",
+        reason:
+          "NO_PUMPSWAP_PAIR",
       };
     }
 
     const name =
-      pumpPair?.baseToken?.address === mint
-        ? pumpPair?.baseToken?.name
-        : pumpPair?.quoteToken?.name;
+      pair?.baseToken?.address ===
+      mint
+        ? pair?.baseToken?.name
+        : pair?.quoteToken?.name;
 
     const symbol =
-      pumpPair?.baseToken?.address === mint
-        ? pumpPair?.baseToken?.symbol
-        : pumpPair?.quoteToken?.symbol;
+      pair?.baseToken?.address ===
+      mint
+        ? pair?.baseToken?.symbol
+        : pair?.quoteToken?.symbol;
 
     if (
       !nameMatches(
@@ -920,35 +1214,39 @@ async function evaluateMint(
     ) {
       return {
         ok: false,
-        reason: "NAME_NOT_ALLOWED",
-        pair: pumpPair,
+        reason:
+          "NAME_NOT_ALLOWED",
         name,
         symbol,
+        pair,
       };
     }
 
     const liquidity =
       safeNumber(
-        pumpPair?.liquidity?.usd
+        pair?.liquidity?.usd
       ) || 0;
 
     if (
-      liquidity < MIN_LIQUIDITY ||
-      liquidity > MAX_LIQUIDITY
+      liquidity <
+        MIN_LIQUIDITY ||
+      liquidity >
+        MAX_LIQUIDITY
     ) {
       return {
         ok: false,
-        reason: "LIQUIDITY_OUT_OF_RANGE",
-        pair: pumpPair,
+        reason:
+          "LIQUIDITY_OUT_OF_RANGE",
         name,
         symbol,
         liquidity,
+        pair,
       };
     }
 
     const ageMs =
       getPairAgeMs(
-        pumpPair
+        pair
       );
 
     if (
@@ -956,25 +1254,28 @@ async function evaluateMint(
     ) {
       return {
         ok: false,
-        reason: "AGE_UNKNOWN",
-        pair: pumpPair,
+        reason:
+          "AGE_UNKNOWN",
         name,
         symbol,
         liquidity,
+        pair,
       };
     }
 
     if (
-      ageMs > MAX_AGE_MS
+      ageMs >
+      MAX_AGE_MS
     ) {
       return {
         ok: false,
-        reason: "TOKEN_TOO_OLD",
-        pair: pumpPair,
+        reason:
+          "TOKEN_TOO_OLD",
         name,
         symbol,
         liquidity,
         ageMs,
+        pair,
       };
     }
 
@@ -984,71 +1285,48 @@ async function evaluateMint(
       );
 
     if (
-      holders < MIN_HOLDERS
+      holders <
+      MIN_HOLDERS
     ) {
       return {
         ok: false,
-        reason: "NOT_ENOUGH_HOLDERS",
-        pair: pumpPair,
+        reason:
+          "NOT_ENOUGH_HOLDERS",
         name,
         symbol,
         liquidity,
         ageMs,
         holders,
+        pair,
       };
     }
 
-    // --------------------------------------------------------
-    // IMPORTANT FIX V6.1
-    // --------------------------------------------------------
-    // On ne rejette plus le token parce que l'adresse
-    // pair de DexScreener ne correspond pas directement
-    // au base_mint du compte.
-    //
-    // On recherche maintenant directement les vrais pools
-    // PumpSwap ayant:
-    // offset 43 = mint
-    // offset 75 = WSOL
-    // --------------------------------------------------------
+    // ========================================================
+    // NO MORE BASE_MINT_MISMATCH BLOCKING
+    // ========================================================
 
-    let directPool = null;
-
-    const dexVerification =
-      await verifyDexPairOnChain(
-        pumpPair,
+    const pool =
+      await findBestPumpSwapPool(
         mint
       );
 
-    if (
-      dexVerification.ok
-    ) {
-      directPool =
-        dexVerification.pool;
-    } else {
-      console.log(
-        `DEX pool non concordant (${dexVerification.reason}), recherche directe PumpSwap...`
-      );
-
-      directPool =
-        await selectBestDirectPool(
-          mint,
-          pumpPair
-        );
-    }
-
-    if (!directPool) {
+    if (!pool) {
       return {
         ok: false,
-        reason: "NO_VALID_DIRECT_PUMPSWAP_POOL",
-        pair: pumpPair,
+
+        reason:
+          "NO_VALID_DIRECT_PUMPSWAP_POOL",
+
         name,
         symbol,
         liquidity,
         ageMs,
         holders,
-        onchain: false,
-        dexVerification:
-          dexVerification.reason,
+
+        pair,
+
+        dexPairAddress:
+          pair.pairAddress,
       };
     }
 
@@ -1061,25 +1339,20 @@ async function evaluateMint(
       symbol,
 
       liquidity,
-
       ageMs,
-
       holders,
 
-      pair: pumpPair,
+      pair,
 
       pairAddress:
-        pumpPair.pairAddress,
+        pair.pairAddress,
 
-      pool:
-        directPool,
+      pool,
 
       onchain: true,
 
       onchainSource:
-        dexVerification.ok
-          ? "DEX_PAIR"
-          : "DIRECT_PROGRAM_SCAN",
+        "DIRECT_PUMPSWAP_POOL",
     };
   } finally {
     evaluationLock = false;
@@ -1087,24 +1360,25 @@ async function evaluateMint(
 }
 
 // ============================================================
-// MARKET DATA
+// MARKET
 // ============================================================
 
 async function getMarketData() {
-  if (!currentCandidate) {
+  if (
+    !currentCandidate
+  ) {
     return null;
   }
 
-  const mint =
-    currentCandidate.mint;
-
   const pairs =
-    await getDexPairs(mint);
+    await getDexPairs(
+      currentCandidate.mint
+    );
 
   const pair =
     chooseBestPumpSwapPair(
       pairs,
-      mint
+      currentCandidate.mint
     );
 
   if (!pair) {
@@ -1128,11 +1402,14 @@ async function getMarketData() {
     return null;
   }
 
-  currentPair = pair;
+  currentPair =
+    pair;
 
-  const item = {
+  const market = {
     timestamp: now(),
+
     price,
+
     liquidity,
 
     dexId:
@@ -1157,7 +1434,9 @@ async function getMarketData() {
       ) || 0,
   };
 
-  marketHistory.push(item);
+  marketHistory.push(
+    market
+  );
 
   const cutoff =
     now() - HISTORY_MS;
@@ -1165,39 +1444,35 @@ async function getMarketData() {
   marketHistory =
     marketHistory.filter(
       x =>
-        x.timestamp >= cutoff
+        x.timestamp >=
+        cutoff
     );
 
   appendJsonLine(
     MARKET_FILE,
-    item
+    market
   );
 
-  return item;
+  return market;
 }
 
 // ============================================================
-// HISTORY METRICS
+// HISTORY
 // ============================================================
 
-function getOldestWithin(ms) {
+function getOldestWithin(
+  ms
+) {
   const cutoff =
     now() - ms;
 
-  for (
-    let i = 0;
-    i < marketHistory.length;
-    i++
-  ) {
-    if (
-      marketHistory[i].timestamp >=
-      cutoff
-    ) {
-      return marketHistory[i];
-    }
-  }
-
-  return null;
+  return (
+    marketHistory.find(
+      x =>
+        x.timestamp >=
+        cutoff
+    ) || null
+  );
 }
 
 function changePercent(
@@ -1205,8 +1480,7 @@ function changePercent(
   newValue
 ) {
   if (
-    oldValue === null ||
-    oldValue === undefined ||
+    !oldValue ||
     oldValue === 0
   ) {
     return null;
@@ -1219,48 +1493,62 @@ function changePercent(
   );
 }
 
-function priceDrop10s(current) {
+function priceDrop10s(
+  market
+) {
   const old =
-    getOldestWithin(10000);
+    getOldestWithin(
+      10000
+    );
 
   if (!old) return null;
 
   return changePercent(
     old.price,
-    current.price
+    market.price
   );
 }
 
-function liquidityDrop10s(current) {
+function liquidityDrop10s(
+  market
+) {
   const old =
-    getOldestWithin(10000);
+    getOldestWithin(
+      10000
+    );
 
   if (!old) return null;
 
   return changePercent(
     old.liquidity,
-    current.liquidity
+    market.liquidity
   );
 }
 
-function liquidityDrop30s(current) {
+function liquidityDrop30s(
+  market
+) {
   const old =
-    getOldestWithin(30000);
+    getOldestWithin(
+      30000
+    );
 
   if (!old) return null;
 
   return changePercent(
     old.liquidity,
-    current.liquidity
+    market.liquidity
   );
 }
 
 // ============================================================
-// ENTRY FILTER
+// ENTRY
 // ============================================================
 
-function entryHealth(current) {
-  if (!current) {
+function entryHealth(
+  market
+) {
+  if (!market) {
     return {
       ok: false,
       reason: "NO_MARKET",
@@ -1268,17 +1556,19 @@ function entryHealth(current) {
   }
 
   if (
-    current.liquidity <
+    market.liquidity <
     MIN_TRADE_LIQUIDITY
   ) {
     return {
       ok: false,
-      reason: "LIQUIDITY_TOO_LOW",
+      reason:
+        "LIQUIDITY_TOO_LOW",
     };
   }
 
   if (
-    marketHistory.length < 8
+    marketHistory.length <
+    8
   ) {
     return {
       ok: false,
@@ -1288,13 +1578,19 @@ function entryHealth(current) {
   }
 
   const p10 =
-    priceDrop10s(current);
+    priceDrop10s(
+      market
+    );
 
   const l10 =
-    liquidityDrop10s(current);
+    liquidityDrop10s(
+      market
+    );
 
   const l30 =
-    liquidityDrop30s(current);
+    liquidityDrop30s(
+      market
+    );
 
   if (
     p10 !== null &&
@@ -1336,28 +1632,36 @@ function entryHealth(current) {
 }
 
 // ============================================================
-// CRASH DETECTION
+// CRASH
 // ============================================================
 
-function detectCrash(current) {
-  if (!current) {
+function detectCrash(
+  market
+) {
+  if (!market) {
     return null;
   }
 
   if (
-    current.liquidity <=
+    market.liquidity <=
     CRASH_LIQUIDITY
   ) {
     return {
-      type: "LIQUIDITY_NEAR_ZERO",
-      price: current.price,
+      type:
+        "LIQUIDITY_NEAR_ZERO",
+
+      price:
+        market.price,
+
       liquidity:
-        current.liquidity,
+        market.liquidity,
     };
   }
 
   const l10 =
-    liquidityDrop10s(current);
+    liquidityDrop10s(
+      market
+    );
 
   if (
     l10 !== null &&
@@ -1365,16 +1669,24 @@ function detectCrash(current) {
       CRASH_LIQUIDITY_DROP_10S
   ) {
     return {
-      type: "LIQUIDITY_COLLAPSE",
-      price: current.price,
+      type:
+        "LIQUIDITY_COLLAPSE",
+
+      price:
+        market.price,
+
       liquidity:
-        current.liquidity,
-      liquidityDrop10s: l10,
+        market.liquidity,
+
+      liquidityDrop10s:
+        l10,
     };
   }
 
   const p10 =
-    priceDrop10s(current);
+    priceDrop10s(
+      market
+    );
 
   if (
     p10 !== null &&
@@ -1382,11 +1694,17 @@ function detectCrash(current) {
       CRASH_PRICE_DROP_10S
   ) {
     return {
-      type: "PRICE_CRASH",
-      price: current.price,
+      type:
+        "PRICE_CRASH",
+
+      price:
+        market.price,
+
       liquidity:
-        current.liquidity,
-      priceDrop10s: p10,
+        market.liquidity,
+
+      priceDrop10s:
+        p10,
     };
   }
 
@@ -1394,16 +1712,21 @@ function detectCrash(current) {
 }
 
 // ============================================================
-// SIMULATED BUY
+// BUY
 // ============================================================
 
-function canBuyStrategy(strategy) {
-  if (strategy.open) {
+function canBuy(
+  strategy
+) {
+  if (
+    strategy.open
+  ) {
     return false;
   }
 
   if (
-    now() - strategy.lastSellAt <
+    now() -
+      strategy.lastSellAt <
     POST_SELL_COOLDOWN_MS
   ) {
     return false;
@@ -1416,7 +1739,8 @@ function canBuyStrategy(strategy) {
   }
 
   if (
-    now() - sessionStartedAt >=
+    now() -
+      sessionStartedAt >=
     NO_NEW_BUY_AFTER_MS
   ) {
     return false;
@@ -1442,23 +1766,24 @@ function simulateBuy(
 
   strategy.targetPrice =
     strategy.entryPrice *
-    (1 + TARGET_PERCENT / 100);
+    1.05;
 
   strategy.stopPrice =
     strategy.entryPrice *
-    (1 + strategy.stopPercent / 100);
+    (1 +
+      strategy.stopPercent /
+        100);
 
   strategy.totalInvested +=
     CAPITAL;
 
   console.log(
-    `BUY #${strategy.id}`,
-    strategy.entryPrice
+    `🟢 BUY SIMULÉ ${strategy.name} @ ${market.price}`
   );
 }
 
 // ============================================================
-// SIMULATED SELL
+// SELL
 // ============================================================
 
 function simulateSell(
@@ -1466,7 +1791,9 @@ function simulateSell(
   market,
   reason
 ) {
-  if (!strategy.open) {
+  if (
+    !strategy.open
+  ) {
     return;
   }
 
@@ -1496,19 +1823,31 @@ function simulateSell(
   strategy.lastSellAt =
     now();
 
-  if (reason === "TARGET") {
+  if (
+    reason ===
+    "TARGET"
+  ) {
     strategy.wins++;
-  } else if (
-    reason === "STOP"
+  }
+
+  if (
+    reason ===
+    "STOP"
   ) {
     strategy.losses++;
-  } else if (
-    reason === "CRASH"
+  }
+
+  if (
+    reason ===
+    "CRASH"
   ) {
+    strategy.losses++;
     strategy.crashes++;
-    strategy.losses++;
-  } else if (
-    reason === "SESSION_LIMIT"
+  }
+
+  if (
+    reason ===
+    "SESSION_LIMIT"
   ) {
     strategy.sessionLimit++;
   }
@@ -1522,9 +1861,11 @@ function simulateSell(
 
     reason,
 
-    entryPrice: entry,
+    entryPrice:
+      entry,
 
-    exitPrice: exit,
+    exitPrice:
+      exit,
 
     resultPercent,
 
@@ -1557,15 +1898,12 @@ function simulateSell(
   );
 
   console.log(
-    `SELL ${strategy.name}`,
-    reason,
-    resultPercent.toFixed(2),
-    pnl.toFixed(2)
+    `🎯 SELL ${strategy.name} ${reason} ${resultPercent.toFixed(2)}%`
   );
 }
 
 // ============================================================
-// FORCE CLOSE
+// CLOSE ALL
 // ============================================================
 
 function forceCloseAll(
@@ -1576,7 +1914,9 @@ function forceCloseAll(
     const strategy
     of strategies
   ) {
-    if (strategy.open) {
+    if (
+      strategy.open
+    ) {
       simulateSell(
         strategy,
         market,
@@ -1615,21 +1955,35 @@ function createCrashReport(
     market,
 
     strategies:
-      strategies.map(s => ({
-        name: s.name,
-        wins: s.wins,
-        losses: s.losses,
-        crashes: s.crashes,
-        sessionLimit:
-          s.sessionLimit,
-        totalPnl:
-          s.totalPnl,
-        open:
-          s.open,
-      })),
+      strategies.map(
+        s => ({
+          name:
+            s.name,
+
+          wins:
+            s.wins,
+
+          losses:
+            s.losses,
+
+          crashes:
+            s.crashes,
+
+          sessionLimit:
+            s.sessionLimit,
+
+          totalPnl:
+            s.totalPnl,
+
+          open:
+            s.open,
+        })
+      ),
 
     history:
-      marketHistory.slice(-100),
+      marketHistory.slice(
+        -100
+      ),
   };
 
   crashes.push(
@@ -1640,16 +1994,16 @@ function createCrashReport(
     CRASH_FILE,
     crashes
   );
-
-  return report;
 }
 
 // ============================================================
-// SESSION LIMIT
+// SESSION
 // ============================================================
 
 function sessionLimitReached() {
-  if (!sessionStartedAt) {
+  if (
+    !sessionStartedAt
+  ) {
     return false;
   }
 
@@ -1661,7 +2015,9 @@ function sessionLimitReached() {
 }
 
 function noMoreBuys() {
-  if (!sessionStartedAt) {
+  if (
+    !sessionStartedAt
+  ) {
     return false;
   }
 
@@ -1676,39 +2032,13 @@ function noMoreBuys() {
 // COMPARISON
 // ============================================================
 
-function getComparison() {
-  return strategies.map(
-    strategy => ({
-      strategy:
-        strategy.name,
-
-      stopPercent:
-        strategy.stopPercent,
-
-      targetPercent:
-        strategy.targetPercent,
-
-      wins:
-        strategy.wins,
-
-      losses:
-        strategy.losses,
-
-      crashes:
-        strategy.crashes,
-
-      sessionLimit:
-        strategy.sessionLimit,
-
-      totalTrades:
-        strategy.trades.length,
-
-      pnl:
-        Number(
-          strategy.totalPnl.toFixed(4)
-        ),
-    })
-  );
+function formatComparison() {
+  return strategies
+    .map(
+      s =>
+        `${s.name}: ${s.wins}W / ${s.losses}L / ${s.sessionLimit}SL | P&L ${s.totalPnl >= 0 ? "+" : ""}${s.totalPnl.toFixed(2)} $`
+    )
+    .join("\n");
 }
 
 function saveComparison() {
@@ -1723,7 +2053,35 @@ function saveComparison() {
         null,
 
       comparison:
-        getComparison(),
+        strategies.map(
+          s => ({
+            strategy:
+              s.name,
+
+            stop:
+              s.stopPercent,
+
+            target:
+              s.targetPercent,
+
+            wins:
+              s.wins,
+
+            losses:
+              s.losses,
+
+            crashes:
+              s.crashes,
+
+            sessionLimit:
+              s.sessionLimit,
+
+            pnl:
+              Number(
+                s.totalPnl.toFixed(4)
+              ),
+          })
+        ),
     }
   );
 }
@@ -1748,15 +2106,14 @@ async function marketTick() {
     lastMarket =
       market;
 
-    // --------------------------------------------------------
-    // TARGET / STOP FIRST
-    // --------------------------------------------------------
-
+    // TARGET / STOP
     for (
       const strategy
       of strategies
     ) {
-      if (!strategy.open) {
+      if (
+        !strategy.open
+      ) {
         continue;
       }
 
@@ -1785,10 +2142,7 @@ async function marketTick() {
       }
     }
 
-    // --------------------------------------------------------
     // CRASH
-    // --------------------------------------------------------
-
     const crash =
       detectCrash(
         market
@@ -1805,33 +2159,15 @@ async function marketTick() {
         crash
       );
 
-      tradeRunning = false;
-
-      if (marketTimer) {
-        clearInterval(
-          marketTimer
-        );
-
-        marketTimer = null;
-      }
-
-      if (
-        pairDiscoveryTimer
-      ) {
-        clearInterval(
-          pairDiscoveryTimer
-        );
-
-        pairDiscoveryTimer = null;
-      }
+      stopTrade();
 
       saveComparison();
 
       await sendTelegram(
-        `🚨 CRASH V6\n\n` +
+        `🚨 CRASH V6.1\n\n` +
         `🪙 ${currentCandidate?.name || "Token"}\n` +
-        `💰 Prix : ${market.price}\n` +
-        `💧 Liquidité : $${market.liquidity.toFixed(2)}\n` +
+        `💰 Prix: ${market.price}\n` +
+        `💧 Liquidité: $${market.liquidity.toFixed(2)}\n` +
         `⚠️ ${crash.type}\n\n` +
         `🛑 Nouveaux BUY arrêtés.\n\n` +
         formatComparison()
@@ -1840,10 +2176,7 @@ async function marketTick() {
       return;
     }
 
-    // --------------------------------------------------------
-    // 45 MINUTES
-    // --------------------------------------------------------
-
+    // 45 MIN
     if (
       sessionLimitReached()
     ) {
@@ -1852,42 +2185,21 @@ async function marketTick() {
         "SESSION_LIMIT"
       );
 
-      tradeRunning = false;
+      stopTrade();
 
       saveComparison();
 
-      if (marketTimer) {
-        clearInterval(
-          marketTimer
-        );
-
-        marketTimer = null;
-      }
-
-      if (
-        pairDiscoveryTimer
-      ) {
-        clearInterval(
-          pairDiscoveryTimer
-        );
-
-        pairDiscoveryTimer = null;
-      }
-
       await sendTelegram(
-        `⏱️ FIN SESSION V6\n\n` +
+        `⏱️ FIN SESSION\n\n` +
         `45 minutes atteintes.\n` +
-        `Toute position ouverte a été fermée en sécurité.\n\n` +
+        `Toute position ouverte a été fermée.\n\n` +
         formatComparison()
       );
 
       return;
     }
 
-    // --------------------------------------------------------
     // NEW BUY
-    // --------------------------------------------------------
-
     if (
       !noMoreBuys()
     ) {
@@ -1904,7 +2216,7 @@ async function marketTick() {
           of strategies
         ) {
           if (
-            canBuyStrategy(
+            canBuy(
               strategy
             )
           ) {
@@ -1917,10 +2229,6 @@ async function marketTick() {
       }
     }
 
-    // --------------------------------------------------------
-    // DIAGNOSTIC
-    // --------------------------------------------------------
-
     if (
       now() -
         lastDiagnosticAt >
@@ -1929,21 +2237,8 @@ async function marketTick() {
       lastDiagnosticAt =
         now();
 
-      const p10 =
-        priceDrop10s(
-          market
-        );
-
-      const l10 =
-        liquidityDrop10s(
-          market
-        );
-
       console.log(
-        `📊 ${market.price} | ` +
-        `$${market.liquidity.toFixed(2)} | ` +
-        `P10 ${p10 === null ? "N/A" : p10.toFixed(2) + "%"} | ` +
-        `L10 ${l10 === null ? "N/A" : l10.toFixed(2) + "%"}`
+        `📊 ${market.price} | $${market.liquidity.toFixed(2)}`
       );
     }
   } catch (e) {
@@ -1955,55 +2250,26 @@ async function marketTick() {
 }
 
 // ============================================================
-// PAIR REFRESH
+// REFRESH POOL
 // ============================================================
 
-async function refreshCurrentPool() {
-  if (!tradeRunning) {
-    return;
-  }
-
-  if (!currentCandidate) {
+async function refreshPool() {
+  if (
+    !tradeRunning ||
+    !currentCandidate
+  ) {
     return;
   }
 
   try {
-    const pair =
-      await getBestPumpSwapPair(
+    const pool =
+      await findBestPumpSwapPool(
         currentCandidate.mint
       );
 
-    if (!pair) {
-      return;
-    }
-
-    currentPair =
-      pair;
-
-    const verified =
-      await verifyDexPairOnChain(
-        pair,
-        currentCandidate.mint
-      );
-
-    if (
-      verified.ok
-    ) {
+    if (pool) {
       currentPool =
-        verified.pool;
-
-      return;
-    }
-
-    const directPool =
-      await selectBestDirectPool(
-        currentCandidate.mint,
-        pair
-      );
-
-    if (directPool) {
-      currentPool =
-        directPool;
+        pool;
     }
   } catch (e) {
     console.log(
@@ -2014,7 +2280,7 @@ async function refreshCurrentPool() {
 }
 
 // ============================================================
-// HELIUS LOGS
+// HELIUS WS
 // ============================================================
 
 function startHeliusLogs() {
@@ -2030,78 +2296,90 @@ function startHeliusLogs() {
         WSS_URL
       );
 
-    heliusWs.onopen = () => {
-      try {
-        heliusWs.send(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            id: 1,
-            method: "logsSubscribe",
-            params: [
-              {
-                mentions: [
-                  PUMPSWAP_PROGRAM.toBase58(),
-                ],
-              },
-              {
-                commitment:
-                  "processed",
-              },
-            ],
-          })
-        );
-      } catch {}
-    };
+    heliusWs.onopen =
+      () => {
+        try {
+          heliusWs.send(
+            JSON.stringify({
+              jsonrpc: "2.0",
 
-    heliusWs.onmessage = event => {
-      try {
-        const data =
-          JSON.parse(
-            event.data
+              id: 1,
+
+              method:
+                "logsSubscribe",
+
+              params: [
+                {
+                  mentions: [
+                    PUMPSWAP_PROGRAM.toBase58(),
+                  ],
+                },
+
+                {
+                  commitment:
+                    "processed",
+                },
+              ],
+            })
           );
+        } catch {}
+      };
 
-        if (
-          data?.method ===
-          "logsNotification"
-        ) {
-          const logs =
-            data?.params?.result?.value?.logs;
+    heliusWs.onmessage =
+      event => {
+        try {
+          const data =
+            JSON.parse(
+              event.data
+            );
 
           if (
-            Array.isArray(logs)
+            data?.method ===
+            "logsNotification"
           ) {
-            const joined =
-              logs.join(" ");
+            const logs =
+              data?.params?.result
+                ?.value?.logs;
 
             if (
-              joined.includes(
-                "Instruction: Buy"
-              ) ||
-              joined.includes(
-                "Instruction: Sell"
+              Array.isArray(
+                logs
               )
             ) {
-              console.log(
-                "⚡ PumpSwap trade event"
-              );
+              const text =
+                logs.join(" ");
+
+              if (
+                text.includes(
+                  "Instruction: Buy"
+                ) ||
+                text.includes(
+                  "Instruction: Sell"
+                )
+              ) {
+                console.log(
+                  "⚡ PumpSwap trade"
+                );
+              }
             }
           }
-        }
-      } catch {}
-    };
+        } catch {}
+      };
 
-    heliusWs.onerror = () => {
-      console.log(
-        "Helius WS error"
-      );
-    };
+    heliusWs.onerror =
+      () => {
+        console.log(
+          "Helius WS error"
+        );
+      };
 
-    heliusWs.onclose = () => {
-      heliusWs = null;
-    };
+    heliusWs.onclose =
+      () => {
+        heliusWs = null;
+      };
   } catch (e) {
     console.log(
-      "Helius WS start error:",
+      "WS error:",
       e.message
     );
   }
@@ -2122,14 +2400,12 @@ function stopTrade() {
     marketTimer = null;
   }
 
-  if (
-    pairDiscoveryTimer
-  ) {
+  if (pairTimer) {
     clearInterval(
-      pairDiscoveryTimer
+      pairTimer
     );
 
-    pairDiscoveryTimer = null;
+    pairTimer = null;
   }
 
   if (heliusWs) {
@@ -2142,23 +2418,27 @@ function stopTrade() {
 }
 
 // ============================================================
-// START TRADE
+// START
 // ============================================================
 
 async function startTrade() {
-  if (!currentCandidate) {
+  if (
+    !currentCandidate
+  ) {
     return {
       ok: false,
       message:
-        "Aucun token candidat. Utilise /scan ou /test MINT.",
+        "Aucun token candidat. Utilise /test MINT ou /scan.",
     };
   }
 
-  if (tradeRunning) {
+  if (
+    tradeRunning
+  ) {
     return {
       ok: false,
       message:
-        "Une simulation est déjà active.",
+        "Simulation déjà active.",
     };
   }
 
@@ -2174,7 +2454,7 @@ async function startTrade() {
     return {
       ok: false,
       message:
-        `Token refusé au démarrage.\nMotif: ${validation.reason}`,
+        `Token refusé: ${validation.reason}`,
     };
   }
 
@@ -2206,9 +2486,9 @@ async function startTrade() {
       MARKET_INTERVAL_MS
     );
 
-  pairDiscoveryTimer =
+  pairTimer =
     setInterval(
-      refreshCurrentPool,
+      refreshPool,
       30000
     );
 
@@ -2218,16 +2498,15 @@ async function startTrade() {
 }
 
 // ============================================================
-// SCAN PUMP.FUN
+// SCAN
 // ============================================================
 
 async function scanPumpFun() {
   try {
-    const url =
-      `${PUMPFUN_API}?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false`;
-
     const response =
-      await fetch(url);
+      await fetch(
+        `${PUMPFUN_API}?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false`
+      );
 
     if (!response.ok) {
       throw new Error(
@@ -2238,51 +2517,23 @@ async function scanPumpFun() {
     const data =
       await response.json();
 
-    if (!Array.isArray(data)) {
+    if (
+      !Array.isArray(data)
+    ) {
       return [];
     }
 
-    const results = [];
-
-    for (
-      const token
-      of data
-    ) {
-      const mint =
-        token?.mint;
-
-      if (!mint) {
-        continue;
-      }
-
-      const name =
-        token?.name ||
-        "";
-
-      const symbol =
-        token?.symbol ||
-        "";
-
-      if (
-        !nameMatches(
-          name,
-          symbol
+    return data.filter(
+      token =>
+        token?.mint &&
+        nameMatches(
+          token?.name,
+          token?.symbol
         )
-      ) {
-        continue;
-      }
-
-      results.push({
-        mint,
-        name,
-        symbol,
-      });
-    }
-
-    return results;
+    );
   } catch (e) {
     console.log(
-      "Pump.fun scan error:",
+      "Scan error:",
       e.message
     );
 
@@ -2294,25 +2545,23 @@ async function runScan() {
   const candidates =
     await scanPumpFun();
 
-  if (!candidates.length) {
+  if (
+    !candidates.length
+  ) {
     await sendTelegram(
-      "🔎 SCAN\n\nAucun Claude / OpenAI / Anthropic récent trouvé."
+      "🔎 Aucun candidat trouvé."
     );
 
     return;
   }
 
-  await sendTelegram(
-    `🔎 SCAN\n\n${candidates.length} candidat(s) trouvé(s).\nÉvaluation en cours...`
-  );
-
   for (
-    const candidate
+    const token
     of candidates
   ) {
     const result =
       await evaluateMint(
-        candidate.mint
+        token.mint
       );
 
     if (
@@ -2321,15 +2570,21 @@ async function runScan() {
       currentCandidate =
         result;
 
+      currentPool =
+        result.pool;
+
+      currentPair =
+        result.pair;
+
       await sendTelegram(
         `🎯 CANDIDAT VALIDÉ\n\n` +
         `🪙 ${result.name}\n` +
         `🔤 ${result.symbol}\n` +
         `💧 $${result.liquidity.toFixed(2)}\n` +
-        `👥 ≥ ${result.holders}\n` +
+        `👥 ≥${result.holders}\n` +
         `⏱️ ${(result.ageMs / 60000).toFixed(1)} min\n` +
         `🏦 PumpSwap 🟢\n` +
-        `⛓️ On-chain 🟢\n\n` +
+        `⛓️ Pool direct 🟢\n\n` +
         `Mint:\n${result.mint}\n\n` +
         `Pool:\n${result.pool.poolAddress}\n\n` +
         `Utilise /starttrade`
@@ -2337,392 +2592,386 @@ async function runScan() {
 
       return;
     }
-
-    await sleep(250);
   }
 
   await sendTelegram(
-    "🔎 SCAN terminé.\n\nAucun token ne respecte tous les filtres."
+    "🔎 Scan terminé.\n\nAucun token ne respecte tous les filtres."
   );
 }
 
 // ============================================================
-// FORMAT COMPARISON
+// /START
 // ============================================================
 
-function formatComparison() {
-  return strategies
-    .map(
-      s =>
-        `${s.name}: ` +
-        `${s.wins}W / ` +
-        `${s.losses}L / ` +
-        `${s.sessionLimit}SL | ` +
-        `P&L ${s.totalPnl >= 0 ? "+" : ""}${s.totalPnl.toFixed(2)} $`
-    )
-    .join("\n");
-}
-
-// ============================================================
-// TELEGRAM COMMANDS
-// ============================================================
-
-bot.start(async ctx => {
-  await ctx.reply(
-    `🤖 V6 RADAR\n\n` +
-    `Filtres:\n` +
-    `• Claude / OpenAI / Anthropic\n` +
-    `• moins de 5 heures\n` +
-    `• liquidité 200k–400k $\n` +
-    `• minimum 1 000 holders\n` +
-    `• PumpSwap\n\n` +
-    `V5.9:\n` +
-    `10 $ / cycle\n` +
-    `+5% target\n` +
-    `stops -10/-15/-20/-25%\n` +
-    `45 min maximum\n\n` +
-    `Commandes:\n` +
-    `/status\n` +
-    `/scan\n` +
-    `/test MINT\n` +
-    `/starttrade\n` +
-    `/stoptrade\n` +
-    `/comparison\n` +
-    `/lastcrash\n` +
-    `/help`
-  );
-});
+bot.start(
+  async ctx => {
+    await ctx.reply(
+      `🤖 V6.1 RADAR\n\n` +
+      `Filtres:\n` +
+      `• Claude / OpenAI / Anthropic\n` +
+      `• moins de 5 heures\n` +
+      `• liquidité 200k–400k $\n` +
+      `• minimum 1 000 holders\n` +
+      `• PumpSwap\n\n` +
+      `V5.9:\n` +
+      `10 $ / cycle\n` +
+      `+5% target\n` +
+      `stops -10/-15/-20/-25%\n` +
+      `45 min maximum\n\n` +
+      `/scan\n` +
+      `/test MINT\n` +
+      `/starttrade\n` +
+      `/stoptrade\n` +
+      `/status\n` +
+      `/comparison\n` +
+      `/lastcrash`
+    );
+  }
+);
 
 // ============================================================
 // /TEST
 // ============================================================
 
-bot.command("test", async ctx => {
-  const parts =
-    ctx.message.text
-      .trim()
-      .split(/\s+/);
+bot.command(
+  "test",
+  async ctx => {
+    const parts =
+      ctx.message.text
+        .trim()
+        .split(/\s+/);
 
-  const mint =
-    parts[1];
+    const mint =
+      parts[1];
 
-  if (!mint) {
+    if (!mint) {
+      await ctx.reply(
+        "Utilise:\n/test MINT"
+      );
+
+      return;
+    }
+
+    try {
+      new PublicKey(mint);
+    } catch {
+      await ctx.reply(
+        "❌ Mint invalide."
+      );
+
+      return;
+    }
+
     await ctx.reply(
-      "Utilise:\n/test MINT"
-    );
-
-    return;
-  }
-
-  try {
-    new PublicKey(mint);
-  } catch {
-    await ctx.reply(
-      "❌ Mint Solana invalide."
-    );
-
-    return;
-  }
-
-  await ctx.reply(
-    `🔎 TEST V6.1\n\n` +
-    `Mint:\n${mint}\n\n` +
-    `Recherche PumpSwap directe...`
-  );
-
-  const result =
-    await evaluateMint(
-      mint,
-      {
-        force: true,
-      }
-    );
-
-  if (!result.ok) {
-    let text =
-      `❌ TOKEN REFUSÉ\n\n` +
+      `🔎 TEST V6.1\n\n` +
       `Mint:\n${mint}\n\n` +
-      `Motif:\n${result.reason}`;
-
-    if (
-      result.name
-    ) {
-      text +=
-        `\n\n🪙 Nom: ${result.name}`;
-    }
-
-    if (
-      result.symbol
-    ) {
-      text +=
-        `\n🔤 Symbole: ${result.symbol}`;
-    }
-
-    if (
-      result.liquidity !==
-      undefined
-    ) {
-      text +=
-        `\n💧 Liquidité: $${Number(result.liquidity).toFixed(2)}`;
-    }
-
-    if (
-      result.holders !==
-      undefined
-    ) {
-      text +=
-        `\n👥 Holders: ${result.holders}`;
-    }
-
-    if (
-      result.ageMs !==
-      undefined
-    ) {
-      text +=
-        `\n⏱️ Âge: ${(result.ageMs / 60000).toFixed(1)} min`;
-    }
-
-    if (
-      result.pair?.pairAddress
-    ) {
-      text +=
-        `\n\nPair Dex:\n${result.pair.pairAddress}`;
-    }
-
-    if (
-      result.dexVerification
-    ) {
-      text +=
-        `\n\nDex on-chain:\n${result.dexVerification}`;
-    }
-
-    await ctx.reply(
-      text
+      `Recherche du vrai Pool PumpSwap...`
     );
 
-    return;
+    const result =
+      await evaluateMint(
+        mint,
+        {
+          force: true,
+        }
+      );
+
+    if (!result.ok) {
+      let text =
+        `❌ TOKEN REFUSÉ\n\n` +
+        `Mint:\n${mint}\n\n` +
+        `Motif:\n${result.reason}`;
+
+      if (
+        result.name
+      ) {
+        text +=
+          `\n\n🪙 Nom: ${result.name}`;
+      }
+
+      if (
+        result.symbol
+      ) {
+        text +=
+          `\n🔤 Symbole: ${result.symbol}`;
+      }
+
+      if (
+        result.liquidity !==
+        undefined
+      ) {
+        text +=
+          `\n💧 Liquidité: $${Number(result.liquidity).toFixed(2)}`;
+      }
+
+      if (
+        result.holders !==
+        undefined
+      ) {
+        text +=
+          `\n👥 Holders: ${result.holders}`;
+      }
+
+      if (
+        result.ageMs !==
+        undefined
+      ) {
+        text +=
+          `\n⏱️ Âge: ${(result.ageMs / 60000).toFixed(1)} min`;
+      }
+
+      if (
+        result.pair?.pairAddress
+      ) {
+        text +=
+          `\n\nPair Dex:\n${result.pair.pairAddress}`;
+      }
+
+      await ctx.reply(
+        text
+      );
+
+      return;
+    }
+
+    currentCandidate =
+      result;
+
+    currentPool =
+      result.pool;
+
+    currentPair =
+      result.pair;
+
+    await ctx.reply(
+      `🟢 TOKEN VALIDÉ V6.1\n\n` +
+      `🪙 Nom: ${result.name}\n` +
+      `🔤 Symbole: ${result.symbol}\n\n` +
+      `💧 Liquidité: $${result.liquidity.toFixed(2)}\n` +
+      `👥 Holders: ≥${result.holders}\n` +
+      `⏱️ Âge: ${(result.ageMs / 60000).toFixed(1)} min\n\n` +
+      `🏦 PumpSwap: 🟢 OK\n` +
+      `⛓️ Pool direct: 🟢 OK\n` +
+      `🔎 Source: ${result.onchainSource}\n\n` +
+      `Pair Dex:\n${result.pairAddress}\n\n` +
+      `VRAI POOL:\n${result.pool.poolAddress}\n\n` +
+      `Index: ${result.pool.index}\n` +
+      `Creator: ${result.pool.creator}\n\n` +
+      `Base vault:\n${result.pool.baseVault}\n\n` +
+      `Quote vault:\n${result.pool.quoteVault}\n\n` +
+      `Mint:\n${result.mint}\n\n` +
+      `▶️ /starttrade`
+    );
   }
-
-  currentCandidate =
-    result;
-
-  currentPair =
-    result.pair;
-
-  currentPool =
-    result.pool;
-
-  await ctx.reply(
-    `🟢 TOKEN VALIDÉ V6.1\n\n` +
-    `🪙 Nom: ${result.name}\n` +
-    `🔤 Symbole: ${result.symbol}\n\n` +
-    `💧 Liquidité: $${result.liquidity.toFixed(2)}\n` +
-    `👥 Holders: ≥${result.holders}\n` +
-    `⏱️ Âge: ${(result.ageMs / 60000).toFixed(1)} min\n\n` +
-    `🏦 PumpSwap: 🟢 OK\n` +
-    `⛓️ On-chain: 🟢 OK\n` +
-    `🔎 Source pool: ${result.onchainSource}\n\n` +
-    `Pair Dex:\n${result.pairAddress}\n\n` +
-    `Pool PumpSwap:\n${result.pool.poolAddress}\n\n` +
-    `Base vault:\n${result.pool.baseVault}\n\n` +
-    `Quote vault:\n${result.pool.quoteVault}\n\n` +
-    `Mint:\n${result.mint}\n\n` +
-    `▶️ Utilise /starttrade`
-  );
-});
+);
 
 // ============================================================
 // /SCAN
 // ============================================================
 
-bot.command("scan", async ctx => {
-  await runScan();
-});
+bot.command(
+  "scan",
+  async () => {
+    await runScan();
+  }
+);
 
 // ============================================================
 // /STARTTRADE
 // ============================================================
 
-bot.command("starttrade", async ctx => {
-  const result =
-    await startTrade();
+bot.command(
+  "starttrade",
+  async ctx => {
+    const result =
+      await startTrade();
 
-  if (!result.ok) {
+    if (!result.ok) {
+      await ctx.reply(
+        `❌ ${result.message}`
+      );
+
+      return;
+    }
+
     await ctx.reply(
-      `❌ ${result.message}`
+      `🟢 V5.9 SIMULATION ACTIVE\n\n` +
+      `🪙 ${currentCandidate.name}\n` +
+      `🔤 ${currentCandidate.symbol}\n\n` +
+      `💵 10 $ / cycle\n` +
+      `🎯 +5%\n` +
+      `🛡️ -10 / -15 / -20 / -25%\n` +
+      `⏱️ 45 min\n` +
+      `🚫 No BUY après 43 min\n\n` +
+      `🏦 Pool:\n${currentPool.poolAddress}\n\n` +
+      `🧪 SIMULATION UNIQUEMENT`
     );
-
-    return;
   }
-
-  await ctx.reply(
-    `🟢 V5.9 SIMULATION ACTIVE\n\n` +
-    `🪙 ${currentCandidate.name}\n` +
-    `🔤 ${currentCandidate.symbol}\n\n` +
-    `💵 Capital: 10 $ / cycle\n` +
-    `🎯 Target: +5%\n` +
-    `🛡️ Stops: -10% / -15% / -20% / -25%\n` +
-    `⏱️ Max session: 45 min\n` +
-    `🚫 Aucun nouveau BUY après 43 min\n\n` +
-    `🏦 PumpSwap: ${currentPool.poolAddress}\n\n` +
-    `🧪 Simulation uniquement`
-  );
-});
+);
 
 // ============================================================
 // /STOPTRADE
 // ============================================================
 
-bot.command("stoptrade", async ctx => {
-  if (!tradeRunning) {
+bot.command(
+  "stoptrade",
+  async ctx => {
+    if (!tradeRunning) {
+      await ctx.reply(
+        "ℹ️ Aucune simulation active."
+      );
+
+      return;
+    }
+
+    if (
+      lastMarket
+    ) {
+      forceCloseAll(
+        lastMarket,
+        "SESSION_LIMIT"
+      );
+    }
+
+    stopTrade();
+
+    saveComparison();
+
     await ctx.reply(
-      "ℹ️ Aucune simulation active."
-    );
-
-    return;
-  }
-
-  if (
-    lastMarket
-  ) {
-    forceCloseAll(
-      lastMarket,
-      "SESSION_LIMIT"
+      `🛑 SIMULATION ARRÊTÉE\n\n` +
+      formatComparison()
     );
   }
-
-  stopTrade();
-
-  saveComparison();
-
-  await ctx.reply(
-    `🛑 SIMULATION ARRÊTÉE\n\n` +
-    formatComparison()
-  );
-});
+);
 
 // ============================================================
 // /STATUS
 // ============================================================
 
-bot.command("status", async ctx => {
-  let text =
-    `📊 STATUS V6.1\n\n`;
-
-  text +=
-    `Radar: ${tradeRunning ? "🟢 ACTIF" : "🔴 STOP"}\n`;
-
-  if (
-    currentCandidate
-  ) {
-    text +=
-      `🪙 ${currentCandidate.name || "N/A"}\n`;
+bot.command(
+  "status",
+  async ctx => {
+    let text =
+      `📊 STATUS V6.1\n\n`;
 
     text +=
-      `Mint:\n${currentCandidate.mint}\n\n`;
+      `Simulation: ${
+        tradeRunning
+          ? "🟢 ACTIVE"
+          : "🔴 STOP"
+      }\n`;
+
+    if (
+      currentCandidate
+    ) {
+      text +=
+        `🪙 ${currentCandidate.name}\n`;
+
+      text +=
+        `Mint:\n${currentCandidate.mint}\n\n`;
+    }
+
+    if (
+      currentPool
+    ) {
+      text +=
+        `🏦 Pool:\n${currentPool.poolAddress}\n\n`;
+    }
+
+    if (
+      lastMarket
+    ) {
+      text +=
+        `💰 Prix: ${lastMarket.price}\n`;
+
+      text +=
+        `💧 Liquidité: $${lastMarket.liquidity.toFixed(2)}\n\n`;
+    }
+
+    text +=
+      formatComparison();
+
+    await ctx.reply(
+      text
+    );
   }
-
-  if (
-    lastMarket
-  ) {
-    text +=
-      `💰 Prix: ${lastMarket.price}\n`;
-
-    text +=
-      `💧 Liquidité: $${lastMarket.liquidity.toFixed(2)}\n`;
-
-    text +=
-      `DEX: ${lastMarket.dexId || "N/A"}\n\n`;
-  }
-
-  text +=
-    formatComparison();
-
-  await ctx.reply(
-    text
-  );
-});
+);
 
 // ============================================================
 // /COMPARISON
 // ============================================================
 
-bot.command("comparison", async ctx => {
-  await ctx.reply(
-    `📊 COMPARAISON V5.9\n\n` +
-    formatComparison()
-  );
+bot.command(
+  "comparison",
+  async ctx => {
+    await ctx.reply(
+      `📊 COMPARAISON\n\n` +
+      formatComparison()
+    );
 
-  saveComparison();
-});
+    saveComparison();
+  }
+);
 
 // ============================================================
 // /LASTCRASH
 // ============================================================
 
-bot.command("lastcrash", async ctx => {
-  if (!crashes.length) {
+bot.command(
+  "lastcrash",
+  async ctx => {
+    if (
+      !crashes.length
+    ) {
+      await ctx.reply(
+        "Aucun crash enregistré."
+      );
+
+      return;
+    }
+
+    const crash =
+      crashes[
+        crashes.length - 1
+      ];
+
     await ctx.reply(
-      "Aucun crash enregistré."
+      `🚨 DERNIER CRASH\n\n` +
+      `🪙 ${crash.name || "N/A"}\n` +
+      `⚠️ ${crash.crash?.type || "N/A"}\n` +
+      `💰 Prix: ${crash.market?.price || "N/A"}\n` +
+      `💧 Liquidité: $${Number(crash.market?.liquidity || 0).toFixed(2)}\n\n` +
+      formatComparison()
     );
-
-    return;
   }
-
-  const crash =
-    crashes[
-      crashes.length - 1
-    ];
-
-  await ctx.reply(
-    `🚨 DERNIER CRASH\n\n` +
-    `🪙 ${crash.name || "N/A"}\n` +
-    `⚠️ ${crash.crash?.type || "N/A"}\n` +
-    `💰 Prix: ${crash.market?.price || "N/A"}\n` +
-    `💧 Liquidité: $${Number(crash.market?.liquidity || 0).toFixed(2)}\n\n` +
-    formatComparison()
-  );
-});
+);
 
 // ============================================================
 // /HELP
 // ============================================================
 
-bot.help(async ctx => {
-  await ctx.reply(
-    `🤖 V6.1\n\n` +
-    `/scan\n` +
-    `/test MINT\n` +
-    `/starttrade\n` +
-    `/stoptrade\n` +
-    `/status\n` +
-    `/comparison\n` +
-    `/lastcrash\n\n` +
-    `Filtres:\n` +
-    `Claude / OpenAI / Anthropic\n` +
-    `Liquidité 200k–400k $\n` +
-    `≥ 1 000 holders\n` +
-    `< 5 heures\n` +
-    `PumpSwap\n\n` +
-    `Simulation uniquement.`
-  );
-});
+bot.help(
+  async ctx => {
+    await ctx.reply(
+      `🤖 V6.1\n\n` +
+      `/scan\n` +
+      `/test MINT\n` +
+      `/starttrade\n` +
+      `/stoptrade\n` +
+      `/status\n` +
+      `/comparison\n` +
+      `/lastcrash`
+    );
+  }
+);
 
 // ============================================================
-// TELEGRAM LAUNCH
+// LAUNCH
 // ============================================================
 
 async function startBot() {
   console.log(
     "🤖 V6.1 Telegram bot démarré"
-  );
-
-  console.log(
-    "📡 RPC:",
-    RPC_URL.replace(
-      HELIUS_API_KEY,
-      "***"
-    )
   );
 
   await bot.launch({
@@ -2735,16 +2984,16 @@ async function startBot() {
 }
 
 startBot().catch(
-  e => {
+  error => {
     console.error(
       "❌ Telegram launch:",
-      e
+      error
     );
   }
 );
 
 // ============================================================
-// PROCESS
+// SHUTDOWN
 // ============================================================
 
 process.once(
