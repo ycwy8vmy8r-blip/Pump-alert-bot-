@@ -22,7 +22,7 @@ const RPC_URL = HELIUS_API_KEY
   : "https://api.mainnet-beta.solana.com";
 
 // ============================================================
-// TOKEN DE TEST
+// TOKEN DE TEST CONNU
 // ============================================================
 
 const TRUSTED_TEST_MINT =
@@ -53,7 +53,7 @@ const MIN_HOLDERS = 1000;
 const MAX_AGE_MINUTES = 300;
 
 // ============================================================
-// FILTRE RADAR AUTOMATIQUE
+// FILTRE RADAR
 // ============================================================
 
 const ALLOWED_NAMES = [
@@ -61,10 +61,6 @@ const ALLOWED_NAMES = [
   "openai",
   "anthropic"
 ];
-
-// IMPORTANT : le filtre NOM est utilisé par /scan.
-// /test MINT est un test manuel et ne bloque PLUS sur le nom.
-// ============================================================
 
 // ============================================================
 // DATA
@@ -79,10 +75,10 @@ if (!fs.existsSync(DATA_DIR)) {
 }
 
 const TRADES_FILE =
-  path.join(DATA_DIR, "trades_v6_5.json");
+  path.join(DATA_DIR, "trades_v6_6.json");
 
 const CRASH_FILE =
-  path.join(DATA_DIR, "crashes_v6_5.json");
+  path.join(DATA_DIR, "crashes_v6_6.json");
 
 function loadJson(file, fallback) {
   try {
@@ -117,7 +113,7 @@ let crashes =
   loadJson(CRASH_FILE, []);
 
 // ============================================================
-// ETAT
+// ETAT GLOBAL
 // ============================================================
 
 let currentCandidate = null;
@@ -199,7 +195,7 @@ async function fetchJson(
               accept:
                 "application/json",
               "user-agent":
-                "pump-test-bot/6.5"
+                "pump-test-bot/6.6"
             }
           });
 
@@ -323,68 +319,99 @@ async function rpc(
   method,
   params = []
 ) {
-  const response =
-    await fetch(
-      RPC_URL,
-      {
-        method: "POST",
-        headers: {
-          "content-type":
-            "application/json"
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: Date.now(),
-          method,
-          params
-        })
-      }
-    );
+  let lastError = null;
 
-  if (
-    response.status === 429
+  for (
+    let attempt = 0;
+    attempt < 4;
+    attempt++
   ) {
-    throw new Error(
-      "RPC_RATE_LIMIT"
-    );
+    try {
+      const response =
+        await fetch(
+          RPC_URL,
+          {
+            method: "POST",
+            headers: {
+              "content-type":
+                "application/json"
+            },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: Date.now(),
+              method,
+              params
+            })
+          }
+        );
+
+      if (
+        response.status === 429
+      ) {
+        await sleep(
+          1000 *
+            Math.pow(
+              2,
+              attempt
+            )
+        );
+
+        continue;
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          `RPC_HTTP_${response.status}`
+        );
+      }
+
+      const json =
+        await response.json();
+
+      if (json.error) {
+        throw new Error(
+          json.error.message ||
+            "RPC_ERROR"
+        );
+      }
+
+      return json.result;
+
+    } catch (e) {
+      lastError = e;
+
+      if (attempt < 3) {
+        await sleep(
+          1000 *
+            Math.pow(
+              2,
+              attempt
+            )
+        );
+      }
+    }
   }
 
-  if (!response.ok) {
-    throw new Error(
-      `RPC_HTTP_${response.status}`
-    );
-  }
-
-  const json =
-    await response.json();
-
-  if (json.error) {
-    throw new Error(
-      json.error.message ||
-        "RPC_ERROR"
-    );
-  }
-
-  return json.result;
+  throw (
+    lastError ||
+    new Error("RPC_ERROR")
+  );
 }
 
 // ============================================================
-// INFO TOKEN
+// TOKEN INFO
 // ============================================================
 
 async function getTokenInfo(
   mint
 ) {
   try {
-    const data =
-      await fetchJson(
-        `https://frontend-api-v3.pump.fun/coins/${mint}`,
-        {
-          cacheMs: 300000
-        }
-      );
-
-    return data;
+    return await fetchJson(
+      `https://frontend-api-v3.pump.fun/coins/${mint}`,
+      {
+        cacheMs: 300000
+      }
+    );
   } catch {
     return null;
   }
@@ -404,15 +431,19 @@ function extractTokenName(
     info?.symbol,
     info?.token?.name,
     info?.token?.symbol,
+
     pair?.baseToken?.address === mint
       ? pair?.baseToken?.name
       : null,
+
     pair?.baseToken?.address === mint
       ? pair?.baseToken?.symbol
       : null,
+
     pair?.quoteToken?.address === mint
       ? pair?.quoteToken?.name
       : null,
+
     pair?.quoteToken?.address === mint
       ? pair?.quoteToken?.symbol
       : null
@@ -440,15 +471,19 @@ function extractTokenSymbol(
     info?.name,
     info?.token?.symbol,
     info?.token?.name,
+
     pair?.baseToken?.address === mint
       ? pair?.baseToken?.symbol
       : null,
+
     pair?.baseToken?.address === mint
       ? pair?.baseToken?.name
       : null,
+
     pair?.quoteToken?.address === mint
       ? pair?.quoteToken?.symbol
       : null,
+
     pair?.quoteToken?.address === mint
       ? pair?.quoteToken?.name
       : null
@@ -467,11 +502,138 @@ function extractTokenSymbol(
 }
 
 // ============================================================
-// HOLDERS
+// NOUVEAU COMPTEUR HOLDERS
 // ============================================================
+//
+// IMPORTANT
+// getTokenLargestAccounts() n'est PAS un compteur de holders.
+//
+// Ici on récupère les comptes de token du mint et on compte
+// les propriétaires uniques.
+//
+// On utilise getProgramAccounts sur les deux programmes :
+// 1. SPL Token classique
+// 2. Token-2022
+//
+// Le compte token SPL a :
+// mint    offset 0
+// owner   offset 32
+//
+// On ne cherche pas le nombre exact si on a déjà atteint 1000.
+// Dès que 1000 propriétaires uniques sont trouvés,
+// le seuil est validé.
+//
+// Le résultat est mis en cache 10 minutes.
+//
+
+const TOKEN_PROGRAM =
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+
+const TOKEN_2022_PROGRAM =
+  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 const holderCache =
   new Map();
+
+async function countHoldersFromProgram(
+  mint,
+  programId,
+  existingOwners
+) {
+  try {
+    const accounts =
+      await rpc(
+        "getProgramAccounts",
+        [
+          programId,
+          {
+            encoding:
+              "base64",
+            filters: [
+              {
+                memcmp: {
+                  offset: 0,
+                  bytes: mint
+                }
+              }
+            ],
+            dataSlice: {
+              offset: 32,
+              length: 32
+            }
+          }
+        ]
+      );
+
+    const owners =
+      existingOwners ||
+      new Set();
+
+    for (
+      const account of accounts ||
+      []
+    ) {
+      const data =
+        account?.account?.data;
+
+      if (
+        !Array.isArray(data) ||
+        !data[0]
+      ) {
+        continue;
+      }
+
+      try {
+        const owner =
+          Buffer.from(
+            data[0],
+            "base64"
+          ).toString("hex");
+
+        if (owner) {
+          owners.add(owner);
+        }
+
+        if (
+          owners.size >=
+          MIN_HOLDERS
+        ) {
+          return {
+            count:
+              MIN_HOLDERS,
+            reached:
+              true
+          };
+        }
+
+      } catch {}
+    }
+
+    return {
+      count:
+        owners.size,
+      reached:
+        owners.size >=
+        MIN_HOLDERS
+    };
+
+  } catch (e) {
+    if (
+      existingOwners &&
+      existingOwners.size
+    ) {
+      return {
+        count:
+          existingOwners.size,
+        reached:
+          existingOwners.size >=
+          MIN_HOLDERS
+      };
+    }
+
+    throw e;
+  }
+}
 
 async function getHolderCount(
   mint
@@ -488,8 +650,9 @@ async function getHolderCount(
     return cached.count;
   }
 
-  // Le token OpenAI déjà validé :
-  // on évite les RPC inutiles.
+  // Le token de test déjà validé.
+  // On ne refait pas un getProgramAccounts
+  // inutilement.
   if (
     mint ===
     TRUSTED_TEST_MINT
@@ -497,44 +660,69 @@ async function getHolderCount(
     holderCache.set(
       mint,
       {
-        count: MIN_HOLDERS,
-        time: Date.now()
+        count:
+          MIN_HOLDERS,
+        time:
+          Date.now()
       }
     );
 
     return MIN_HOLDERS;
   }
 
+  const owners =
+    new Set();
+
   try {
-    const result =
-      await rpc(
-        "getTokenLargestAccounts",
-        [
-          mint,
-          {
-            commitment:
-              "confirmed"
-          }
-        ]
+    // SPL Token classique
+    const classic =
+      await countHoldersFromProgram(
+        mint,
+        TOKEN_PROGRAM,
+        owners
       );
 
-    const accounts =
-      result?.value || [];
+    if (
+      classic.reached
+    ) {
+      holderCache.set(
+        mint,
+        {
+          count:
+            MIN_HOLDERS,
+          time:
+            Date.now()
+        }
+      );
+
+      return MIN_HOLDERS;
+    }
+
+    // Token-2022
+    const token2022 =
+      await countHoldersFromProgram(
+        mint,
+        TOKEN_2022_PROGRAM,
+        owners
+      );
 
     const count =
-      accounts.length;
+      token2022.reached
+        ? MIN_HOLDERS
+        : token2022.count;
 
     holderCache.set(
       mint,
       {
         count,
-        time: Date.now()
+        time:
+          Date.now()
       }
     );
 
     return count;
 
-  } catch {
+  } catch (e) {
     if (cached) {
       return cached.count;
     }
@@ -580,13 +768,12 @@ function pairHasToken(
 }
 
 // ============================================================
-// TROUVER PAIR
+// PAIR PUMPSWAP
 // ============================================================
 
 async function findPumpSwapPair(
   mint
 ) {
-  // Pair connue pour notre token
   if (
     mint ===
       TRUSTED_TEST_MINT &&
@@ -654,10 +841,12 @@ async function findPumpSwapPair(
   valid.sort(
     (a, b) =>
       Number(
-        b.liquidity?.usd || 0
+        b.liquidity?.usd ||
+          0
       ) -
       Number(
-        a.liquidity?.usd || 0
+        a.liquidity?.usd ||
+          0
       )
   );
 
@@ -755,8 +944,7 @@ async function getMarketData(
   }
 
   // Une liquidité à 0 n'est PAS
-  // automatiquement un crash.
-  // On refuse simplement cette lecture.
+  // considérée comme un crash.
   if (
     !Number.isFinite(
       liquidity
@@ -772,7 +960,8 @@ async function getMarketData(
     mint,
     pairAddress:
       pair.pairAddress,
-    dex: pair.dexId,
+    dex:
+      pair.dexId,
     price,
     liquidity,
     volume24h:
@@ -788,12 +977,22 @@ async function getMarketData(
       Number(
         pair.marketCap || 0
       ),
-    timestamp: now
+    timestamp:
+      now
   };
 }
 
 // ============================================================
-// EVALUATION MANUELLE
+// TEST MANUEL
+// ============================================================
+//
+// IMPORTANT : /test ne bloque PAS sur le nom.
+// Il bloque sur :
+// - PumpSwap
+// - liquidité
+// - âge
+// - holders
+//
 // ============================================================
 
 async function evaluateManualTest(
@@ -805,7 +1004,7 @@ async function evaluateManualTest(
         mint
       );
 
-    let pair =
+    const pair =
       await findPumpSwapPair(
         mint
       );
@@ -818,7 +1017,6 @@ async function evaluateManualTest(
       };
     }
 
-    // Récupération nom depuis plusieurs sources.
     const name =
       extractTokenName(
         info,
@@ -940,7 +1138,7 @@ async function evaluateManualTest(
 }
 
 // ============================================================
-// EVALUATION RADAR
+// RADAR AUTOMATIQUE
 // ============================================================
 
 async function evaluateRadarCandidate(
@@ -1068,7 +1266,6 @@ function openPosition(
 
   const tokenName =
     currentCandidate?.name ||
-    market.name ||
     "Inconnu";
 
   telegram(
@@ -1353,7 +1550,7 @@ async function marketTick(
       sessionElapsedMinutes();
 
     // --------------------------------------------------------
-    // FIN DE SESSION
+    // 45 MINUTES
     // --------------------------------------------------------
 
     if (
@@ -1453,12 +1650,12 @@ async function marketTick(
     }
 
     // --------------------------------------------------------
-    // NOUVEAU BUY
+    // BUY
     // --------------------------------------------------------
 
     if (
       elapsed <
-      NO_NEW_BUY_MINUTES &&
+        NO_NEW_BUY_MINUTES &&
       Date.now() -
         lastSellAt >=
         COOLDOWN_AFTER_SELL
@@ -1472,8 +1669,8 @@ async function marketTick(
       market;
 
   } catch (e) {
-    // Une donnée temporairement indisponible
-    // ne provoque PAS de faux crash.
+    // Une donnée invalide ou une limitation API
+    // ne devient PAS un faux crash.
     console.error(
       "Market tick:",
       e.message
@@ -1501,7 +1698,7 @@ async function startTrade() {
     await telegram(
       `❌ Aucun token sélectionné.\n\n` +
       `Utilise :\n` +
-      `/test TON_MINT`
+      `/test MINT`
     );
 
     return;
@@ -1575,7 +1772,7 @@ async function startTrade() {
 }
 
 // ============================================================
-// STOP
+// STOP TRADE
 // ============================================================
 
 async function stopTrade() {
@@ -1646,11 +1843,6 @@ bot.command(
       `🔎 Test manuel du token...`
     );
 
-    // IMPORTANT :
-    // /test ne vérifie PAS le nom.
-    // Il vérifie uniquement le marché,
-    // la liquidité, l'âge et les holders.
-
     const result =
       await evaluateManualTest(
         mint
@@ -1684,7 +1876,6 @@ bot.command(
       `⏱️ Âge : ${result.ageMinutes.toFixed(1)} min\n` +
       `🏦 DEX : PumpSwap\n\n` +
       `🔗 Pair : ${result.pair.pairAddress}\n\n` +
-      `Le filtre de nom ne bloque pas les tests manuels.\n\n` +
       `Utilise /starttrade pour lancer le test.`
     );
   }
@@ -1759,7 +1950,9 @@ bot.command(
         `💧 Liquidité : $${lastMarket.liquidity.toFixed(2)}`;
     }
 
-    await ctx.reply(text);
+    await ctx.reply(
+      text
+    );
   }
 );
 
@@ -1809,7 +2002,8 @@ bot.command(
       `⏱️ 45 min maximum\n` +
       `🚫 Aucun BUY après 43 min\n` +
       `🏦 PumpSwap\n\n` +
-      `TEST MANUEL : le nom ne bloque pas le token.\n` +
+      `TEST MANUEL : le nom ne bloque pas.\n` +
+      `HOLDERS : comptage par propriétaires uniques.\n` +
       `SIMULATION UNIQUEMENT`
     );
   }
@@ -1831,6 +2025,7 @@ bot.start(
       `• PumpSwap\n\n` +
       `TEST MANUEL :\n` +
       `• le nom ne bloque pas\n` +
+      `• holders vérifiés correctement\n` +
       `• /test MINT\n\n` +
       `Trading simulation :\n` +
       `• $10 par achat\n` +
@@ -1849,7 +2044,7 @@ bot.start(
 );
 
 // ============================================================
-// START
+// START TELEGRAM
 // ============================================================
 
 bot.launch({
@@ -1857,11 +2052,15 @@ bot.launch({
 })
   .then(() => {
     console.log(
-      "🤖 V6.5 démarrée"
+      "🤖 V6.6 démarrée"
     );
 
     console.log(
-      "🟢 /test manuel : nom non bloquant"
+      "🟢 /test : nom non bloquant"
+    );
+
+    console.log(
+      "👥 Holders : propriétaires uniques"
     );
 
     console.log(
