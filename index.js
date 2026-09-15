@@ -10,10 +10,13 @@ const CHAT_ID = process.env.CHAT_ID;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 
 const TOKEN_MINT =
-  "5XnMHrs45GNHqNpPNHd8bepoHdRhFBppZdUieP4MKa1S";
+  "8uJzBn6QvEmHESjzbPbegvvfXHXgWJmnp7mfBwgGFh1a";
 
 const SOL_MINT =
   "So11111111111111111111111111111111111111112";
+
+const PUMP_PROGRAM =
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
 const PUMPSWAP_PROGRAM =
   "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
@@ -89,7 +92,6 @@ let lastSellTime = 0;
 let ws = null;
 let interval = null;
 
-let pumpPools = [];
 let selectedPool = null;
 
 function now() {
@@ -179,6 +181,197 @@ async function rpc(method, params = []) {
   return json.result;
 }
 
+/*
+ * ---------------------------------------------------------
+ * PUMPSWAP CANONICAL POOL
+ * ---------------------------------------------------------
+ *
+ * Pump documente le pool canonique comme :
+ *
+ * ["pool", index, creator, baseMint, quoteMint]
+ *
+ * Pour le pool canonique Pump :
+ * - index = 0
+ * - creator = pumpPoolAuthorityPda(baseMint)
+ *
+ * pumpPoolAuthorityPda :
+ * ["pool-authority", baseMint]
+ * sur le Pump program.
+ */
+
+function derivePumpPoolAuthority(mint) {
+  const mintKey =
+    new PublicKey(mint);
+
+  const [authority] =
+    PublicKey.findProgramAddressSync(
+      [
+        Buffer.from(
+          "pool-authority"
+        ),
+        mintKey.toBuffer()
+      ],
+      new PublicKey(
+        PUMP_PROGRAM
+      )
+    );
+
+  return authority;
+}
+
+function deriveCanonicalPumpPool(mint) {
+  const mintKey =
+    new PublicKey(mint);
+
+  const authority =
+    derivePumpPoolAuthority(
+      mint
+    );
+
+  const indexBuffer =
+    Buffer.alloc(2);
+
+  indexBuffer.writeUInt16LE(
+    0,
+    0
+  );
+
+  const [pool] =
+    PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("pool"),
+        indexBuffer,
+        authority.toBuffer(),
+        mintKey.toBuffer(),
+        new PublicKey(
+          SOL_MINT
+        ).toBuffer()
+      ],
+      new PublicKey(
+        PUMPSWAP_PROGRAM
+      )
+    );
+
+  return {
+    pool,
+    authority
+  };
+}
+
+async function loadCanonicalPool() {
+  console.log(
+    "🔎 Recherche du pool canonique PumpSwap..."
+  );
+
+  const {
+    pool,
+    authority
+  } =
+    deriveCanonicalPumpPool(
+      TOKEN_MINT
+    );
+
+  console.log(
+    "Pool PDA:",
+    pool.toBase58()
+  );
+
+  console.log(
+    "Pool authority:",
+    authority.toBase58()
+  );
+
+  const result =
+    await rpc(
+      "getAccountInfo",
+      [
+        pool.toBase58(),
+        {
+          encoding: "base64",
+          commitment: "processed"
+        }
+      ]
+    );
+
+  if (
+    !result ||
+    !result.value
+  ) {
+    throw new Error(
+      `Pool canonique introuvable: ${pool.toBase58()}`
+    );
+  }
+
+  const parsed =
+    parsePumpSwapPool(
+      pool.toBase58(),
+      result.value
+    );
+
+  if (!parsed) {
+    throw new Error(
+      "Impossible de lire le pool PumpSwap canonique"
+    );
+  }
+
+  if (
+    parsed.baseMint !==
+    TOKEN_MINT
+  ) {
+    throw new Error(
+      "Le pool canonique ne contient pas le token demandé"
+    );
+  }
+
+  if (
+    parsed.quoteMint !==
+    SOL_MINT
+  ) {
+    throw new Error(
+      "Le pool canonique n'est pas en WSOL"
+    );
+  }
+
+  selectedPool =
+    parsed;
+
+  console.log(
+    "✅ POOL PUMPSWAP TROUVÉ"
+  );
+
+  console.log(
+    "Pool:",
+    parsed.address
+  );
+
+  console.log(
+    "Base mint:",
+    parsed.baseMint
+  );
+
+  console.log(
+    "Quote mint:",
+    parsed.quoteMint
+  );
+
+  console.log(
+    "Base vault:",
+    parsed.baseVault
+  );
+
+  console.log(
+    "Quote vault:",
+    parsed.quoteVault
+  );
+
+  console.log(
+    "Virtual quote:",
+    parsed.virtualQuoteReserves.toString()
+  );
+
+  return parsed;
+}
+
 function readSignedBigIntLE(
   buffer,
   offset,
@@ -193,7 +386,9 @@ function readSignedBigIntLE(
   ) {
     value =
       (value << 8n) +
-      BigInt(buffer[offset + i]);
+      BigInt(
+        buffer[offset + i]
+      );
   }
 
   const bits =
@@ -210,14 +405,13 @@ function readSignedBigIntLE(
   return value;
 }
 
-function parsePoolAccount(
-  pubkey,
+function parsePumpSwapPool(
+  address,
   account
 ) {
   if (
     !account ||
-    !account.data ||
-    account.data.length === 0
+    !account.data
   ) {
     return null;
   }
@@ -228,7 +422,29 @@ function parsePoolAccount(
       "base64"
     );
 
-  if (data.length < 261) {
+  /*
+   * Pool layout:
+   *
+   * 0-7   discriminator
+   * 8     bump
+   * 9-10  index
+   * 11-42 creator
+   * 43-74 baseMint
+   * 75-106 quoteMint
+   * 107-138 lpMint
+   * 139-170 base vault
+   * 171-202 quote vault
+   * 203-210 lp supply
+   * 211-242 coin creator
+   * 243    mayhem
+   * 244    cashback
+   * 245-260 virtual quote reserves
+   */
+
+  if (
+    data.length <
+    261
+  ) {
     return null;
   }
 
@@ -261,114 +477,53 @@ function parsePoolAccount(
       );
 
     return {
-      address: pubkey,
+      address,
+
       baseMint,
       quoteMint,
+
       baseVault,
       quoteVault,
+
       virtualQuoteReserves
     };
+
   } catch {
     return null;
   }
 }
 
-async function discoverPumpPools() {
-  console.log(
-    "🔎 Recherche des vrais pools PumpSwap..."
-  );
+/*
+ * ---------------------------------------------------------
+ * RESERVES ON-CHAIN
+ * ---------------------------------------------------------
+ */
 
-  const result =
-    await rpc(
-      "getProgramAccounts",
-      [
-        PUMPSWAP_PROGRAM,
-        {
-          commitment: "processed",
-
-          filters: [
-            {
-              memcmp: {
-                offset: 43,
-                bytes: TOKEN_MINT
-              }
-            },
-            {
-              memcmp: {
-                offset: 75,
-                bytes: SOL_MINT
-              }
-            }
-          ],
-
-          encoding: "base64"
-        }
-      ]
-    );
-
-  const pools = [];
-
-  for (const item of result || []) {
-    const pool =
-      parsePoolAccount(
-        item.pubkey,
-        item.account
-      );
-
-    if (!pool) {
-      continue;
-    }
-
-    if (
-      pool.baseMint !== TOKEN_MINT ||
-      pool.quoteMint !== SOL_MINT
-    ) {
-      continue;
-    }
-
-    pools.push(pool);
-  }
-
-  if (!pools.length) {
-    throw new Error(
-      "Aucun pool PumpSwap TOKEN/SOL trouvé"
-    );
-  }
-
-  pumpPools = pools;
-
-  console.log(
-    `✅ ${pools.length} pool(s) PumpSwap trouvé(s)`
-  );
-
-  for (const pool of pools) {
-    console.log(
-      `Pool: ${pool.address}`
-    );
-  }
-
-  return pools;
-}
-
-async function getPoolReserves(pool) {
+async function getPoolReserves(
+  pool
+) {
   const requests = [
     {
       jsonrpc: "2.0",
       id: 1,
-      method: "getTokenAccountBalance",
+      method:
+        "getTokenAccountBalance",
       params: [
         pool.baseVault,
         "processed"
       ]
     },
+
     {
       jsonrpc: "2.0",
       id: 2,
-      method: "getBalance",
+      method:
+        "getBalance",
       params: [
         pool.quoteVault,
         {
-          commitment: "processed"
+          commitment:
+            "processed"
         }
       ]
     }
@@ -383,9 +538,10 @@ async function getPoolReserves(pool) {
           "content-type":
             "application/json"
         },
-        body: JSON.stringify(
-          requests
-        )
+        body:
+          JSON.stringify(
+            requests
+          )
       }
     );
 
@@ -414,7 +570,7 @@ async function getPoolReserves(pool) {
   ) {
     throw new Error(
       baseResult?.error?.message ||
-      "Réserve base indisponible"
+      "Réserve token indisponible"
     );
   }
 
@@ -456,7 +612,8 @@ async function getPoolReserves(pool) {
     );
 
   const virtualQuote =
-    pool.virtualQuoteReserves > 0n
+    pool.virtualQuoteReserves >
+    0n
       ? pool.virtualQuoteReserves
       : 0n;
 
@@ -477,6 +634,18 @@ async function getPoolReserves(pool) {
       virtualQuote
   };
 }
+
+/*
+ * ---------------------------------------------------------
+ * DEXSCREENER
+ * ---------------------------------------------------------
+ *
+ * DexScreener sert uniquement pour :
+ * - prix USD
+ * - prix SOL
+ *
+ * PAS pour la liquidité.
+ */
 
 async function getDexMarket() {
   const url =
@@ -509,32 +678,37 @@ async function getDexMarket() {
           json.pairs || []
         );
 
-  const pumpPairs =
-    pairs.filter(
+  const pumpPair =
+    pairs.find(
       p =>
         p &&
-        p.dexId === "pumpswap" &&
+        p.dexId ===
+          "pumpswap" &&
         p.baseToken &&
-        p.baseToken.address === TOKEN_MINT
+        p.baseToken.address ===
+          TOKEN_MINT
     );
 
-  if (!pumpPairs.length) {
+  if (!pumpPair) {
     throw new Error(
-      "Aucun marché PumpSwap trouvé sur DexScreener"
+      "Prix PumpSwap indisponible"
     );
   }
 
-  const pair =
-    pumpPairs[0];
-
   const priceUsd =
-    Number(pair.priceUsd);
+    Number(
+      pumpPair.priceUsd
+    );
 
   const priceNative =
-    Number(pair.priceNative);
+    Number(
+      pumpPair.priceNative
+    );
 
   if (
-    !Number.isFinite(priceUsd) ||
+    !Number.isFinite(
+      priceUsd
+    ) ||
     priceUsd <= 0
   ) {
     throw new Error(
@@ -545,7 +719,9 @@ async function getDexMarket() {
   let solUsd = null;
 
   if (
-    Number.isFinite(priceNative) &&
+    Number.isFinite(
+      priceNative
+    ) &&
     priceNative > 0
   ) {
     solUsd =
@@ -557,163 +733,53 @@ async function getDexMarket() {
     priceUsd,
     priceNative,
     solUsd,
-    pairAddress:
-      pair.pairAddress,
+
     symbol:
-      pair.baseToken.symbol ||
+      pumpPair.baseToken
+        .symbol ||
       "TOKEN",
+
     name:
-      pair.baseToken.name ||
+      pumpPair.baseToken
+        .name ||
       "Token"
   };
 }
 
-async function chooseBestPool() {
-  if (!pumpPools.length) {
-    await discoverPumpPools();
-  }
-
-  let best = null;
-  let bestLiquidity = -1;
-
-  const dex =
-    await getDexMarket();
-
-  for (const pool of pumpPools) {
-    try {
-      const reserves =
-        await getPoolReserves(
-          pool
-        );
-
-      const quoteUsd =
-        Number.isFinite(
-          dex.solUsd
-        )
-          ? reserves.quoteSol *
-            dex.solUsd
-          : 0;
-
-      const baseUsd =
-        reserves.baseTokens *
-        dex.priceUsd;
-
-      const liquidityUsd =
-        quoteUsd +
-        baseUsd;
-
-      if (
-        liquidityUsd >
-        bestLiquidity
-      ) {
-        bestLiquidity =
-          liquidityUsd;
-
-        best = {
-          pool,
-          reserves,
-          liquidityUsd
-        };
-      }
-
-    } catch (e) {
-      console.log(
-        `Pool ${pool.address} ignoré:`,
-        e.message
-      );
-    }
-  }
-
-  if (!best) {
-    throw new Error(
-      "Impossible de lire les réserves des pools"
-    );
-  }
-
-  selectedPool =
-    best.pool;
-
-  console.log(
-    "✅ Pool sélectionné:",
-    selectedPool.address
-  );
-
-  console.log(
-    "💧 Liquidité on-chain:",
-    fmtUsd(
-      best.liquidityUsd
-    )
-  );
-
-  return best;
-}
+/*
+ * ---------------------------------------------------------
+ * MARKET
+ * ---------------------------------------------------------
+ */
 
 async function getMarket() {
+  if (!selectedPool) {
+    await loadCanonicalPool();
+  }
+
   const dex =
     await getDexMarket();
 
-  if (!pumpPools.length) {
-    await discoverPumpPools();
-  }
-
-  let candidates = [];
-
-  for (
-    const pool of pumpPools
-  ) {
-    try {
-      const reserves =
-        await getPoolReserves(
-          pool
-        );
-
-      const quoteUsd =
-        Number.isFinite(
-          dex.solUsd
-        )
-          ? reserves.quoteSol *
-            dex.solUsd
-          : 0;
-
-      const baseUsd =
-        reserves.baseTokens *
-        dex.priceUsd;
-
-      const liquidityUsd =
-        quoteUsd +
-        baseUsd;
-
-      candidates.push({
-        pool,
-        reserves,
-        liquidityUsd
-      });
-
-    } catch (e) {
-      console.log(
-        `⚠️ Pool ${pool.address}:`,
-        e.message
-      );
-    }
-  }
-
-  if (!candidates.length) {
-    throw new Error(
-      "Aucune réserve PumpSwap lisible"
+  const reserves =
+    await getPoolReserves(
+      selectedPool
     );
-  }
 
-  candidates.sort(
-    (a, b) =>
-      b.liquidityUsd -
-      a.liquidityUsd
-  );
+  const quoteUsd =
+    Number.isFinite(
+      dex.solUsd
+    )
+      ? reserves.quoteSol *
+        dex.solUsd
+      : 0;
 
-  const best =
-    candidates[0];
+  const baseUsd =
+    reserves.baseTokens *
+    dex.priceUsd;
 
-  selectedPool =
-    best.pool;
+  const liquidityUsd =
+    quoteUsd +
+    baseUsd;
 
   return {
     ts: now(),
@@ -722,13 +788,17 @@ async function getMarket() {
       dex.priceUsd,
 
     liquidity:
-      best.liquidityUsd,
+      Number.isFinite(
+        liquidityUsd
+      )
+        ? liquidityUsd
+        : 0,
 
     quoteSol:
-      best.reserves.quoteSol,
+      reserves.quoteSol,
 
     baseTokens:
-      best.reserves.baseTokens,
+      reserves.baseTokens,
 
     solUsd:
       dex.solUsd,
@@ -766,7 +836,8 @@ function trimHistory() {
 
   marketHistory =
     marketHistory.filter(
-      x => x.ts >= cutoff
+      x =>
+        x.ts >= cutoff
     );
 }
 
@@ -826,8 +897,10 @@ function getChange(
 
   return (
     (
-      (current -
-        old[field]) /
+      (
+        current -
+        old[field]
+      ) /
       old[field]
     ) * 100
   );
@@ -874,6 +947,12 @@ function isCrash(
     liq10
   };
 }
+
+/*
+ * ---------------------------------------------------------
+ * V5.1 ENTRY FILTERS
+ * ---------------------------------------------------------
+ */
 
 function entryAllowed() {
   if (!lastMarket) {
@@ -1014,6 +1093,12 @@ function entryAllowed() {
   };
 }
 
+/*
+ * ---------------------------------------------------------
+ * SIMULATION
+ * ---------------------------------------------------------
+ */
+
 function openPosition() {
   if (!lastMarket) {
     return;
@@ -1055,9 +1140,7 @@ function openPosition() {
         lastMarket.liquidity,
       capital:
         CAPITAL_USD,
-      tokens,
-      pool:
-        selectedPool?.address
+      tokens
     }
   );
 
@@ -1400,6 +1483,12 @@ async function marketTick() {
   }
 }
 
+/*
+ * ---------------------------------------------------------
+ * HELIUS WSS
+ * ---------------------------------------------------------
+ */
+
 function startHelius() {
   if (ws) {
     return;
@@ -1518,6 +1607,12 @@ function stopHelius() {
   ws = null;
 }
 
+/*
+ * ---------------------------------------------------------
+ * SESSION
+ * ---------------------------------------------------------
+ */
+
 async function startSession() {
   if (running) {
     return;
@@ -1541,7 +1636,6 @@ async function startSession() {
   lastBuyTime = 0;
   lastSellTime = 0;
 
-  pumpPools = [];
   selectedPool = null;
 
   console.log(
@@ -1659,6 +1753,12 @@ async function stopSession(
     `P&L: ${fmtUsd(pnl)}`
   );
 }
+
+/*
+ * ---------------------------------------------------------
+ * TELEGRAM
+ * ---------------------------------------------------------
+ */
 
 bot.start(
   ctx => {
