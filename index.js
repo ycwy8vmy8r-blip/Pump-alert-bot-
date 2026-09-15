@@ -1,2229 +1,2195 @@
-const { Telegraf } = require("telegraf");
-const { Connection, PublicKey } = require("@solana/web3.js");
-const fs = require("fs");
-const path = require("path");
-const WebSocket = require("ws");
 require("dotenv").config();
 
-/*
-  PUMP RADAR V5.9
-  COMPARATIF STOP-LOSS
+const { Telegraf } = require("telegraf");
+const {
+  Connection,
+  PublicKey,
+} = require("@solana/web3.js");
 
-  SIMULATION UNIQUEMENT
+const fs = require("fs");
+const path = require("path");
 
-  4 stratégies virtuelles :
-    +5% / stop -10%
-    +5% / stop -15%
-    +5% / stop -20%
-    +5% / stop -25%
+// ============================================================
+// V6 RADAR + V5.9 SIMULATION
+// ============================================================
 
-  Capital : 10 $ par stratégie
-  Cooldown : 30 secondes
-  Aucun nouveau BUY après 43 minutes
-  Fermeture forcée à 45 minutes
-*/
+// -------------------- ENV --------------------
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
-const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 
-const TOKEN_MINT =
-  "5XnMHrs45GNHqNpPNHd8bepoHdRhFBppZdUieP4MKa1S";
+if (!BOT_TOKEN) throw new Error("BOT_TOKEN manquant");
+if (!CHAT_ID) throw new Error("CHAT_ID manquant");
+if (!HELIUS_API_KEY) throw new Error("HELIUS_API_KEY manquant");
 
-const SOLANA_RPC = HELIUS_API_KEY
-  ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`
-  : "https://api.mainnet-beta.solana.com";
+// -------------------- SOLANA --------------------
 
-const HELIUS_WSS = HELIUS_API_KEY
-  ? `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`
-  : null;
+const RPC_URL =
+  process.env.HELIUS_RPC_URL ||
+  `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
-const DEX_TOKEN_URL =
-  `https://api.dexscreener.com/latest/dex/tokens/${TOKEN_MINT}`;
+const WSS_URL =
+  process.env.HELIUS_WSS_URL ||
+  `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
-const DEX_PAIR_URL =
-  "https://api.dexscreener.com/latest/dex/pairs/solana/";
+const connection = new Connection(RPC_URL, "confirmed");
+
+// -------------------- PROGRAMMES --------------------
 
 const PUMPSWAP_PROGRAM =
   "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
+const PUMP_PROGRAM =
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+
 const WSOL_MINT =
   "So11111111111111111111111111111111111111112";
 
-// ================================
-// PARAMÈTRES DE LA STRATÉGIE
-// ================================
+// -------------------- STRATEGIE --------------------
 
-const CAPITAL_USD = 10;
-const TARGET_PCT = 0.05;
+const CAPITAL = 10;
 
-const STOP_VARIANTS = [
-  {
-    id: "STOP_10",
-    label: "-10 %",
-    stopPct: 0.10,
-  },
-  {
-    id: "STOP_15",
-    label: "-15 %",
-    stopPct: 0.15,
-  },
-  {
-    id: "STOP_20",
-    label: "-20 %",
-    stopPct: 0.20,
-  },
-  {
-    id: "STOP_25",
-    label: "-25 %",
-    stopPct: 0.25,
-  },
-];
+const TARGET_PCT = 5;
 
-const MARKET_INTERVAL_MS = 2000;
+const STOP_LEVELS = [-10, -15, -20, -25];
 
-const HISTORY_MS = 120000;
-const WARMUP_POINTS = 8;
+const MARKET_INTERVAL = 2000;
 
-const COOLDOWN_MS = 30000;
+const RADAR_INTERVAL = 15000;
+
+const PAIR_REFRESH_INTERVAL = 30000;
+
+const HOLDER_REFRESH_INTERVAL = 60000;
+
+const SESSION_MAX_MS = 45 * 60 * 1000;
 
 const NO_NEW_BUY_MS = 43 * 60 * 1000;
-const MAX_SESSION_MS = 45 * 60 * 1000;
 
-const MIN_LIQUIDITY_USD = 3000;
+const POST_SELL_COOLDOWN_MS = 30000;
 
-// Détection crash
-const CRASH_LIQUIDITY_USD = 1;
-const CRASH_LIQUIDITY_DROP_10S = -0.50;
-const CRASH_PRICE_DROP_10S = -0.20;
+const MIN_LIQUIDITY = 200000;
 
-// DexScreener : redécouverte de la paire
-const DISCOVERY_INTERVAL_MS = 30000;
+const MAX_LIQUIDITY = 400000;
 
-// Diagnostics Telegram/console
-const DIAGNOSTIC_INTERVAL_MS = 30000;
+const MIN_HOLDERS = 1000;
 
-// ================================
-// STOCKAGE
-// ================================
+const MAX_AGE_MS = 5 * 60 * 60 * 1000;
+
+const HISTORY_SECONDS = 120;
+
+const CRASH_LIQUIDITY = 1;
+
+const CRASH_LIQUIDITY_DROP_10S = -50;
+
+const CRASH_PRICE_DROP_10S = -20;
+
+// -------------------- DATA --------------------
 
 const DATA_DIR = fs.existsSync("/data")
   ? "/data"
   : path.join(__dirname, "data");
 
-fs.mkdirSync(DATA_DIR, {
-  recursive: true,
-});
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
 
-const FILES = {
-  market: path.join(
-    DATA_DIR,
-    "v5_9_market_history.jsonl"
-  ),
+const MARKET_FILE = path.join(
+  DATA_DIR,
+  "v6_market_history.jsonl"
+);
 
-  trades: path.join(
-    DATA_DIR,
-    "v5_9_trades.json"
-  ),
+const TRADE_FILE = path.join(
+  DATA_DIR,
+  "v6_trades.json"
+);
 
-  comparison: path.join(
-    DATA_DIR,
-    "v5_9_comparison.json"
-  ),
+const CRASH_FILE = path.join(
+  DATA_DIR,
+  "v6_crashes.json"
+);
 
-  crash: path.join(
-    DATA_DIR,
-    "v5_9_crash_reports.json"
-  ),
-};
+const SUMMARY_FILE = path.join(
+  DATA_DIR,
+  "v6_summary.json"
+);
 
-// ================================
-// VARIABLES GLOBALES
-// ================================
+// ============================================================
+// ETAT GENERAL
+// ============================================================
 
-let bot = null;
-let connection = null;
-let heliusWs = null;
+let radarRunning = false;
+let simulationRunning = false;
 
-let sessionRunning = false;
-let sessionStartedAt = null;
-let sessionEndedAt = null;
-
+let radarTimer = null;
 let marketTimer = null;
+
+let radarBusy = false;
+let marketBusy = false;
+
+let currentCandidate = null;
+
+let currentPair = null;
+
+let lastPairRefresh = 0;
+
+let lastHolderRefresh = 0;
+
+let lastHolderCount = null;
+
+let sessionStart = null;
 
 let marketHistory = [];
 
-let cachedPairAddress = null;
-let cachedPair = null;
-let lastDiscoveryAt = 0;
-
-let lastMarketData = null;
-
-let lastDiagnosticAt = 0;
+let lastMarket = null;
 
 let crashDetected = false;
-let crashReport = null;
 
-let previousVaultSnapshot = null;
+let sessionStoppedReason = null;
 
-let lastOnChainValidation = {
-  checkedAt: 0,
-  ok: false,
-  reason: "NOT_CHECKED",
-  owner: null,
-  baseMint: null,
-  quoteMint: null,
-  baseVault: null,
-  quoteVault: null,
-};
+// ============================================================
+// TELEGRAM
+// ============================================================
 
-// ================================
-// HISTORIQUE SAUVEGARDÉ
-// ================================
+const bot = new Telegraf(BOT_TOKEN);
 
-const comparisonHistory =
-  loadJson(FILES.comparison, []);
-
-const savedTrades =
-  loadJson(FILES.trades, []);
-
-const savedCrashes =
-  loadJson(FILES.crash, []);
-
-// ================================
-// 4 STRATÉGIES VIRTUELLES
-// ================================
-
-function initStrategy(definition) {
-  return {
-    id: definition.id,
-    label: definition.label,
-    stopPct: definition.stopPct,
-
-    positionOpen: false,
-
-    entryPrice: null,
-    entryTime: null,
-    targetPrice: null,
-
-    invested: CAPITAL_USD,
-
-    cycleNumber: 0,
-
-    wins: 0,
-    stops: 0,
-    crashExits: 0,
-    sessionExits: 0,
-    otherExits: 0,
-
-    pnl: 0,
-
-    cooldownUntil: 0,
-
-    lastExit: null,
-
-    totalTrades: 0,
-    entryCount: 0,
-
-    stoppedBeforeCrash: 0,
-    targetBeforeCrash: 0,
-  };
+async function sendTelegram(text) {
+  try {
+    await bot.telegram.sendMessage(CHAT_ID, text);
+  } catch (err) {
+    console.log("Telegram error:", err.message);
+  }
 }
 
-const strategies =
-  STOP_VARIANTS.map(initStrategy);
-
-// ================================
-// OUTILS
-// ================================
+// ============================================================
+// UTILITAIRES
+// ============================================================
 
 function now() {
   return Date.now();
 }
 
-function pctChange(oldValue, newValue) {
-  if (
-    !Number.isFinite(oldValue) ||
-    oldValue === 0 ||
-    !Number.isFinite(newValue)
-  ) {
+function ageMs(timestamp) {
+  return now() - timestamp;
+}
+
+function formatDuration(ms) {
+  const total = Math.floor(ms / 1000);
+
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+
+  return `${h}h ${m}m ${s}s`;
+}
+
+function formatUsd(value) {
+  if (!Number.isFinite(value)) return "N/A";
+
+  return `$${value.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+function pct(a, b) {
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b === 0) {
     return null;
   }
 
-  return (newValue / oldValue) - 1;
+  return ((a - b) / b) * 100;
 }
 
-function money(value) {
-  if (!Number.isFinite(value)) {
-    return "$0.00";
-  }
-
-  return `$${value.toFixed(2)}`;
-}
-
-function priceText(value) {
-  if (!Number.isFinite(value)) {
-    return "N/A";
-  }
-
-  if (value < 0.001) {
-    return value.toFixed(10);
-  }
-
-  return value.toFixed(8);
-}
-
-function loadJson(file, fallback) {
+function writeJsonLine(file, obj) {
   try {
-    if (!fs.existsSync(file)) {
-      return fallback;
-    }
+    fs.appendFileSync(
+      file,
+      JSON.stringify(obj) + "\n"
+    );
+  } catch (err) {
+    console.log("writeJsonLine:", err.message);
+  }
+}
+
+function readJson(file, fallback) {
+  try {
+    if (!fs.existsSync(file)) return fallback;
 
     return JSON.parse(
       fs.readFileSync(file, "utf8")
     );
-  } catch (e) {
-    console.log(
-      `⚠️ Lecture impossible ${file}:`,
-      e.message
-    );
-
+  } catch {
     return fallback;
   }
 }
 
-function saveJson(file, data) {
+function writeJson(file, obj) {
   try {
     fs.writeFileSync(
       file,
-      JSON.stringify(data, null, 2)
+      JSON.stringify(obj, null, 2)
     );
-  } catch (e) {
-    console.log(
-      `⚠️ Écriture impossible ${file}:`,
-      e.message
-    );
+  } catch (err) {
+    console.log("writeJson:", err.message);
   }
 }
 
-function appendJsonl(file, data) {
+// ============================================================
+// NOMS RECHERCHES
+// ============================================================
+
+const TARGET_NAMES = [
+  "claude",
+  "openai",
+  "anthropic",
+];
+
+function normalizeName(value) {
+  return String(value || "")
+    .toLowerCase()
+    .trim();
+}
+
+function matchesTargetName(name, symbol) {
+  const n = normalizeName(name);
+  const s = normalizeName(symbol);
+
+  return TARGET_NAMES.some((target) => {
+    return (
+      n === target ||
+      s === target ||
+      n.includes(target) ||
+      s.includes(target)
+    );
+  });
+}
+
+// ============================================================
+// DEXSCREENER
+// ============================================================
+
+async function fetchJson(url) {
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(
+      `HTTP ${response.status} ${url}`
+    );
+  }
+
+  return response.json();
+}
+
+// ------------------------------------------------------------
+// Recherche PumpSwap pour un mint
+// ------------------------------------------------------------
+
+async function getPumpSwapPairsForMint(mint) {
+  const url =
+    `https://api.dexscreener.com/latest/dex/tokens/${mint}`;
+
+  const data = await fetchJson(url);
+
+  const pairs = Array.isArray(data.pairs)
+    ? data.pairs
+    : [];
+
+  return pairs.filter((pair) => {
+    const dex = normalizeName(pair.dexId);
+
+    const isPumpSwap =
+      dex === "pumpswap" ||
+      dex === "pump_amm" ||
+      dex === "pumpamm" ||
+      dex.includes("pump");
+
+    const base =
+      pair.baseToken?.address === mint;
+
+    const quote =
+      pair.quoteToken?.address === mint;
+
+    return isPumpSwap && (base || quote);
+  });
+}
+
+// ------------------------------------------------------------
+// Choisir meilleur pair
+// ------------------------------------------------------------
+
+function chooseBestPair(pairs, mint) {
+  if (!pairs.length) return null;
+
+  const valid = pairs.filter((pair) => {
+    const liquidity =
+      Number(pair.liquidity?.usd || 0);
+
+    return liquidity > 0;
+  });
+
+  if (!valid.length) return null;
+
+  valid.sort((a, b) => {
+    const la =
+      Number(a.liquidity?.usd || 0);
+
+    const lb =
+      Number(b.liquidity?.usd || 0);
+
+    return lb - la;
+  });
+
+  return valid[0];
+}
+
+// ============================================================
+// SOLANA / HOLDERS
+// ============================================================
+
+// ------------------------------------------------------------
+// Compter holders
+// ------------------------------------------------------------
+
+async function getHolderCount(mint) {
   try {
-    fs.appendFileSync(
-      file,
-      JSON.stringify(data) + "\n"
-    );
-  } catch (e) {
+    const url =
+      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+
+    const body = {
+      jsonrpc: "2.0",
+      id: "v6-holders",
+      method: "getTokenAccounts",
+      params: {
+        mint: mint,
+        limit: 1000,
+      },
+    };
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `Helius holders HTTP ${response.status}`
+      );
+    }
+
+    const data = await response.json();
+
+    const accounts =
+      data.result?.token_accounts ||
+      data.result?.tokenAccounts ||
+      [];
+
+    const owners = new Set();
+
+    for (const account of accounts) {
+      const owner =
+        account.owner ||
+        account.owner_address ||
+        account.ownerAddress;
+
+      const amount = Number(
+        account.amount ||
+        account.token_amount ||
+        account.tokenAmount ||
+        0
+      );
+
+      if (owner && amount > 0) {
+        owners.add(owner);
+      }
+    }
+
+    return owners.size;
+
+  } catch (err) {
     console.log(
-      "⚠️ Écriture JSONL impossible:",
-      e.message
+      "⚠️ Holder check:",
+      err.message
     );
+
+    return null;
   }
 }
 
-function elapsedMs() {
-  if (!sessionStartedAt) {
-    return 0;
+// ============================================================
+// VERIFICATION PUMPSWAP ON-CHAIN
+// ============================================================
+
+const OFFSET_BASE_MINT = 43;
+const OFFSET_QUOTE_MINT = 75;
+const OFFSET_BASE_VAULT = 139;
+const OFFSET_QUOTE_VAULT = 171;
+const OFFSET_VIRTUAL_QUOTE = 245;
+
+function readPubkey(data, offset) {
+  if (
+    !data ||
+    data.length < offset + 32
+  ) {
+    return null;
   }
 
-  return now() - sessionStartedAt;
+  return new PublicKey(
+    data.subarray(offset, offset + 32)
+  ).toBase58();
 }
 
-function sessionMinutes() {
-  return elapsedMs() / 60000;
+function readI128LE(data, offset) {
+  if (
+    !data ||
+    data.length < offset + 16
+  ) {
+    return 0n;
+  }
+
+  let result = 0n;
+
+  for (let i = 15; i >= 0; i--) {
+    result =
+      (result << 8n) +
+      BigInt(data[offset + i]);
+  }
+
+  return result;
 }
 
-// ================================
-// SESSION
-// ================================
+async function verifyPumpSwapPool(pairAddress, mint) {
+  try {
+    const info = await connection.getAccountInfo(
+      new PublicKey(pairAddress),
+      "confirmed"
+    );
 
-function canOpenNewPosition() {
-  return (
-    sessionRunning &&
-    !crashDetected &&
-    elapsedMs() < NO_NEW_BUY_MS
+    if (!info) {
+      return {
+        ok: false,
+        reason: "POOL_NOT_FOUND",
+      };
+    }
+
+    if (
+      info.owner.toBase58() !==
+      PUMPSWAP_PROGRAM
+    ) {
+      return {
+        ok: false,
+        reason: "OWNER_NOT_PUMPSWAP",
+      };
+    }
+
+    const data = info.data;
+
+    const baseMint =
+      readPubkey(data, OFFSET_BASE_MINT);
+
+    const quoteMint =
+      readPubkey(data, OFFSET_QUOTE_MINT);
+
+    const baseVault =
+      readPubkey(data, OFFSET_BASE_VAULT);
+
+    const quoteVault =
+      readPubkey(data, OFFSET_QUOTE_VAULT);
+
+    if (!baseMint || !quoteMint) {
+      return {
+        ok: false,
+        reason: "INVALID_POOL_LAYOUT",
+      };
+    }
+
+    if (baseMint !== mint) {
+      return {
+        ok: false,
+        reason: "BASE_MINT_MISMATCH",
+        baseMint,
+      };
+    }
+
+    if (quoteMint !== WSOL_MINT) {
+      return {
+        ok: false,
+        reason: "QUOTE_NOT_WSOL",
+        quoteMint,
+      };
+    }
+
+    return {
+      ok: true,
+      baseMint,
+      quoteMint,
+      baseVault,
+      quoteVault,
+      virtualQuote: readI128LE(
+        data,
+        OFFSET_VIRTUAL_QUOTE
+      ),
+    };
+
+  } catch (err) {
+    return {
+      ok: false,
+      reason: err.message,
+    };
+  }
+}
+
+// ============================================================
+// CANDIDAT
+// ============================================================
+
+async function evaluateCandidate(pair) {
+  try {
+    const base = pair.baseToken || {};
+
+    const mint =
+      base.address;
+
+    const name =
+      base.name || "";
+
+    const symbol =
+      base.symbol || "";
+
+    if (!mint) {
+      return {
+        ok: false,
+        reason: "NO_MINT",
+      };
+    }
+
+    // -------------------- NOM --------------------
+
+    if (
+      !matchesTargetName(
+        name,
+        symbol
+      )
+    ) {
+      return {
+        ok: false,
+        reason: "NAME",
+      };
+    }
+
+    // -------------------- AGE --------------------
+
+    const pairCreated =
+      Number(pair.pairCreatedAt || 0);
+
+    if (!pairCreated) {
+      return {
+        ok: false,
+        reason: "NO_CREATION_DATE",
+      };
+    }
+
+    const createdMs =
+      pairCreated;
+
+    const age =
+      now() - createdMs;
+
+    if (
+      age < 0 ||
+      age > MAX_AGE_MS
+    ) {
+      return {
+        ok: false,
+        reason: "AGE",
+        age,
+      };
+    }
+
+    // -------------------- LIQUIDITE --------------------
+
+    const liquidity =
+      Number(
+        pair.liquidity?.usd || 0
+      );
+
+    if (
+      liquidity < MIN_LIQUIDITY ||
+      liquidity > MAX_LIQUIDITY
+    ) {
+      return {
+        ok: false,
+        reason: "LIQUIDITY",
+        liquidity,
+      };
+    }
+
+    // -------------------- PUMPSWAP --------------------
+
+    const dex =
+      normalizeName(pair.dexId);
+
+    const isPumpSwap =
+      dex === "pumpswap" ||
+      dex === "pump_amm" ||
+      dex === "pumpamm" ||
+      dex.includes("pump");
+
+    if (!isPumpSwap) {
+      return {
+        ok: false,
+        reason: "DEX",
+      };
+    }
+
+    // -------------------- HOLDERS --------------------
+
+    let holders =
+      lastHolderCount;
+
+    if (
+      currentCandidate?.mint !== mint ||
+      now() - lastHolderRefresh >
+      HOLDER_REFRESH_INTERVAL
+    ) {
+      holders =
+        await getHolderCount(mint);
+
+      lastHolderRefresh = now();
+
+      if (holders !== null) {
+        lastHolderCount = holders;
+      }
+    }
+
+    if (holders === null) {
+      return {
+        ok: false,
+        reason: "HOLDERS_UNAVAILABLE",
+      };
+    }
+
+    if (holders < MIN_HOLDERS) {
+      return {
+        ok: false,
+        reason: "HOLDERS",
+        holders,
+      };
+    }
+
+    // -------------------- ON-CHAIN --------------------
+
+    const pairAddress =
+      pair.pairAddress;
+
+    if (!pairAddress) {
+      return {
+        ok: false,
+        reason: "NO_PAIR_ADDRESS",
+      };
+    }
+
+    const onchain =
+      await verifyPumpSwapPool(
+        pairAddress,
+        mint
+      );
+
+    if (!onchain.ok) {
+      return {
+        ok: false,
+        reason:
+          `ONCHAIN_${onchain.reason}`,
+      };
+    }
+
+    return {
+      ok: true,
+
+      mint,
+
+      name,
+
+      symbol,
+
+      pairAddress,
+
+      dex: pair.dexId,
+
+      liquidity,
+
+      priceUsd:
+        Number(
+          pair.priceUsd || 0
+        ),
+
+      holders,
+
+      ageMs: age,
+
+      ageMinutes:
+        age / 60000,
+
+      onchain,
+
+      pair,
+    };
+
+  } catch (err) {
+    return {
+      ok: false,
+      reason: err.message,
+    };
+  }
+}
+
+// ============================================================
+// RADAR
+// ============================================================
+
+// ------------------------------------------------------------
+// Source de découverte
+// ------------------------------------------------------------
+//
+// On utilise les tokens récemment apparus dans les flux
+// Pump.fun disponibles publiquement.
+// Le radar garde également les candidats déjà vus.
+//
+// ------------------------------------------------------------
+
+async function getRecentPumpTokens() {
+  const urls = [
+    "https://frontend-api-v3.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false",
+    "https://frontend-api-v3.pump.fun/coins?offset=0&limit=50&sort=market_cap&order=DESC&includeNsfw=false",
+  ];
+
+  const result = [];
+
+  for (const url of urls) {
+    try {
+      const data =
+        await fetchJson(url);
+
+      if (Array.isArray(data)) {
+        result.push(...data);
+      } else if (
+        Array.isArray(data.coins)
+      ) {
+        result.push(...data.coins);
+      }
+    } catch (err) {
+      console.log(
+        "Pump.fun source:",
+        err.message
+      );
+    }
+  }
+
+  const map = new Map();
+
+  for (const token of result) {
+    const mint =
+      token.mint ||
+      token.address;
+
+    if (mint) {
+      map.set(mint, token);
+    }
+  }
+
+  return Array.from(
+    map.values()
   );
 }
 
-function sessionLimitReached() {
-  return (
-    sessionRunning &&
-    elapsedMs() >= MAX_SESSION_MS
-  );
+// ------------------------------------------------------------
+// Vérifier un token
+// ------------------------------------------------------------
+
+async function inspectToken(token) {
+  const mint =
+    token.mint ||
+    token.address;
+
+  if (!mint) return null;
+
+  const name =
+    token.name ||
+    token.symbol ||
+    "";
+
+  const symbol =
+    token.symbol ||
+    "";
+
+  if (
+    !matchesTargetName(
+      name,
+      symbol
+    )
+  ) {
+    return null;
+  }
+
+  let pairs;
+
+  try {
+    pairs =
+      await getPumpSwapPairsForMint(
+        mint
+      );
+  } catch {
+    return null;
+  }
+
+  const pair =
+    chooseBestPair(
+      pairs,
+      mint
+    );
+
+  if (!pair) {
+    return null;
+  }
+
+  const candidate =
+    await evaluateCandidate(
+      pair
+    );
+
+  if (!candidate.ok) {
+    return null;
+  }
+
+  return candidate;
 }
 
-// ================================
-// HISTORIQUE MARCHÉ
-// ================================
+// ------------------------------------------------------------
+// Boucle radar
+// ------------------------------------------------------------
 
-function historyTrim() {
+async function radarTick() {
+  if (!radarRunning) return;
+
+  if (radarBusy) return;
+
+  radarBusy = true;
+
+  try {
+    const tokens =
+      await getRecentPumpTokens();
+
+    console.log(
+      `🔎 Radar: ${tokens.length} tokens examinés`
+    );
+
+    for (const token of tokens) {
+      if (!radarRunning) break;
+
+      const candidate =
+        await inspectToken(token);
+
+      if (!candidate?.ok) {
+        continue;
+      }
+
+      const mint =
+        candidate.mint;
+
+      // Éviter de relancer constamment
+      // exactement le même candidat.
+
+      if (
+        currentCandidate?.mint === mint &&
+        simulationRunning
+      ) {
+        continue;
+      }
+
+      currentCandidate =
+        candidate;
+
+      await announceCandidate(
+        candidate
+      );
+
+      // Pour le moment, le radar ne lance
+      // PAS automatiquement la simulation.
+      //
+      // Le candidat est envoyé sur Telegram.
+      // La commande /starttrade permet de le lancer.
+
+      break;
+    }
+
+  } catch (err) {
+    console.log(
+      "❌ Radar:",
+      err.message
+    );
+  } finally {
+    radarBusy = false;
+  }
+}
+
+// ============================================================
+// ANNONCE CANDIDAT
+// ============================================================
+
+async function announceCandidate(candidate) {
+  const text =
+`🟢 CANDIDAT V6
+
+🪙 ${candidate.name}
+🔤 ${candidate.symbol}
+
+💧 Liquidité :
+${formatUsd(candidate.liquidity)}
+
+👥 Holders :
+${candidate.holders}
+
+⏱️ Âge :
+${candidate.ageMinutes.toFixed(1)} min
+
+🏦 DEX :
+${candidate.dex}
+
+🔗 Pair :
+${candidate.pairAddress}
+
+⛓️ PumpSwap on-chain :
+OK
+
+🧪 V5.9 prêt
+
+Mint :
+${candidate.mint}
+
+Commande :
+/starttrade`;
+
+  await sendTelegram(text);
+}
+
+// ============================================================
+// MARCHE
+// ============================================================
+
+async function getCurrentMarket() {
+  if (!currentCandidate) {
+    return null;
+  }
+
+  const mint =
+    currentCandidate.mint;
+
+  try {
+    const pairs =
+      await getPumpSwapPairsForMint(
+        mint
+      );
+
+    const pair =
+      chooseBestPair(
+        pairs,
+        mint
+      );
+
+    if (!pair) {
+      return null;
+    }
+
+    const price =
+      Number(pair.priceUsd || 0);
+
+    const liquidity =
+      Number(
+        pair.liquidity?.usd || 0
+      );
+
+    if (
+      !Number.isFinite(price) ||
+      price <= 0
+    ) {
+      return null;
+    }
+
+    if (
+      !Number.isFinite(liquidity)
+    ) {
+      return null;
+    }
+
+    return {
+      timestamp: now(),
+
+      mint,
+
+      price,
+
+      liquidity,
+
+      dex: pair.dexId,
+
+      pairAddress:
+        pair.pairAddress,
+
+      name:
+        pair.baseToken?.name ||
+        currentCandidate.name,
+
+      symbol:
+        pair.baseToken?.symbol ||
+        currentCandidate.symbol,
+    };
+
+  } catch (err) {
+    console.log(
+      "Market:",
+      err.message
+    );
+
+    return null;
+  }
+}
+
+// ============================================================
+// HISTORIQUE
+// ============================================================
+
+function addMarketPoint(market) {
+  marketHistory.push(market);
+
   const cutoff =
-    now() - HISTORY_MS;
+    now() -
+    HISTORY_SECONDS * 1000;
 
   marketHistory =
     marketHistory.filter(
-      x => x.ts >= cutoff
+      (x) =>
+        x.timestamp >= cutoff
     );
+
+  writeJsonLine(
+    MARKET_FILE,
+    market
+  );
 }
 
-function snapshotAtOrBefore(msAgo) {
+function getPointAgo(seconds) {
   const target =
-    now() - msAgo;
+    now() -
+    seconds * 1000;
 
   let best = null;
 
-  for (
-    let i = marketHistory.length - 1;
-    i >= 0;
-    i--
-  ) {
-    if (
-      marketHistory[i].ts <= target
-    ) {
-      best = marketHistory[i];
-      break;
+  for (const point of marketHistory) {
+    if (point.timestamp <= target) {
+      best = point;
     }
   }
 
   return best;
 }
 
-function getMarketChange(msAgo, field) {
+function getPriceDrop(seconds) {
   const old =
-    snapshotAtOrBefore(msAgo);
+    getPointAgo(seconds);
 
-  const latest =
-    marketHistory[
-      marketHistory.length - 1
-    ];
-
-  if (!old || !latest) {
+  if (!old || !lastMarket) {
     return null;
   }
 
-  return pctChange(
-    old[field],
-    latest[field]
+  return pct(
+    lastMarket.price,
+    old.price
   );
 }
 
-// ================================
-// CONDITIONS D'ENTRÉE
-// ================================
+function getLiquidityDrop(seconds) {
+  const old =
+    getPointAgo(seconds);
 
-function entryHealthReason() {
-  if (!lastMarketData) {
-    return "NO_MARKET";
-  }
-
-  if (
-    lastMarketData.liquidityUsd <
-    MIN_LIQUIDITY_USD
-  ) {
-    return "LIQUIDITY_TOO_LOW";
-  }
-
-  if (
-    marketHistory.length <
-    WARMUP_POINTS
-  ) {
-    return (
-      `HISTORY_WARMUP ` +
-      `${marketHistory.length}/${WARMUP_POINTS}`
-    );
-  }
-
-  const price10 =
-    getMarketChange(
-      10000,
-      "priceUsd"
-    );
-
-  const liq10 =
-    getMarketChange(
-      10000,
-      "liquidityUsd"
-    );
-
-  const liq30 =
-    getMarketChange(
-      30000,
-      "liquidityUsd"
-    );
-
-  if (
-    price10 !== null &&
-    price10 < -0.05
-  ) {
-    return "PRICE_DROP_10S";
-  }
-
-  if (
-    liq10 !== null &&
-    liq10 < -0.12
-  ) {
-    return "LIQUIDITY_DROP_10S";
-  }
-
-  if (
-    liq30 !== null &&
-    liq30 < -0.20
-  ) {
-    return "LIQUIDITY_DROP_30S";
-  }
-
-  return null;
-}
-
-function isHealthyEntry() {
-  return entryHealthReason() === null;
-}
-
-// ================================
-// DÉTECTION CRASH
-// ================================
-
-function crashReason() {
-  if (
-    !lastMarketData ||
-    marketHistory.length < 2
-  ) {
+  if (!old || !lastMarket) {
     return null;
   }
 
-  const price10 =
-    getMarketChange(
-      10000,
-      "priceUsd"
-    );
+  return pct(
+    lastMarket.liquidity,
+    old.liquidity
+  );
+}
 
-  const liq10 =
-    getMarketChange(
-      10000,
-      "liquidityUsd"
-    );
+// ============================================================
+// V5.9 STRATEGIES
+// ============================================================
+
+function createStrategy(stopPct) {
+  return {
+    id: `STOP_${Math.abs(stopPct)}`,
+
+    stopPct,
+
+    capital: CAPITAL,
+
+    open: false,
+
+    entryPrice: null,
+
+    entryTime: null,
+
+    cycle: 0,
+
+    wins: 0,
+
+    losses: 0,
+
+    sessionLimit: 0,
+
+    crashExits: 0,
+
+    manualExits: 0,
+
+    pnl: 0,
+
+    lastSellTime: 0,
+
+    trades: [],
+  };
+}
+
+let strategies =
+  STOP_LEVELS.map(
+    createStrategy
+  );
+
+// ============================================================
+// CONDITIONS D'ENTREE
+// ============================================================
+
+function entryAllowed() {
+  if (!simulationRunning) {
+    return {
+      ok: false,
+      reason: "SIMULATION_STOPPED",
+    };
+  }
+
+  if (!lastMarket) {
+    return {
+      ok: false,
+      reason: "NO_MARKET",
+    };
+  }
+
+  const sessionAge =
+    now() - sessionStart;
 
   if (
-    Number.isFinite(
-      lastMarketData.liquidityUsd
-    ) &&
-    lastMarketData.liquidityUsd <=
-      CRASH_LIQUIDITY_USD
+    sessionAge >= NO_NEW_BUY_MS
+  ) {
+    return {
+      ok: false,
+      reason: "NO_NEW_BUY_43MIN",
+    };
+  }
+
+  if (
+    lastMarket.liquidity <
+    MIN_LIQUIDITY
+  ) {
+    return {
+      ok: false,
+      reason: "LIQUIDITY_LOW",
+    };
+  }
+
+  if (
+    lastMarket.liquidity >
+    MAX_LIQUIDITY
+  ) {
+    return {
+      ok: false,
+      reason: "LIQUIDITY_HIGH",
+    };
+  }
+
+  if (
+    marketHistory.length < 8
+  ) {
+    return {
+      ok: false,
+      reason: "HISTORY_WARMUP",
+    };
+  }
+
+  const drop10 =
+    getPriceDrop(10);
+
+  if (
+    drop10 !== null &&
+    drop10 <= -5
+  ) {
+    return {
+      ok: false,
+      reason: "PRICE_TOO_WEAK",
+    };
+  }
+
+  const liq10 =
+    getLiquidityDrop(10);
+
+  if (
+    liq10 !== null &&
+    liq10 <= -12
+  ) {
+    return {
+      ok: false,
+      reason: "LIQUIDITY_10S_WEAK",
+    };
+  }
+
+  const liq30 =
+    getLiquidityDrop(30);
+
+  if (
+    liq30 !== null &&
+    liq30 <= -20
+  ) {
+    return {
+      ok: false,
+      reason: "LIQUIDITY_30S_WEAK",
+    };
+  }
+
+  return {
+    ok: true,
+    reason: "OK",
+  };
+}
+
+// ============================================================
+// CRASH
+// ============================================================
+
+function getCrashReason() {
+  if (!lastMarket) {
+    return null;
+  }
+
+  if (
+    lastMarket.liquidity <=
+    CRASH_LIQUIDITY
   ) {
     return "LIQUIDITY_NEAR_ZERO";
   }
 
+  const liq10 =
+    getLiquidityDrop(10);
+
   if (
     liq10 !== null &&
-    liq10 <=
-      CRASH_LIQUIDITY_DROP_10S
+    liq10 <= CRASH_LIQUIDITY_DROP_10S
   ) {
-    return "LIQUIDITY_COLLAPSE_10S";
+    return "LIQUIDITY_CRASH";
   }
+
+  const price10 =
+    getPriceDrop(10);
 
   if (
     price10 !== null &&
-    price10 <=
-      CRASH_PRICE_DROP_10S
+    price10 <= CRASH_PRICE_DROP_10S
   ) {
-    return "PRICE_CRASH_10S";
+    return "PRICE_CRASH";
   }
 
   return null;
 }
 
-// ================================
-// TELEGRAM
-// ================================
+// ============================================================
+// ACHAT SIMULE
+// ============================================================
 
-async function sendTelegram(text) {
-  if (!bot || !CHAT_ID) {
-    console.log(text);
+function simulateBuy(strategy) {
+  if (strategy.open) {
     return;
   }
 
-  try {
-    await bot.telegram.sendMessage(
-      CHAT_ID,
-      text
-    );
-  } catch (e) {
-    console.log(
-      "⚠️ Telegram:",
-      e.message
-    );
-  }
-}
+  strategy.open = true;
 
-// ================================
-// RESET
-// ================================
+  strategy.entryPrice =
+    lastMarket.price;
 
-function resetStrategies() {
-  for (let i = 0; i < strategies.length; i++) {
-    const definition =
-      STOP_VARIANTS[i];
+  strategy.entryTime =
+    now();
 
-    strategies[i] =
-      initStrategy(definition);
-  }
-}
+  strategy.cycle++;
 
-function resetSessionState() {
-  marketHistory = [];
+  const target =
+    strategy.entryPrice *
+    (1 + TARGET_PCT / 100);
 
-  cachedPairAddress = null;
-  cachedPair = null;
+  console.log(
+    `🟢 BUY SIMULÉ ${strategy.id} #${strategy.cycle}`
+  );
 
-  lastDiscoveryAt = 0;
+  sendTelegram(
+`🟢 BUY SIMULÉ
 
-  lastMarketData = null;
+Stratégie : ${strategy.id}
+Stop : ${strategy.stopPct}%
 
-  lastDiagnosticAt = 0;
+Cycle #${strategy.cycle}
 
-  crashDetected = false;
-  crashReport = null;
+Capital :
+${formatUsd(strategy.capital)}
 
-  previousVaultSnapshot = null;
+Prix :
+${strategy.entryPrice}
 
-  lastOnChainValidation = {
-    checkedAt: 0,
-    ok: false,
-    reason: "NOT_CHECKED",
-    owner: null,
-    baseMint: null,
-    quoteMint: null,
-    baseVault: null,
-    quoteVault: null,
-  };
+Liquidité :
+${formatUsd(lastMarket.liquidity)}
 
-  resetStrategies();
-}
-
-// ================================
-// HTTP
-// ================================
-
-async function fetchJson(
-  url,
-  timeoutMs = 8000
-) {
-  const controller =
-    new AbortController();
-
-  const timeout =
-    setTimeout(
-      () => controller.abort(),
-      timeoutMs
-    );
-
-  try {
-    const response =
-      await fetch(url, {
-        method: "GET",
-
-        headers: {
-          accept:
-            "application/json",
-
-          "user-agent":
-            "PumpRadar-V5.9",
-        },
-
-        signal:
-          controller.signal,
-      });
-
-    if (!response.ok) {
-      throw new Error(
-        `HTTP ${response.status}`
-      );
-    }
-
-    return await response.json();
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-// ================================
-// DEXSCREENER
-// ================================
-
-function isPumpSwapPair(pair) {
-  if (!pair) {
-    return false;
-  }
-
-  const dexId =
-    String(
-      pair.dexId || ""
-    ).toLowerCase();
-
-  return (
-    dexId === "pumpswap" ||
-    dexId === "pump_amm" ||
-    dexId === "pumpamm" ||
-    dexId.includes("pump")
+🎯 Vente cible :
+${target}`
   );
 }
 
-function isTargetBasePair(pair) {
-  return (
-    pair &&
-    pair.baseToken &&
-    String(
-      pair.baseToken.address
-    ).toLowerCase() ===
-      TOKEN_MINT.toLowerCase()
-  );
-}
-
-async function discoverPumpSwapPair(
-  force = false
-) {
-  if (
-    !force &&
-    cachedPairAddress &&
-    now() - lastDiscoveryAt <
-      DISCOVERY_INTERVAL_MS
-  ) {
-    return cachedPairAddress;
-  }
-
-  const data =
-    await fetchJson(
-      DEX_TOKEN_URL,
-      8000
-    );
-
-  const pairs =
-    Array.isArray(data.pairs)
-      ? data.pairs
-      : [];
-
-  const candidates =
-    pairs
-      .filter(isPumpSwapPair)
-      .filter(isTargetBasePair)
-      .filter(
-        pair => pair.pairAddress
-      )
-      .sort((a, b) => {
-        const la =
-          Number(
-            a.liquidity?.usd || 0
-          );
-
-        const lb =
-          Number(
-            b.liquidity?.usd || 0
-          );
-
-        return lb - la;
-      });
-
-  lastDiscoveryAt = now();
-
-  if (!candidates.length) {
-    cachedPairAddress = null;
-    cachedPair = null;
-
-    throw new Error(
-      "Aucune paire PumpSwap cible trouvée"
-    );
-  }
-
-  cachedPair =
-    candidates[0];
-
-  cachedPairAddress =
-    candidates[0].pairAddress;
-
-  return cachedPairAddress;
-}
-
-async function fetchPairMarket(
-  pairAddress
-) {
-  const data =
-    await fetchJson(
-      `${DEX_PAIR_URL}${encodeURIComponent(
-        pairAddress
-      )}`,
-      8000
-    );
-
-  const pairs =
-    Array.isArray(data.pairs)
-      ? data.pairs
-      : [];
-
-  let pair =
-    pairs.find(
-      p =>
-        p.pairAddress ===
-          pairAddress &&
-        isPumpSwapPair(p) &&
-        isTargetBasePair(p)
-    );
-
-  if (!pair) {
-    pair =
-      pairs.find(
-        p =>
-          isPumpSwapPair(p) &&
-          isTargetBasePair(p)
-      );
-  }
-
-  if (!pair) {
-    throw new Error(
-      "Paire PumpSwap introuvable"
-    );
-  }
-
-  cachedPair = pair;
-
-  return pair;
-}
-
-async function getDexMarketData() {
-  let pairAddress =
-    cachedPairAddress;
-
-  if (
-    !pairAddress ||
-    now() - lastDiscoveryAt >=
-      DISCOVERY_INTERVAL_MS
-  ) {
-    pairAddress =
-      await discoverPumpSwapPair();
-  }
-
-  let pair;
-
-  try {
-    pair =
-      await fetchPairMarket(
-        pairAddress
-      );
-  } catch (e) {
-    console.log(
-      "⚠️ Pair endpoint:",
-      e.message
-    );
-
-    pairAddress =
-      await discoverPumpSwapPair(
-        true
-      );
-
-    pair =
-      await fetchPairMarket(
-        pairAddress
-      );
-  }
-
-  const priceUsd =
-    Number(pair.priceUsd);
-
-  const liquidityUsd =
-    Number(
-      pair.liquidity?.usd
-    );
-
-  if (
-    !Number.isFinite(priceUsd) ||
-    priceUsd <= 0
-  ) {
-    throw new Error(
-      "Prix DEX invalide"
-    );
-  }
-
-  if (
-    !Number.isFinite(liquidityUsd)
-  ) {
-    throw new Error(
-      "Liquidité DEX invalide"
-    );
-  }
-
-  return {
-    ts: now(),
-
-    priceUsd,
-
-    liquidityUsd,
-
-    pairAddress,
-
-    dexId: pair.dexId,
-
-    url:
-      pair.url || null,
-
-    baseMint:
-      pair.baseToken?.address ||
-      null,
-
-    quoteMint:
-      pair.quoteToken?.address ||
-      null,
-
-    priceNative:
-      Number(
-        pair.priceNative
-      ) || null,
-
-    fdv:
-      Number(pair.fdv) || null,
-
-    marketCap:
-      Number(pair.marketCap) ||
-      null,
-  };
-}
-
-// ================================
-// VALIDATION ON-CHAIN
-// ================================
-
-function readInt128LE(bytes) {
-  let result = 0n;
-
-  for (
-    let i = 0;
-    i < bytes.length;
-    i++
-  ) {
-    result +=
-      BigInt(bytes[i]) <<
-      (8n * BigInt(i));
-  }
-
-  const negative =
-    (bytes[bytes.length - 1] &
-      0x80) !== 0;
-
-  if (!negative) {
-    return result;
-  }
-
-  return (
-    result -
-    (1n << 128n)
-  );
-}
-
-function parsePumpSwapPool(data) {
-  if (
-    !data ||
-    !data.length ||
-    data.length < 203
-  ) {
-    throw new Error(
-      "Compte pool trop court"
-    );
-  }
-
-  const baseMint =
-    new PublicKey(
-      data.slice(43, 75)
-    ).toBase58();
-
-  const quoteMint =
-    new PublicKey(
-      data.slice(75, 107)
-    ).toBase58();
-
-  const baseVault =
-    new PublicKey(
-      data.slice(139, 171)
-    ).toBase58();
-
-  const quoteVault =
-    new PublicKey(
-      data.slice(171, 203)
-    ).toBase58();
-
-  let virtualQuoteReserves =
-    null;
-
-  if (data.length >= 261) {
-    try {
-      virtualQuoteReserves =
-        readInt128LE(
-          data.slice(245, 261)
-        );
-    } catch (_) {
-      virtualQuoteReserves =
-        null;
-    }
-  }
-
-  return {
-    baseMint,
-    quoteMint,
-    baseVault,
-    quoteVault,
-    virtualQuoteReserves,
-  };
-}
-
-async function validatePumpSwapPool(
-  pairAddress
-) {
-  try {
-    const pubkey =
-      new PublicKey(
-        pairAddress
-      );
-
-    const info =
-      await connection.getAccountInfo(
-        pubkey,
-        "processed"
-      );
-
-    if (!info) {
-      throw new Error(
-        "Compte pool introuvable"
-      );
-    }
-
-    const owner =
-      info.owner.toBase58();
-
-    if (
-      owner !== PUMPSWAP_PROGRAM
-    ) {
-      throw new Error(
-        `Owner inattendu: ${owner}`
-      );
-    }
-
-    const parsed =
-      parsePumpSwapPool(
-        info.data
-      );
-
-    if (
-      parsed.baseMint !==
-        TOKEN_MINT ||
-      parsed.quoteMint !==
-        WSOL_MINT
-    ) {
-      throw new Error(
-        `Mints inattendus`
-      );
-    }
-
-    lastOnChainValidation = {
-      checkedAt: now(),
-
-      ok: true,
-
-      reason: "OK",
-
-      owner,
-
-      ...parsed,
-    };
-
-    return lastOnChainValidation;
-  } catch (e) {
-    lastOnChainValidation = {
-      checkedAt: now(),
-
-      ok: false,
-
-      reason: e.message,
-
-      owner: null,
-
-      baseMint: null,
-
-      quoteMint: null,
-
-      baseVault: null,
-
-      quoteVault: null,
-    };
-
-    return lastOnChainValidation;
-  }
-}
-
-async function readVaultSnapshot(
-  validation
-) {
-  if (
-    !validation?.ok ||
-    !validation.baseVault ||
-    !validation.quoteVault
-  ) {
-    return null;
-  }
-
-  try {
-    const [
-      baseInfo,
-      quoteInfo,
-    ] =
-      await Promise.all([
-        connection.getTokenAccountBalance(
-          new PublicKey(
-            validation.baseVault
-          ),
-          "processed"
-        ),
-
-        connection.getTokenAccountBalance(
-          new PublicKey(
-            validation.quoteVault
-          ),
-          "processed"
-        ),
-      ]);
-
-    const baseAmount =
-      Number(
-        baseInfo.value.amount
-      );
-
-    const quoteAmount =
-      Number(
-        quoteInfo.value.amount
-      );
-
-    return {
-      ts: now(),
-
-      baseAmount,
-
-      quoteAmount,
-
-      quoteSol:
-        quoteAmount / 1e9,
-    };
-  } catch (_) {
-    return null;
-  }
-}
-
-function processVaultDiagnostics(
-  snapshot
-) {
-  if (!snapshot) {
-    return null;
-  }
-
-  if (!previousVaultSnapshot) {
-    previousVaultSnapshot =
-      snapshot;
-
-    return null;
-  }
-
-  const baseDelta =
-    snapshot.baseAmount -
-    previousVaultSnapshot.baseAmount;
-
-  const quoteDelta =
-    snapshot.quoteAmount -
-    previousVaultSnapshot.quoteAmount;
-
-  previousVaultSnapshot =
-    snapshot;
-
-  if (
-    baseDelta === 0 &&
-    quoteDelta === 0
-  ) {
-    return null;
-  }
-
-  if (
-    baseDelta < 0 &&
-    quoteDelta > 0
-  ) {
-    return "SELL";
-  }
-
-  if (
-    baseDelta > 0 &&
-    quoteDelta < 0
-  ) {
-    return "BUY";
-  }
-
-  if (
-    baseDelta < 0 &&
-    quoteDelta < 0
-  ) {
-    return "WITHDRAWAL";
-  }
-
-  if (
-    baseDelta > 0 &&
-    quoteDelta > 0
-  ) {
-    return "ADDITION";
-  }
-
-  return "UNKNOWN";
-}
-
-async function refreshOnChainDiagnostics() {
-  if (
-    !cachedPairAddress ||
-    !connection
-  ) {
-    return;
-  }
-
-  const validation =
-    await validatePumpSwapPool(
-      cachedPairAddress
-    );
-
-  if (!validation.ok) {
-    return;
-  }
-
-  const snapshot =
-    await readVaultSnapshot(
-      validation
-    );
-
-  processVaultDiagnostics(
-    snapshot
-  );
-}
-
-// ================================
-// SAUVEGARDE
-// ================================
-
-function saveMarketSnapshot(
-  market
-) {
-  appendJsonl(
-    FILES.market,
-    {
-      ...market,
-
-      sessionMinute:
-        Number(
-          sessionMinutes().toFixed(3)
-        ),
-    }
-  );
-}
-
-function saveTrade(
+// ============================================================
+// VENTE SIMULEE
+// ============================================================
+
+function simulateSell(
   strategy,
-  action,
   reason,
-  price,
-  pnl,
-  extra = {}
+  exitPrice
 ) {
+  if (!strategy.open) {
+    return;
+  }
+
+  const entry =
+    strategy.entryPrice;
+
+  const resultPct =
+    ((exitPrice - entry) / entry) *
+    100;
+
+  const pnl =
+    strategy.capital *
+    (resultPct / 100);
+
+  strategy.pnl += pnl;
+
+  if (reason === "TARGET") {
+    strategy.wins++;
+  }
+
+  if (
+    reason === "STOP" ||
+    reason === "CRASH"
+  ) {
+    strategy.losses++;
+  }
+
+  if (reason === "SESSION_LIMIT") {
+    strategy.sessionLimit++;
+  }
+
+  if (reason === "CRASH") {
+    strategy.crashExits++;
+  }
+
   const trade = {
-    ts:
-      new Date().toISOString(),
+    timestamp: new Date().toISOString(),
 
     strategy:
-      strategy.label,
+      strategy.id,
 
     stopPct:
       strategy.stopPct,
 
     cycle:
-      strategy.cycleNumber,
-
-    action,
+      strategy.cycle,
 
     reason,
 
-    price,
+    entry,
+
+    exit:
+      exitPrice,
+
+    resultPct,
 
     pnl,
-
-    sessionMinute:
-      Number(
-        sessionMinutes().toFixed(3)
-      ),
-
-    ...extra,
   };
 
-  savedTrades.push(
+  strategy.trades.push(
     trade
   );
 
-  if (
-    savedTrades.length > 5000
-  ) {
-    savedTrades.splice(
-      0,
-      savedTrades.length - 5000
-    );
-  }
-
-  saveJson(
-    FILES.trades,
-    savedTrades
+  writeJsonLine(
+    TRADE_FILE,
+    trade
   );
-}
 
-// ================================
-// P&L
-// ================================
-
-function calculatePnl(
-  entryPrice,
-  exitPrice
-) {
-  if (
-    !Number.isFinite(entryPrice) ||
-    !Number.isFinite(exitPrice) ||
-    entryPrice <= 0 ||
-    exitPrice <= 0
-  ) {
-    return 0;
-  }
-
-  const tokenQty =
-    CAPITAL_USD /
-    entryPrice;
-
-  const exitValue =
-    tokenQty *
-    exitPrice;
-
-  return (
-    exitValue -
-    CAPITAL_USD
+  console.log(
+    `🎯 SELL ${strategy.id}`,
+    reason,
+    resultPct.toFixed(2) + "%",
+    pnl.toFixed(2)
   );
-}
 
-// ================================
-// ACHAT
-// ================================
+  sendTelegram(
+`🎯 SELL SIMULÉ
 
-async function openPosition(
-  strategy,
-  price,
-  reason = "ENTRY"
-) {
-  if (
-    strategy.positionOpen
-  ) {
-    return false;
-  }
+Stratégie : ${strategy.id}
+Motif : ${reason}
 
-  strategy.positionOpen =
-    true;
+Cycle #${strategy.cycle}
 
-  strategy.entryPrice =
-    price;
+Entrée :
+${entry}
 
-  strategy.entryTime =
+Sortie :
+${exitPrice}
+
+Résultat :
+${resultPct >= 0 ? "+" : ""}${resultPct.toFixed(2)}%
+
+P&L :
+${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} $
+
+Total stratégie :
+${strategy.pnl >= 0 ? "+" : ""}${strategy.pnl.toFixed(2)} $`
+  );
+
+  strategy.open = false;
+
+  strategy.entryPrice = null;
+
+  strategy.entryTime = null;
+
+  strategy.lastSellTime =
     now();
-
-  strategy.targetPrice =
-    price *
-    (1 + TARGET_PCT);
-
-  strategy.cycleNumber += 1;
-
-  strategy.totalTrades += 1;
-
-  strategy.entryCount += 1;
-
-  saveTrade(
-    strategy,
-    "BUY",
-    reason,
-    price,
-    0,
-    {
-      targetPrice:
-        strategy.targetPrice,
-
-      capital:
-        CAPITAL_USD,
-    }
-  );
-
-  return true;
 }
 
-// ================================
-// VENTE
-// ================================
+// ============================================================
+// STRATEGIE TICK
+// ============================================================
 
-async function closePosition(
-  strategy,
-  exitPrice,
-  reason
-) {
-  if (
-    !strategy.positionOpen
-  ) {
-    return false;
-  }
+function processStrategy(strategy) {
+  if (!lastMarket) return;
 
-  const entryPrice =
-    strategy.entryPrice;
+  // -------------------- POSITION OUVERTE --------------------
 
-  const pnl =
-    calculatePnl(
-      entryPrice,
-      exitPrice
-    );
+  if (strategy.open) {
+    const entry =
+      strategy.entryPrice;
 
-  strategy.positionOpen =
-    false;
+    const gainPct =
+      ((lastMarket.price - entry) /
+        entry) *
+      100;
 
-  strategy.lastExit = {
-    ts: now(),
-
-    reason,
-
-    entryPrice,
-
-    exitPrice,
-
-    pnl,
-  };
-
-  strategy.pnl += pnl;
-
-  strategy.cooldownUntil =
-    now() +
-    COOLDOWN_MS;
-
-  if (
-    reason === "TARGET"
-  ) {
-    strategy.wins += 1;
-
-    strategy.targetBeforeCrash +=
-      1;
-  } else if (
-    reason === "STOP"
-  ) {
-    strategy.stops += 1;
-
-    strategy.stoppedBeforeCrash +=
-      1;
-  } else if (
-    reason === "CRASH"
-  ) {
-    strategy.crashExits +=
-      1;
-  } else if (
-    reason === "SESSION_LIMIT"
-  ) {
-    strategy.sessionExits +=
-      1;
-  } else {
-    strategy.otherExits +=
-      1;
-  }
-
-  saveTrade(
-    strategy,
-    "SELL",
-    reason,
-    exitPrice,
-    pnl,
-    {
-      entryPrice,
-
-      targetPrice:
-        strategy.targetPrice,
-
-      stopPrice:
-        entryPrice *
-        (1 - strategy.stopPct),
-    }
-  );
-
-  const result = {
-    reason,
-
-    entryPrice,
-
-    exitPrice,
-
-    pnl,
-  };
-
-  strategy.entryPrice =
-    null;
-
-  strategy.entryTime =
-    null;
-
-  strategy.targetPrice =
-    null;
-
-  return result;
-}
-
-// ================================
-// TRAITEMENT D'UNE STRATÉGIE
-// ================================
-
-async function processStrategy(
-  strategy
-) {
-  if (
-    !strategy.positionOpen
-  ) {
-    if (
-      !canOpenNewPosition()
-    ) {
-      return null;
-    }
+    // TARGET
 
     if (
-      strategy.cooldownUntil >
-      now()
+      gainPct >= TARGET_PCT
     ) {
-      return null;
-    }
-
-    if (
-      !isHealthyEntry()
-    ) {
-      return null;
-    }
-
-    await openPosition(
-      strategy,
-      lastMarketData.priceUsd
-    );
-
-    return {
-      type: "BUY",
-
-      strategy,
-    };
-  }
-
-  const price =
-    lastMarketData.priceUsd;
-
-  // CIBLE +5 %
-  if (
-    price >=
-    strategy.targetPrice
-  ) {
-    const result =
-      await closePosition(
+      simulateSell(
         strategy,
-        price,
-        "TARGET"
+        "TARGET",
+        lastMarket.price
       );
 
-    return {
-      type: "SELL",
+      return;
+    }
 
-      strategy,
+    // STOP
 
-      result,
-    };
-  }
-
-  // STOP
-  const stopPrice =
-    strategy.entryPrice *
-    (1 - strategy.stopPct);
-
-  if (
-    price <= stopPrice
-  ) {
-    const result =
-      await closePosition(
-        strategy,
-        price,
-        "STOP"
-      );
-
-    return {
-      type: "SELL",
-
-      strategy,
-
-      result,
-    };
-  }
-
-  return null;
-}
-
-// ================================
-// FERMETURE FORCÉE
-// ================================
-
-async function forceCloseAll(
-  reason,
-  price
-) {
-  const exits = [];
-
-  for (
-    const strategy of strategies
-  ) {
     if (
-      !strategy.positionOpen
+      gainPct <=
+      strategy.stopPct
     ) {
-      continue;
-    }
-
-    const result =
-      await closePosition(
+      simulateSell(
         strategy,
-        price,
-        reason
+        "STOP",
+        lastMarket.price
       );
 
-    if (result) {
-      exits.push({
-        strategy,
-
-        result,
-      });
+      return;
     }
+
+    return;
   }
 
-  return exits;
-}
-
-// ================================
-// MESSAGES TELEGRAM
-// ================================
-
-function buildBuyMessage() {
-  const price =
-    lastMarketData.priceUsd;
-
-  let text =
-    `🧪 V5.9 BUY COMPARATIF\n` +
-    `Prix: ${priceText(price)}\n` +
-    `Capital: ${money(CAPITAL_USD)} par stratégie\n\n`;
-
-  for (
-    const s of strategies
-  ) {
-    text +=
-      `${s.label}: ` +
-      `cible ${priceText(
-        s.targetPrice
-      )} | ` +
-      `stop ${priceText(
-        s.entryPrice *
-        (1 - s.stopPct)
-      )}\n`;
-  }
-
-  return text;
-}
-
-function buildSellMessage(
-  strategy,
-  result
-) {
-  const variation =
-    pctChange(
-      result.entryPrice,
-      result.exitPrice
-    ) * 100;
-
-  let icon = "💥";
+  // -------------------- COOLDOWN --------------------
 
   if (
-    result.reason === "TARGET"
+    now() - strategy.lastSellTime <
+    POST_SELL_COOLDOWN_MS
   ) {
-    icon = "🎯";
+    return;
   }
 
-  if (
-    result.reason === "STOP"
-  ) {
-    icon = "🛑";
+  // -------------------- ENTREE --------------------
+
+  const entry =
+    entryAllowed();
+
+  if (!entry.ok) {
+    return;
   }
 
-  if (
-    result.reason ===
-    "SESSION_LIMIT"
-  ) {
-    icon = "⏰";
-  }
-
-  return (
-    `${icon} V5.9 SELL ${strategy.label}\n` +
-    `Motif: ${result.reason}\n` +
-    `Entrée: ${priceText(
-      result.entryPrice
-    )}\n` +
-    `Sortie: ${priceText(
-      result.exitPrice
-    )}\n` +
-    `Variation: ${variation.toFixed(
-      2
-    )}%\n` +
-    `P&L: ${money(
-      result.pnl
-    )}`
-  );
+  simulateBuy(strategy);
 }
 
-// ================================
-// RAPPORT FINAL
-// ================================
+// ============================================================
+// CRASH GLOBAL
+// ============================================================
 
-function buildComparisonReport() {
-  const totalPnl =
-    strategies.reduce(
-      (sum, s) =>
-        sum + s.pnl,
-      0
-    );
-
-  let text =
-    `🧪 V5.9 COMPARATIF TERMINÉ\n\n` +
-    `Token: ${TOKEN_MINT}\n` +
-    `Durée: ${sessionMinutes().toFixed(
-      1
-    )} min\n` +
-    `Capital virtuel: ${money(
-      CAPITAL_USD
-    )} / stratégie\n` +
-    `Cible: +5 %\n\n`;
-
-  for (
-    const s of strategies
-  ) {
-    text +=
-      `${s.label}\n` +
-      `  🎯 Gains: ${s.wins}\n` +
-      `  🛑 Stops: ${s.stops}\n` +
-      `  💥 Crash: ${s.crashExits}\n` +
-      `  ⏰ Limite: ${s.sessionExits}\n` +
-      `  💰 P&L: ${money(
-        s.pnl
-      )}\n\n`;
-  }
-
-  text +=
-    `Somme P&L des 4 simulations: ` +
-    `${money(totalPnl)}\n`;
-
-  if (crashDetected) {
-    text +=
-      `\n💥 Crash détecté: ` +
-      `${crashReport?.reason ||
-        "UNKNOWN"}\n` +
-      `Prix: ${priceText(
-        lastMarketData?.priceUsd
-      )}\n` +
-      `Liquidité: ${money(
-        lastMarketData?.liquidityUsd
-      )}\n`;
-  }
-
-  return text;
-}
-
-// ================================
-// SAUVEGARDE COMPARATIF
-// ================================
-
-function saveComparisonReport(
-  reason
-) {
-  const report = {
-    ts:
-      new Date().toISOString(),
-
-    token:
-      TOKEN_MINT,
-
-    reason,
-
-    durationMinutes:
-      Number(
-        sessionMinutes().toFixed(3)
-      ),
-
-    capitalPerStrategy:
-      CAPITAL_USD,
-
-    targetPct:
-      TARGET_PCT,
-
-    crashDetected,
-
-    crashReport,
-
-    strategies:
-      strategies.map(s => ({
-        id:
-          s.id,
-
-        label:
-          s.label,
-
-        stopPct:
-          s.stopPct,
-
-        wins:
-          s.wins,
-
-        stops:
-          s.stops,
-
-        crashExits:
-          s.crashExits,
-
-        sessionExits:
-          s.sessionExits,
-
-        pnl:
-          Number(
-            s.pnl.toFixed(6)
-          ),
-
-        totalTrades:
-          s.totalTrades,
-
-        stoppedBeforeCrash:
-          s.stoppedBeforeCrash,
-
-        targetBeforeCrash:
-          s.targetBeforeCrash,
-
-        lastExit:
-          s.lastExit,
-      })),
-  };
-
-  comparisonHistory.push(
-    report
-  );
-
-  if (
-    comparisonHistory.length >
-    100
-  ) {
-    comparisonHistory.splice(
-      0,
-      comparisonHistory.length -
-        100
-    );
-  }
-
-  saveJson(
-    FILES.comparison,
-    comparisonHistory
-  );
-}
-
-// ================================
-// RAPPORT CRASH
-// ================================
-
-function saveCrashReport(
-  reason
-) {
-  crashReport = {
-    ts:
-      new Date().toISOString(),
-
-    reason,
-
-    priceUsd:
-      lastMarketData?.priceUsd ??
-      null,
-
-    liquidityUsd:
-      lastMarketData?.liquidityUsd ??
-      null,
-
-    priceDrop10s:
-      getMarketChange(
-        10000,
-        "priceUsd"
-      ),
-
-    liquidityDrop10s:
-      getMarketChange(
-        10000,
-        "liquidityUsd"
-      ),
-
-    pairAddress:
-      cachedPairAddress,
-
-    onChain:
-      lastOnChainValidation,
-
-    sessionMinute:
-      Number(
-        sessionMinutes().toFixed(3)
-      ),
-  };
-
-  savedCrashes.push(
-    crashReport
-  );
-
-  if (
-    savedCrashes.length >
-    100
-  ) {
-    savedCrashes.splice(
-      0,
-      savedCrashes.length -
-        100
-    );
-  }
-
-  saveJson(
-    FILES.crash,
-    savedCrashes
-  );
-}
-
-// ================================
-// CRASH
-// ================================
-
-async function handleCrash(
-  reason
-) {
+async function handleCrash(reason) {
   if (crashDetected) {
     return;
   }
 
   crashDetected = true;
 
-  saveCrashReport(
+  console.log(
+    "💥 CRASH :",
     reason
   );
 
-  const price =
-    lastMarketData?.priceUsd;
+  for (const strategy of strategies) {
+    if (strategy.open) {
+      simulateSell(
+        strategy,
+        "CRASH",
+        lastMarket.price
+      );
+    }
+  }
 
-  const price10 =
-    getMarketChange(
-      10000,
-      "priceUsd"
+  const report = {
+    timestamp:
+      new Date().toISOString(),
+
+    reason,
+
+    mint:
+      currentCandidate?.mint,
+
+    name:
+      currentCandidate?.name,
+
+    symbol:
+      currentCandidate?.symbol,
+
+    price:
+      lastMarket?.price,
+
+    liquidity:
+      lastMarket?.liquidity,
+
+    priceDrop10s:
+      getPriceDrop(10),
+
+    liquidityDrop10s:
+      getLiquidityDrop(10),
+
+    strategies:
+      strategies.map(
+        (s) => ({
+          id: s.id,
+          stopPct: s.stopPct,
+          wins: s.wins,
+          losses: s.losses,
+          pnl: s.pnl,
+          crashExits:
+            s.crashExits,
+        })
+      ),
+  };
+
+  writeJsonLine(
+    CRASH_FILE,
+    report
+  );
+
+  await sendTelegram(
+`💥 CRASH DÉTECTÉ
+
+${reason}
+
+🪙 ${currentCandidate?.name}
+${currentCandidate?.symbol}
+
+Prix :
+${lastMarket?.price}
+
+Liquidité :
+${formatUsd(
+  lastMarket?.liquidity
+)}
+
+Prix 10s :
+${getPriceDrop(10)?.toFixed(2) ?? "N/A"}%
+
+Liquidité 10s :
+${getLiquidityDrop(10)?.toFixed(2) ?? "N/A"}%
+
+🛑 NOUVEAUX BUY ARRÊTÉS
+
+Les positions ouvertes ont été clôturées en simulation.
+
+Utilise :
+/comparison`
+  );
+
+  simulationRunning = false;
+
+  saveComparison();
+
+  stopMarketLoop();
+}
+
+// ============================================================
+// LIMITE 45 MIN
+// ============================================================
+
+async function handleSessionLimit() {
+  if (!simulationRunning) {
+    return;
+  }
+
+  const elapsed =
+    now() - sessionStart;
+
+  if (
+    elapsed < SESSION_MAX_MS
+  ) {
+    return;
+  }
+
+  console.log(
+    "⏰ LIMITE 45 MIN"
+  );
+
+  for (const strategy of strategies) {
+    if (strategy.open) {
+      // Règle ferme :
+      // position ouverte = vente de sécurité.
+
+      simulateSell(
+        strategy,
+        "SESSION_LIMIT",
+        lastMarket.price
+      );
+    }
+  }
+
+  sessionStoppedReason =
+    "SESSION_LIMIT";
+
+  simulationRunning = false;
+
+  saveComparison();
+
+  await sendTelegram(
+`⏰ FIN DE SESSION
+
+45 minutes atteintes.
+
+🔒 Toute position encore ouverte a été vendue au prix observé.
+
+🛑 Nouvelle entrée impossible.
+
+📊 Comparaison finale :
+/comparison`
+  );
+
+  stopMarketLoop();
+}
+
+// ============================================================
+// MARKET LOOP
+// ============================================================
+
+async function marketTick() {
+  if (!simulationRunning) {
+    return;
+  }
+
+  if (marketBusy) {
+    return;
+  }
+
+  marketBusy = true;
+
+  try {
+    const market =
+      await getCurrentMarket();
+
+    if (!market) {
+      console.log(
+        "⚠️ Marché indisponible"
+      );
+
+      return;
+    }
+
+    lastMarket =
+      market;
+
+    addMarketPoint(
+      market
     );
 
-  const liq10 =
-    getMarketChange(
-      10000,
-      "liquidityUsd"
+    console.log(
+      `📈 ${market.price} | ${formatUsd(
+        market.liquidity
+      )}`
     );
+
+    // --------------------------------------------------------
+    // IMPORTANT
+    // On traite d'abord TARGET/STOP.
+    // --------------------------------------------------------
+
+    for (const strategy of strategies) {
+      processStrategy(
+        strategy
+      );
+    }
+
+    // --------------------------------------------------------
+    // CRASH
+    // --------------------------------------------------------
+
+    const crashReason =
+      getCrashReason();
+
+    if (crashReason) {
+      await handleCrash(
+        crashReason
+      );
+
+      return;
+    }
+
+    // --------------------------------------------------------
+    // 45 MIN
+    // --------------------------------------------------------
+
+    await handleSessionLimit();
+
+  } catch (err) {
+    console.log(
+      "❌ Market loop:",
+      err.message
+    );
+  } finally {
+    marketBusy = false;
+  }
+}
+
+// ============================================================
+// COMPARAISON
+// ============================================================
+
+function getComparison() {
+  return strategies.map(
+    (strategy) => ({
+      strategy:
+        strategy.id,
+
+      stop:
+        strategy.stopPct,
+
+      wins:
+        strategy.wins,
+
+      losses:
+        strategy.losses,
+
+      sessionLimit:
+        strategy.sessionLimit,
+
+      crashExits:
+        strategy.crashExits,
+
+      pnl:
+        Number(
+          strategy.pnl.toFixed(2)
+        ),
+
+      cycles:
+        strategy.cycle,
+    })
+  );
+}
+
+function saveComparison() {
+  const comparison = {
+    timestamp:
+      new Date().toISOString(),
+
+    candidate:
+      currentCandidate,
+
+    sessionStart,
+
+    sessionStoppedReason,
+
+    strategies:
+      getComparison(),
+  };
+
+  writeJson(
+    SUMMARY_FILE,
+    comparison
+  );
+}
+
+async function sendComparison() {
+  const rows =
+    getComparison();
 
   let text =
-    `💥 V5.9 CRASH DÉTECTÉ\n` +
-    `Motif: ${reason}\n` +
-    `Prix: ${priceText(
-      price
-    )}\n` +
-    `Liquidité: ${money(
-      lastMarketData?.liquidityUsd
-    )}\n` +
-    `Prix 10s: ${
-      price10 === null
-        ? "N/A"
-        : (price10 * 100).toFixed(
-            2
-          ) + "%"
-    }\n` +
-    `Liquidité 10s: ${
-      liq10 === null
-        ? "N/A"
-        : (liq10 * 100).toFixed(
-            2
-          ) + "%"
-    }\n\n` +
-    `🛑 Aucun nouvel achat.`;
+`📊 COMPARAISON V6 / V5.9
+
+🪙 ${currentCandidate?.name || "N/A"}
+${currentCandidate?.symbol || ""}
+
+`;
+
+  for (const row of rows) {
+    text +=
+`
+${row.strategy}
+Stop : ${row.stop}%
+Cycles : ${row.cycles}
+Wins : ${row.wins}
+Losses : ${row.losses}
+Crash exits : ${row.crashExits}
+Session limit : ${row.sessionLimit}
+P&L : ${row.pnl >= 0 ? "+" : ""}${row.pnl} $
+`;
+  }
 
   await sendTelegram(
     text
   );
+}
 
-  if (
-    Number.isFinite(price) &&
-    price > 0
-  ) {
-    const exits =
-      await forceCloseAll(
-        "CRASH",
-        price
-      );
+// ============================================================
+// STATUS
+// ============================================================
 
-    for (
-      const exit of exits
-    ) {
-      await sendTelegram(
-        buildSellMessage(
-          exit.strategy,
-          exit.result
-        )
-      );
-    }
+async function sendStatus() {
+  let text =
+`📡 STATUS V6
+
+Radar :
+${radarRunning ? "🟢 ACTIF" : "🔴 ARRÊTÉ"}
+
+Simulation :
+${simulationRunning ? "🟢 ACTIVE" : "🔴 ARRÊTÉE"}
+
+`;
+
+  if (currentCandidate) {
+    text +=
+`
+🪙 Candidat :
+${currentCandidate.name}
+
+🔤 ${currentCandidate.symbol}
+
+💧 ${formatUsd(
+  currentCandidate.liquidity
+)}
+
+👥 ${currentCandidate.holders}
+
+⏱️ ${currentCandidate.ageMinutes.toFixed(1)} min
+
+🏦 ${currentCandidate.dex}
+`;
+  }
+
+  if (lastMarket) {
+    text +=
+`
+📈 Prix :
+${lastMarket.price}
+
+💧 Liquidité :
+${formatUsd(
+  lastMarket.liquidity
+)}
+`;
+  }
+
+  if (simulationRunning) {
+    text +=
+`
+⏱️ Session :
+${formatDuration(
+  now() - sessionStart
+)}
+`;
   }
 
   await sendTelegram(
-    buildComparisonReport(
-      "CRASH"
-    )
-  );
-
-  saveComparisonReport(
-    "CRASH"
-  );
-
-  sessionRunning = false;
-
-  sessionEndedAt =
-    now();
-
-  stopTimers();
-
-  await sendTelegram(
-    `🛑 V5.9 arrêtée après crash.`
+    text
   );
 }
 
-// ================================
-// LIMITE 45 MIN
-// ================================
+// ============================================================
+// DERNIER CRASH
+// ============================================================
 
-async function handleSessionLimit() {
-  if (!sessionRunning) {
-    return;
-  }
-
-  const price =
-    lastMarketData?.priceUsd;
-
-  if (
-    !Number.isFinite(price) ||
-    price <= 0
-  ) {
-    await sendTelegram(
-      `⏰ 45 min atteintes, ` +
-      `mais aucun prix exploitable n'est disponible.`
-    );
-
-    return;
-  }
-
-  const exits =
-    await forceCloseAll(
-      "SESSION_LIMIT",
-      price
-    );
-
-  for (
-    const exit of exits
-  ) {
-    await sendTelegram(
-      buildSellMessage(
-        exit.strategy,
-        exit.result
-      )
-    );
-  }
-
-  sessionRunning = false;
-
-  sessionEndedAt =
-    now();
-
-  const report =
-    buildComparisonReport(
-      "SESSION_LIMIT"
-    );
-
-  await sendTelegram(
-    `⏰ V5.9 LIMITE 45 MIN\n\n` +
-    `Toutes les positions ouvertes ` +
-    `ont été fermées en sécurité.\n\n` +
-    report
-  );
-
-  saveComparisonReport(
-    "SESSION_LIMIT"
-  );
-
-  stopTimers();
-}
-
-// ================================
-// TICK PRINCIPAL
-// ================================
-
-async function marketTick() {
-  if (!sessionRunning) {
-    return;
-  }
-
+async function sendLastCrash() {
   try {
-    const market =
-      await getDexMarketData();
-
-    lastMarketData =
-      market;
-
-    marketHistory.push(
-      market
-    );
-
-    historyTrim();
-
-    saveMarketSnapshot(
-      market
-    );
-
-    if (
-      now() -
-        lastOnChainValidation.checkedAt >
-      15000
-    ) {
-      refreshOnChainDiagnostics()
-        .catch(() => {});
-    }
-
-    /*
-      ORDRE IMPORTANT :
-
-      1. Mise à jour du marché
-      2. Chaque stop/cible est testé
-      3. Ensuite seulement on vérifie le crash
-
-      Cela permet de voir si un stop
-      aurait réellement été touché
-      avant le crash.
-    */
-
-    const actions = [];
-
-    for (
-      const strategy of strategies
-    ) {
-      const action =
-        await processStrategy(
-          strategy
-        );
-
-      if (action) {
-        actions.push(
-          action
-        );
-      }
-    }
-
-    for (
-      const action of actions
-    ) {
-      if (
-        action.type === "BUY"
-      ) {
-        await sendTelegram(
-          buildBuyMessage()
-        );
-      }
-
-      if (
-        action.type === "SELL"
-      ) {
-        await sendTelegram(
-          buildSellMessage(
-            action.strategy,
-            action.result
-          )
-        );
-      }
-    }
-
-    const reason =
-      crashReason();
-
-    if (reason) {
-      await handleCrash(
-        reason
+    if (!fs.existsSync(
+      CRASH_FILE
+    )) {
+      await sendTelegram(
+        "Aucun crash enregistré."
       );
 
       return;
     }
 
-    if (
-      sessionLimitReached()
-    ) {
-      await handleSessionLimit();
+    const lines =
+      fs.readFileSync(
+        CRASH_FILE,
+        "utf8"
+      )
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+
+    if (!lines.length) {
+      await sendTelegram(
+        "Aucun crash enregistré."
+      );
 
       return;
     }
 
-    if (
-      now() -
-        lastDiagnosticAt >=
-      DIAGNOSTIC_INTERVAL_MS
-    ) {
-      lastDiagnosticAt =
-        now();
-
-      const entryReason =
-        entryHealthReason();
-
-      console.log(
-        `📊 V5.9 ` +
-        `${sessionMinutes().toFixed(
-          1
-        )}m | ` +
-        `Prix ${priceText(
-          market.priceUsd
-        )} | ` +
-        `Liq ${money(
-          market.liquidityUsd
-        )} | ` +
-        `Entrée ${
-          entryReason ||
-          "OK"
-        }`
+    const last =
+      JSON.parse(
+        lines[lines.length - 1]
       );
-    }
-  } catch (e) {
-    console.log(
-      "⚠️ Tick marché:",
-      e.message
+
+    await sendTelegram(
+`💥 DERNIER CRASH
+
+${last.reason}
+
+Token :
+${last.name}
+
+Prix :
+${last.price}
+
+Liquidité :
+${formatUsd(
+  last.liquidity
+)}
+
+Prix 10s :
+${last.priceDrop10s?.toFixed(2) ?? "N/A"}%
+
+Liquidité 10s :
+${last.liquidityDrop10s?.toFixed(2) ?? "N/A"}%`
     );
 
-    if (
-      sessionLimitReached()
-    ) {
-      await handleSessionLimit();
-    }
+  } catch (err) {
+    await sendTelegram(
+      "Impossible de lire le dernier crash."
+    );
   }
 }
 
-// ================================
-// TIMERS
-// ================================
+// ============================================================
+// START SIMULATION
+// ============================================================
 
-function stopTimers() {
+async function startSimulation() {
+  if (!currentCandidate) {
+    await sendTelegram(
+`❌ Aucun candidat V6 validé.
+
+Laisse d'abord le radar trouver un token répondant aux critères.`
+    );
+
+    return;
+  }
+
+  if (simulationRunning) {
+    await sendTelegram(
+      "⚠️ Une simulation est déjà active."
+    );
+
+    return;
+  }
+
+  strategies =
+    STOP_LEVELS.map(
+      createStrategy
+    );
+
+  marketHistory = [];
+
+  lastMarket = null;
+
+  crashDetected = false;
+
+  sessionStoppedReason = null;
+
+  sessionStart =
+    now();
+
+  simulationRunning = true;
+
+  await sendTelegram(
+`🧪 V5.9 DÉMARRÉE
+
+🪙 ${currentCandidate.name}
+🔤 ${currentCandidate.symbol}
+
+💵 Capital :
+10 $ / cycle
+
+🎯 Target :
++5%
+
+🛑 Stops comparés :
+-10%
+-15%
+-20%
+-25%
+
+⏱️ Session :
+45 min
+
+🚫 Aucun nouveau BUY après :
+43 min
+
+🔒 Vente de sécurité obligatoire à :
+45 min
+
+⚠️ Simulation uniquement.
+
+Aucune transaction réelle.`
+  );
+
+  startMarketLoop();
+}
+
+// ============================================================
+// STOP SIMULATION
+// ============================================================
+
+async function stopSimulation() {
+  if (!simulationRunning) {
+    await sendTelegram(
+      "ℹ️ Aucune simulation active."
+    );
+
+    return;
+  }
+
+  for (const strategy of strategies) {
+    if (strategy.open && lastMarket) {
+      simulateSell(
+        strategy,
+        "MANUAL",
+        lastMarket.price
+      );
+
+      strategy.manualExits++;
+    }
+  }
+
+  simulationRunning = false;
+
+  sessionStoppedReason =
+    "MANUAL";
+
+  saveComparison();
+
+  stopMarketLoop();
+
+  await sendTelegram(
+`🛑 SIMULATION ARRÊTÉE
+
+Toutes les positions ouvertes ont été clôturées en simulation.
+
+📊 Résultats :
+/comparison`
+  );
+}
+
+// ============================================================
+// LOOPS
+// ============================================================
+
+function startRadarLoop() {
+  if (radarTimer) {
+    clearInterval(
+      radarTimer
+    );
+  }
+
+  radarRunning = true;
+
+  radarTick();
+
+  radarTimer =
+    setInterval(
+      radarTick,
+      RADAR_INTERVAL
+    );
+}
+
+function stopRadarLoop() {
+  radarRunning = false;
+
+  if (radarTimer) {
+    clearInterval(
+      radarTimer
+    );
+
+    radarTimer = null;
+  }
+}
+
+function startMarketLoop() {
+  if (marketTimer) {
+    clearInterval(
+      marketTimer
+    );
+  }
+
+  marketTimer =
+    setInterval(
+      marketTick,
+      MARKET_INTERVAL
+    );
+
+  marketTick();
+}
+
+function stopMarketLoop() {
   if (marketTimer) {
     clearInterval(
       marketTimer
@@ -2233,659 +2199,232 @@ function stopTimers() {
   }
 }
 
-// ================================
-// START SESSION
-// ================================
+// ============================================================
+// TELEGRAM COMMANDES
+// ============================================================
 
-async function startSession() {
-  if (sessionRunning) {
-    await sendTelegram(
-      "⚠️ V5.9 est déjà en cours."
+bot.command(
+  "start",
+  async (ctx) => {
+    await ctx.reply(
+`🤖 V6 RADAR
+
+Filtres :
+
+• Claude / OpenAI / Anthropic
+• moins de 5 heures
+• liquidité 200k–400k $
+• minimum 1 000 holders
+• PumpSwap
+
+🧪 V5.9 :
+10 $ / cycle
++5% target
+stops -10/-15/-20/-25%
+45 min maximum
+
+Commandes :
+
+/status
+/starttrade
+/stoptrade
+/comparison
+/lastcrash
+/scan
+/help`
     );
-
-    return;
   }
+);
 
-  resetSessionState();
-
-  sessionRunning =
-    true;
-
-  sessionStartedAt =
-    now();
-
-  sessionEndedAt =
-    null;
-
-  await sendTelegram(
-    `🧪 V5.9 COMPARATIF DÉMARRÉ\n\n` +
-    `Token: ${TOKEN_MINT}\n` +
-    `Capital: ${money(
-      CAPITAL_USD
-    )} par stratégie\n` +
-    `Cible: +5 %\n` +
-    `Stops: -10 % / -15 % / -20 % / -25 %\n` +
-    `Cooldown: 30 s\n` +
-    `Pas de BUY après 43 min\n` +
-    `Fermeture forcée à 45 min\n` +
-    `Simulation uniquement.\n\n` +
-    `🔎 Recherche PumpSwap...`
-  );
-
-  try {
-    await discoverPumpSwapPair(
-      true
-    );
-
-    await sendTelegram(
-      `🟢 PumpSwap trouvé\n` +
-      `Pair: ${cachedPairAddress}\n` +
-      `⏳ Warm-up: ${WARMUP_POINTS} observations.`
-    );
-  } catch (e) {
-    await sendTelegram(
-      `❌ V5.9 ARRÊTÉE\n` +
-      `Aucun marché PumpSwap détecté.\n` +
-      `Erreur: ${e.message}`
-    );
-
-    sessionRunning =
-      false;
-
-    return;
+bot.command(
+  "status",
+  async () => {
+    await sendStatus();
   }
+);
 
-  marketTimer =
-    setInterval(
-      marketTick,
-      MARKET_INTERVAL_MS
-    );
-
-  await marketTick();
-}
-
-// ================================
-// STOP MANUEL
-// ================================
-
-async function stopSession(
-  reason = "MANUAL"
-) {
-  if (!sessionRunning) {
-    await sendTelegram(
-      "ℹ️ V5.9 n'est pas active."
-    );
-
-    return;
-  }
-
-  const price =
-    lastMarketData?.priceUsd;
-
-  if (
-    Number.isFinite(price) &&
-    price > 0
-  ) {
-    const exits =
-      await forceCloseAll(
-        "MANUAL",
-        price
-      );
-
-    for (
-      const exit of exits
-    ) {
+bot.command(
+  "scan",
+  async () => {
+    if (radarBusy) {
       await sendTelegram(
-        buildSellMessage(
-          exit.strategy,
-          exit.result
-        )
-      );
-    }
-  }
-
-  sessionRunning =
-    false;
-
-  sessionEndedAt =
-    now();
-
-  saveComparisonReport(
-    reason
-  );
-
-  await sendTelegram(
-    `🛑 V5.9 arrêt manuel.\n\n` +
-    buildComparisonReport(
-      reason
-    )
-  );
-
-  stopTimers();
-}
-
-// ================================
-// STATUS
-// ================================
-
-function statusText() {
-  if (!sessionRunning) {
-    return "🔴 V5.9 inactive";
-  }
-
-  let text =
-    `🟢 V5.9 active\n` +
-    `Session: ${sessionMinutes().toFixed(
-      1
-    )} min\n` +
-    `Prix: ${priceText(
-      lastMarketData?.priceUsd
-    )}\n` +
-    `Liquidité: ${money(
-      lastMarketData?.liquidityUsd
-    )}\n` +
-    `Pair: ${
-      cachedPairAddress ||
-      "N/A"
-    }\n` +
-    `On-chain: ${
-      lastOnChainValidation.ok
-        ? "OK"
-        : lastOnChainValidation.reason
-    }\n\n`;
-
-  for (
-    const s of strategies
-  ) {
-    const status =
-      s.positionOpen
-        ? "OPEN"
-        : s.cooldownUntil >
-          now()
-          ? "COOLDOWN"
-          : "READY";
-
-    text +=
-      `${s.label} | ` +
-      `${status} | ` +
-      `W:${s.wins} ` +
-      `S:${s.stops} ` +
-      `C:${s.crashExits} ` +
-      `P&L:${money(
-        s.pnl
-      )}\n`;
-  }
-
-  return text;
-}
-
-// ================================
-// DERNIER CRASH
-// ================================
-
-function lastCrashText() {
-  if (
-    !savedCrashes.length
-  ) {
-    return "ℹ️ Aucun crash enregistré.";
-  }
-
-  const c =
-    savedCrashes[
-      savedCrashes.length - 1
-    ];
-
-  return (
-    `💥 DERNIER CRASH V5.9\n` +
-    `Date: ${c.ts}\n` +
-    `Motif: ${c.reason}\n` +
-    `Prix: ${priceText(
-      c.priceUsd
-    )}\n` +
-    `Liquidité: ${money(
-      c.liquidityUsd
-    )}\n` +
-    `Prix 10s: ${
-      c.priceDrop10s === null
-        ? "N/A"
-        : (
-            c.priceDrop10s *
-            100
-          ).toFixed(2) +
-          "%"
-    }\n` +
-    `Liquidité 10s: ${
-      c.liquidityDrop10s === null
-        ? "N/A"
-        : (
-            c.liquidityDrop10s *
-            100
-          ).toFixed(2) +
-          "%"
-    }`
-  );
-}
-
-// ================================
-// DERNIER COMPARATIF
-// ================================
-
-function comparisonHistoryText() {
-  if (
-    !comparisonHistory.length
-  ) {
-    return "ℹ️ Aucun comparatif terminé.";
-  }
-
-  const r =
-    comparisonHistory[
-      comparisonHistory.length - 1
-    ];
-
-  let text =
-    `📚 DERNIER COMPARATIF\n` +
-    `Date: ${r.ts}\n` +
-    `Fin: ${r.reason}\n` +
-    `Durée: ${r.durationMinutes} min\n\n`;
-
-  for (
-    const s of r.strategies
-  ) {
-    text +=
-      `${s.label}: ` +
-      `W${s.wins} / ` +
-      `S${s.stops} / ` +
-      `C${s.crashExits} / ` +
-      `P&L ${money(
-        s.pnl
-      )}\n`;
-  }
-
-  return text;
-}
-
-// ================================
-// TELEGRAM SETUP
-// ================================
-
-function setupTelegram() {
-  if (!BOT_TOKEN) {
-    console.log(
-      "❌ BOT_TOKEN manquant."
-    );
-
-    return;
-  }
-
-  bot =
-    new Telegraf(
-      BOT_TOKEN
-    );
-
-  bot.start(
-    async ctx => {
-      await ctx.reply(
-        `🤖 V5.9\n\n` +
-        `/starttrade = lancer\n` +
-        `/stoptrade = arrêter\n` +
-        `/status = état actuel\n` +
-        `/lastcrash = dernier crash\n` +
-        `/comparison = dernier comparatif\n` +
-        `/help = aide\n\n` +
-        `Simulation uniquement.`
-      );
-    }
-  );
-
-  bot.command(
-    "starttrade",
-    async ctx => {
-      await startSession();
-    }
-  );
-
-  bot.command(
-    "stoptrade",
-    async ctx => {
-      await stopSession(
-        "MANUAL"
-      );
-    }
-  );
-
-  bot.command(
-    "status",
-    async ctx => {
-      await ctx.reply(
-        statusText()
-      );
-    }
-  );
-
-  bot.command(
-    "lastcrash",
-    async ctx => {
-      await ctx.reply(
-        lastCrashText()
-      );
-    }
-  );
-
-  bot.command(
-    "comparison",
-    async ctx => {
-      await ctx.reply(
-        comparisonHistoryText()
-      );
-    }
-  );
-
-  bot.command(
-    "help",
-    async ctx => {
-      await ctx.reply(
-        `🧪 V5.9\n\n` +
-        `Comparaison de 4 protections:\n` +
-        `-10 %, -15 %, -20 %, -25 %\n\n` +
-        `Toutes utilisent:\n` +
-        `• 10 $ par cycle\n` +
-        `• cible +5 %\n` +
-        `• même marché\n` +
-        `• mêmes conditions d'entrée\n` +
-        `• cooldown 30 s\n` +
-        `• aucun BUY après 43 min\n` +
-        `• fermeture à 45 min\n\n` +
-        `/starttrade\n` +
-        `/stoptrade\n` +
-        `/status\n` +
-        `/lastcrash\n` +
-        `/comparison`
-      );
-    }
-  );
-
-  bot.catch(
-    err => {
-      console.log(
-        "❌ Erreur Telegram:",
-        err.message
-      );
-    }
-  );
-
-  bot
-    .launch({
-      dropPendingUpdates: true,
-    })
-    .then(() => {
-      console.log(
-        "🤖 V5.9 Telegram bot démarré"
-      );
-    })
-    .catch(err => {
-      console.log(
-        "❌ Telegram launch:",
-        err.message
-      );
-    });
-
-  process.once(
-    "SIGINT",
-    () => bot.stop("SIGINT")
-  );
-
-  process.once(
-    "SIGTERM",
-    () => bot.stop("SIGTERM")
-  );
-}
-
-// ================================
-// SOLANA
-// ================================
-
-function setupSolana() {
-  connection =
-    new Connection(
-      SOLANA_RPC,
-      {
-        commitment:
-          "processed",
-
-        wsEndpoint:
-          HELIUS_WSS ||
-          undefined,
-      }
-    );
-}
-
-// ================================
-// HELIUS DIAGNOSTIC
-// ================================
-
-function setupHeliusDiagnostics() {
-  if (!HELIUS_WSS) {
-    console.log(
-      "ℹ️ Helius WSS non configuré."
-    );
-
-    return;
-  }
-
-  try {
-    heliusWs =
-      new WebSocket(
-        HELIUS_WSS
+        "🔎 Le radar est déjà en train de scanner."
       );
 
-    heliusWs.on(
-      "open",
-      () => {
-        console.log(
-          "📡 Helius WSS connecté"
-        );
-
-        const request = {
-          jsonrpc:
-            "2.0",
-
-          id: 1,
-
-          method:
-            "logsSubscribe",
-
-          params: [
-            {
-              mentions: [
-                PUMPSWAP_PROGRAM,
-              ],
-            },
-
-            {
-              commitment:
-                "processed",
-            },
-          ],
-        };
-
-        heliusWs.send(
-          JSON.stringify(
-            request
-          )
-        );
-      }
-    );
-
-    heliusWs.on(
-      "message",
-      raw => {
-        try {
-          const msg =
-            JSON.parse(
-              raw.toString()
-            );
-
-          if (
-            msg.result
-          ) {
-            console.log(
-              `📡 Helius subscription: ${msg.result}`
-            );
-          }
-        } catch (_) {}
-      }
-    );
-
-    heliusWs.on(
-      "error",
-      err => {
-        console.log(
-          "⚠️ Helius WSS:",
-          err.message
-        );
-      }
-    );
-
-    heliusWs.on(
-      "close",
-      () => {
-        console.log(
-          "📡 Helius WSS fermé"
-        );
-      }
-    );
-  } catch (e) {
-    console.log(
-      "⚠️ Helius WSS:",
-      e.message
-    );
-  }
-}
-
-// ================================
-// ARRÊT PROPRE
-// ================================
-
-async function shutdown() {
-  stopTimers();
-
-  if (heliusWs) {
-    try {
-      heliusWs.close();
-    } catch (_) {}
-  }
-
-  if (sessionRunning) {
-    const price =
-      lastMarketData?.priceUsd;
-
-    if (
-      Number.isFinite(price) &&
-      price > 0
-    ) {
-      await forceCloseAll(
-        "SESSION_LIMIT",
-        price
-      );
+      return;
     }
 
-    saveComparisonReport(
-      "PROCESS_SHUTDOWN"
+    await sendTelegram(
+      "🔎 Scan V6 lancé..."
     );
-  }
-}
 
-process.on(
-  "SIGINT",
-  async () => {
-    await shutdown();
-    process.exit(0);
+    await radarTick();
+
+    if (!currentCandidate) {
+      await sendTelegram(
+`🔴 Aucun candidat validé pour le moment.
+
+Critères :
+Claude / OpenAI / Anthropic
+< 5 h
+200k–400k $
+≥ 1 000 holders
+PumpSwap`
+      );
+    }
   }
 );
 
-process.on(
-  "SIGTERM",
+bot.command(
+  "starttrade",
   async () => {
-    await shutdown();
-    process.exit(0);
+    await startSimulation();
   }
 );
 
-// ================================
-// MAIN
-// ================================
+bot.command(
+  "stoptrade",
+  async () => {
+    await stopSimulation();
+  }
+);
+
+bot.command(
+  "comparison",
+  async () => {
+    await sendComparison();
+  }
+);
+
+bot.command(
+  "lastcrash",
+  async () => {
+    await sendLastCrash();
+  }
+);
+
+bot.command(
+  "help",
+  async () => {
+    await sendTelegram(
+`🤖 COMMANDES V6
+
+/scan
+Cherche immédiatement un candidat.
+
+/status
+État du radar et de la simulation.
+
+/starttrade
+Lance V5.9 sur le candidat validé.
+
+/stoptrade
+Arrête la simulation.
+
+/comparison
+Compare les 4 stops.
+
+/lastcrash
+Dernier crash enregistré.
+
+/help
+Cette aide.`
+    );
+  }
+);
+
+// ============================================================
+// LANCEMENT
+// ============================================================
 
 async function main() {
   console.log(
-    "===================================="
+    "🚀 V6 RADAR + V5.9 SIMULATION"
   );
 
   console.log(
-    "🧪 PUMP RADAR V5.9"
+    "📡 RPC:",
+    RPC_URL.replace(
+      HELIUS_API_KEY,
+      "***"
+    )
   );
 
   console.log(
-    "===================================="
+    "🎯 Filtres:",
+    "Claude/OpenAI/Anthropic | <5h | 200k-400k | >=1000 holders | PumpSwap"
   );
 
   console.log(
-    `Token: ${TOKEN_MINT}`
+    "🧪 Simulation:",
+    "$10 | +5% | stops -10/-15/-20/-25%"
   );
+
+  await bot.launch({
+    dropPendingUpdates: true,
+  });
 
   console.log(
-    `Capital: $${CAPITAL_USD}`
+    "🤖 Telegram connecté"
   );
 
-  console.log(
-    `Target: +${TARGET_PCT * 100}%`
+  await sendTelegram(
+`🟢 V6 RADAR DÉMARRÉ
+
+🔎 Recherche automatique :
+
+Claude / OpenAI / Anthropic
+< 5 heures
+200k–400k $ liquidité
+≥ 1 000 holders
+PumpSwap
+
+🧪 V5.9 conservé :
+10 $ / cycle
++5%
+stops -10/-15/-20/-25%
+45 min max
+43 min cutoff
+
+Simulation uniquement.
+
+Le radar cherche maintenant.`
   );
 
-  console.log(
-    `Stops: ${
-      STOP_VARIANTS
-        .map(x => x.label)
-        .join(" / ")
-    }`
-  );
-
-  console.log(
-    `RPC: ${
-      HELIUS_API_KEY
-        ? "Helius"
-        : "Public Solana"
-    }`
-  );
-
-  console.log(
-    `Data: ${DATA_DIR}`
-  );
-
-  if (!BOT_TOKEN) {
-    console.log(
-      "❌ BOT_TOKEN absent"
-    );
-  }
-
-  if (!CHAT_ID) {
-    console.log(
-      "⚠️ CHAT_ID absent"
-    );
-  }
-
-  setupSolana();
-
-  setupTelegram();
-
-  setupHeliusDiagnostics();
+  startRadarLoop();
 }
 
+process.once(
+  "SIGINT",
+  () => {
+    stopRadarLoop();
+    stopMarketLoop();
+    bot.stop("SIGINT");
+  }
+);
+
+process.once(
+  "SIGTERM",
+  () => {
+    stopRadarLoop();
+    stopMarketLoop();
+    bot.stop("SIGTERM");
+  }
+);
+
 main().catch(
-  err => {
+  async (err) => {
     console.error(
-      "❌ Erreur fatale V5.9:",
+      "❌ ERREUR FATALE:",
       err
     );
 
-    process.exit(1);
+    try {
+      await sendTelegram(
+        `❌ V6 ERREUR FATALE
+
+${err.message}`
+      );
+    } catch {}
   }
 );
