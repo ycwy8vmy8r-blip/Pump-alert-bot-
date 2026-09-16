@@ -5,7 +5,7 @@ const https = require("https");
 // ========================================
 
 const WALLET_ADDRESS =
-  "Fg8bPb4BEphR8AZNup55BWaY9EuT5Mu3SYpAUpyhqxJH";
+  "7ZmUF8EcQ5tqxBfG3qW45gtYVVMCpN6dFZu43BLUVLC5";
 
 const THRESHOLD_USD = 200000;
 
