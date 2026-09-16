@@ -1,215 +1,252 @@
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const CHAT_ID = process.env.CHAT_ID;
-const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
+const https = require("https");
 
 // ========================================
 // CONFIGURATION
 // ========================================
 
-const WALLET_ADDRESS = "7ZmUF8EcQ5tqxBfG3qW45gtYVVMCpN6dFZu43BLUVLC5";
+const WALLET_ADDRESS = "Fg8bPb4BEphR8AZNup55BWaY9EuT5Mu3SYpAUpyhqxJH";
 
-const THRESHOLD_USD = 200000;
+const THRESHOLD_USD = 70000;
 
-// Vérification toutes les 10 secondes
 const CHECK_INTERVAL_MS = 10000;
 
-// Mint WSOL pour récupérer le prix du SOL via Helius
-const SOL_MINT =
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const CHAT_ID = process.env.CHAT_ID;
+
+// RPC public Solana Mainnet
+const SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com";
+
+// WSOL mint utilisé pour récupérer le prix du SOL
+const WSOL_MINT =
   "So11111111111111111111111111111111111111112";
 
 // ========================================
-// VERIFICATION CONFIG
+// PETIT CLIENT HTTP
 // ========================================
 
-if (!BOT_TOKEN || !CHAT_ID || !HELIUS_API_KEY) {
-  console.error("❌ BOT_TOKEN, CHAT_ID ou HELIUS_API_KEY manquant.");
-  process.exit(1);
+function httpsRequest(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    const request = https.request(
+      url,
+      {
+        method: options.method || "GET",
+        headers: {
+          "Content-Type": "application/json",
+          ...(options.headers || {})
+        }
+      },
+      (response) => {
+        let data = "";
+
+        response.on("data", (chunk) => {
+          data += chunk;
+        });
+
+        response.on("end", () => {
+          if (response.statusCode < 200 || response.statusCode >= 300) {
+            reject(
+              new Error(
+                `HTTP ${response.statusCode} : ${data.slice(0, 300)}`
+              )
+            );
+            return;
+          }
+
+          try {
+            resolve(JSON.parse(data));
+          } catch (error) {
+            reject(new Error("Réponse JSON invalide"));
+          }
+        });
+      }
+    );
+
+    request.on("error", reject);
+
+    if (options.body) {
+      request.write(options.body);
+    }
+
+    request.end();
+  });
 }
 
 // ========================================
 // TELEGRAM
 // ========================================
 
-async function sendTelegramMessage(message) {
-  const url =
-    `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+async function sendTelegram(message) {
+  if (!BOT_TOKEN || !CHAT_ID) {
+    console.log("⚠️ BOT_TOKEN ou CHAT_ID manquant.");
+    return;
+  }
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      chat_id: CHAT_ID,
-      text: message
-    })
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+
+  const body = JSON.stringify({
+    chat_id: CHAT_ID,
+    text: message
   });
 
-  const data = await response.json();
+  try {
+    await httpsRequest(url, {
+      method: "POST",
+      body
+    });
 
-  if (!data.ok) {
-    console.error("❌ Erreur Telegram :", data);
+    console.log("📨 Alerte Telegram envoyée.");
+  } catch (error) {
+    console.error(
+      "❌ Erreur Telegram :",
+      error.message
+    );
   }
 }
 
 // ========================================
-// APPEL HELIUS
-// ========================================
-
-async function heliusRpc(method, params) {
-  const url =
-    `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: "wallet-monitor",
-      method,
-      params
-    })
-  });
-
-  if (!response.ok) {
-    throw new Error(
-      `Helius HTTP ${response.status}`
-    );
-  }
-
-  const data = await response.json();
-
-  if (data.error) {
-    throw new Error(
-      data.error.message || "Erreur Helius"
-    );
-  }
-
-  return data.result;
-}
-
-// ========================================
-// SOLDE SOL DU WALLET
+// SOLDE SOL NATIF
 // ========================================
 
 async function getSolBalance() {
-  const result = await heliusRpc(
-    "getBalance",
-    [WALLET_ADDRESS]
-  );
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "getBalance",
+    params: [
+      WALLET_ADDRESS,
+      {
+        commitment: "finalized"
+      }
+    ]
+  });
 
-  const lamports = result.value || 0;
+  const data = await httpsRequest(SOLANA_RPC_URL, {
+    method: "POST",
+    body
+  });
 
-  return lamports / 1_000_000_000;
+  if (
+    !data ||
+    !data.result ||
+    typeof data.result.value !== "number"
+  ) {
+    throw new Error("Solde SOL introuvable.");
+  }
+
+  // Solana retourne le solde en lamports.
+  return data.result.value / 1_000_000_000;
 }
 
 // ========================================
 // PRIX DU SOL
 // ========================================
 
-async function getSolPrice() {
-  const result = await heliusRpc(
-    "getAsset",
-    {
-      id: SOL_MINT,
-      displayOptions: {
-        showFungible: true
-      }
-    }
+async function getSolPriceUsd() {
+  const url =
+    `https://api.dexscreener.com/token-pairs/v1/solana/${WSOL_MINT}`;
+
+  const pairs = await httpsRequest(url);
+
+  if (!Array.isArray(pairs) || pairs.length === 0) {
+    throw new Error("Aucune paire SOL trouvée sur DexScreener.");
+  }
+
+  const validPairs = pairs.filter((pair) => {
+    return (
+      pair &&
+      pair.priceUsd &&
+      Number.isFinite(Number(pair.priceUsd)) &&
+      pair.liquidity &&
+      Number.isFinite(Number(pair.liquidity.usd))
+    );
+  });
+
+  if (validPairs.length === 0) {
+    throw new Error("Prix SOL indisponible sur DexScreener.");
+  }
+
+  // On prend la paire avec la plus grosse liquidité.
+  validPairs.sort(
+    (a, b) =>
+      Number(b.liquidity.usd) -
+      Number(a.liquidity.usd)
   );
 
-  const price =
-    result?.token_info?.price_info?.price_per_token;
+  const price = Number(validPairs[0].priceUsd);
 
-  if (
-    typeof price !== "number" ||
-    !Number.isFinite(price)
-  ) {
-    throw new Error(
-      "Prix SOL indisponible via Helius."
-    );
+  if (!Number.isFinite(price) || price <= 0) {
+    throw new Error("Prix SOL invalide.");
   }
 
   return price;
 }
 
 // ========================================
-// CALCUL VALEUR DU WALLET
-// ========================================
-
-async function checkWallet() {
-  console.log("");
-  console.log("🔎 Vérification du wallet...");
-  console.log("========================================");
-
-  const solBalance = await getSolBalance();
-  const solPrice = await getSolPrice();
-
-  const walletValueUsd =
-    solBalance * solPrice;
-
-  console.log(
-    `SOL : ${solBalance.toFixed(6)} × $${solPrice.toFixed(2)} = $${walletValueUsd.toFixed(2)}`
-  );
-
-  console.log("========================================");
-  console.log(
-    `💰 VALEUR TOTALE DU WALLET : $${walletValueUsd.toFixed(2)}`
-  );
-  console.log(
-    `🎯 SEUIL : $${THRESHOLD_USD.toFixed(2)}`
-  );
-  console.log("========================================");
-
-  return walletValueUsd;
-}
-
-// ========================================
 // SURVEILLANCE
 // ========================================
 
-let alertSent = false;
+let thresholdTriggered = false;
 
-async function monitor() {
+async function checkWallet() {
   try {
-    const walletValueUsd =
-      await checkWallet();
+    console.log("");
+    console.log("🔎 Vérification du wallet...");
+    console.log("========================================");
 
-    // Seuil atteint
+    const solBalance = await getSolBalance();
+
+    const solPrice = await getSolPriceUsd();
+
+    const walletValueUsd =
+      solBalance * solPrice;
+
+    console.log(
+      `SOL : ${solBalance.toFixed(6)} × $${solPrice.toFixed(2)} = $${walletValueUsd.toFixed(2)}`
+    );
+
+    console.log("========================================");
+
+    console.log(
+      `💰 VALEUR TOTALE DU WALLET : $${walletValueUsd.toFixed(2)}`
+    );
+
+    console.log(
+      `🎯 SEUIL : $${THRESHOLD_USD.toFixed(2)}`
+    );
+
+    console.log("========================================");
+
+    // ========================================
+    // ALERTE AU FRANCHISSEMENT DU SEUIL
+    // ========================================
+
     if (
       walletValueUsd >= THRESHOLD_USD &&
-      !alertSent
+      !thresholdTriggered
     ) {
-      alertSent = true;
+      thresholdTriggered = true;
 
       const message =
-        `🚨 SEUIL WALLET ATTEINT\n\n` +
-        `💰 Valeur du wallet : $${walletValueUsd.toFixed(2)}\n` +
-        `🎯 Seuil : $${THRESHOLD_USD.toFixed(2)}\n\n` +
-        `👛 Wallet :\n${WALLET_ADDRESS}`;
+        `🚨 SEUIL WALLET ATTEINT !\n\n` +
+        `💰 Valeur : $${walletValueUsd.toFixed(2)}\n` +
+        `🎯 Seuil : $${THRESHOLD_USD.toFixed(2)}\n` +
+        `◎ SOL : ${solBalance.toFixed(6)}\n` +
+        `💵 Prix SOL : $${solPrice.toFixed(2)}`;
 
-      await sendTelegramMessage(message);
-
-      console.log(
-        "🚨 ALERTE TELEGRAM ENVOYÉE"
-      );
+      await sendTelegram(message);
     }
 
-    // Si le wallet repasse sous le seuil,
-    // on réarme l'alerte
+    // Réarmement lorsque le wallet repasse sous le seuil
     if (
       walletValueUsd < THRESHOLD_USD &&
-      alertSent
+      thresholdTriggered
     ) {
-      alertSent = false;
+      thresholdTriggered = false;
 
       console.log(
-        "🔄 Wallet repassé sous le seuil, alerte réarmée."
+        "🔄 Seuil repassé sous la limite. Alerte réarmée."
       );
     }
-
   } catch (error) {
     console.error(
       "❌ Erreur surveillance :",
@@ -219,21 +256,21 @@ async function monitor() {
 }
 
 // ========================================
-// DEMARRAGE
+// DÉMARRAGE
 // ========================================
 
-console.log("");
 console.log("========================================");
-console.log("👛 WALLET MONITOR");
+console.log("🚀 WALLET MONITOR DÉMARRÉ");
 console.log("========================================");
-console.log(`Wallet : ${WALLET_ADDRESS}`);
-console.log(`Seuil : $${THRESHOLD_USD}`);
-console.log("Mode : VALEUR SOL DU WALLET UNIQUEMENT");
+console.log(`👛 Wallet : ${WALLET_ADDRESS}`);
+console.log(`🎯 Seuil : $${THRESHOLD_USD.toFixed(2)}`);
+console.log(`⏱️ Vérification : toutes les ${CHECK_INTERVAL_MS / 1000}s`);
+console.log("🚫 Helius : NON UTILISÉ");
 console.log("========================================");
 
-monitor();
+checkWallet();
 
 setInterval(
-  monitor,
+  checkWallet,
   CHECK_INTERVAL_MS
 );
