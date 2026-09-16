@@ -91,9 +91,9 @@ const MIN_HEALTH_SCORE_FOR_ENTRY = 80;
 // Les tokens SPL présents dans le wallet ne sont PAS comptés.
 
 const WALLET_ADDRESS =
-  "Fg8bPb4BEphR8AZNup55BWaY9EuT5Mu3SYpAUpyhqxJH";
+  "FHQA7p3XseQPnpemtckEbyJPLra9sK7Sge5QAbw1irob";
 
-const WALLET_THRESHOLD_USD = 70000;
+const WALLET_THRESHOLD_USD = 30000;
 
 const WALLET_CHECK_INTERVAL_MS = 10000;
 
