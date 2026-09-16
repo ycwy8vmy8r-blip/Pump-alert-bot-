@@ -1,30 +1,24 @@
-const { Telegraf } = require("telegraf");
 const fs = require("fs");
 const path = require("path");
-
-// ============================================================
-// WALLET MONITOR
-// Surveillance de la valeur totale d'un portefeuille Solana
-// ============================================================
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 
-if (!BOT_TOKEN || !CHAT_ID || !HELIUS_API_KEY) {
-  console.error(
-    "❌ BOT_TOKEN, CHAT_ID ou HELIUS_API_KEY manquant."
-  );
-  process.exit(1);
-}
-
-const bot = new Telegraf(BOT_TOKEN);
-
-// ============================================================
+// ===============================
 // CONFIGURATION
-// ============================================================
+// ===============================
+
+const WALLET_ADDRESS =
+  "D6YTMYdeTpKkaDf7RkaxGZDehmetmLcrXmj4pKopVwHE";
+
+const THRESHOLD_USD = 145000;
 
 const CHECK_INTERVAL_MS = 10000;
+
+// ===============================
+// DOSSIER DATA
+// ===============================
 
 const DATA_DIR = fs.existsSync("/data")
   ? "/data"
@@ -34,105 +28,102 @@ if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-const MONITORS_FILE = path.join(
-  DATA_DIR,
-  "wallet_monitors.json"
-);
+const STATE_FILE = path.join(DATA_DIR, "wallet_monitor_state.json");
 
-// ============================================================
-// ÉTAT
-// ============================================================
+// ===============================
+// VALIDATION
+// ===============================
 
-let monitors = loadMonitors();
-
-let checking = false;
-
-// ============================================================
-// OUTILS
-// ============================================================
-
-function now() {
-  return Date.now();
-}
-
-function formatUsd(value) {
-  return `$${Number(value || 0).toLocaleString(
-    "en-US",
-    {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2
-    }
-  )}`;
-}
-
-function shortAddress(address) {
-  if (!address) return "inconnue";
-
-  return `${address.slice(0, 6)}...${address.slice(-6)}`;
-}
-
-function isValidSolanaAddress(address) {
-  return (
-    typeof address === "string" &&
-    /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)
+if (!BOT_TOKEN || !CHAT_ID || !HELIUS_API_KEY) {
+  console.error(
+    "❌ BOT_TOKEN, CHAT_ID ou HELIUS_API_KEY manquant."
   );
+  process.exit(1);
 }
 
-// ============================================================
-// SAUVEGARDE
-// ============================================================
+// ===============================
+// ETAT
+// ===============================
 
-function saveMonitors() {
+let state = {
+  alertSent: false,
+  lastValueUsd: 0,
+  lastCheck: null
+};
+
+try {
+  if (fs.existsSync(STATE_FILE)) {
+    state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  }
+} catch (err) {
+  console.error("⚠️ Impossible de lire l'état :", err.message);
+}
+
+function saveState() {
   try {
     fs.writeFileSync(
-      MONITORS_FILE,
-      JSON.stringify(monitors, null, 2)
+      STATE_FILE,
+      JSON.stringify(state, null, 2)
     );
-  } catch (error) {
+  } catch (err) {
     console.error(
-      "❌ Erreur sauvegarde monitors:",
-      error.message
+      "⚠️ Impossible de sauvegarder l'état :",
+      err.message
     );
   }
 }
 
-function loadMonitors() {
+// ===============================
+// TELEGRAM
+// ===============================
+
+async function sendTelegramMessage(text) {
+  const url =
+    `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+
   try {
-    if (!fs.existsSync(MONITORS_FILE)) {
-      return [];
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        chat_id: CHAT_ID,
+        text
+      })
+    });
+
+    const data = await response.json();
+
+    if (!data.ok) {
+      console.error(
+        "❌ Telegram :",
+        data.description || "erreur inconnue"
+      );
+      return false;
     }
 
-    const content = fs.readFileSync(
-      MONITORS_FILE,
-      "utf8"
-    );
-
-    if (!content.trim()) {
-      return [];
-    }
-
-    const data = JSON.parse(content);
-
-    return Array.isArray(data) ? data : [];
-  } catch (error) {
+    return true;
+  } catch (err) {
     console.error(
-      "❌ Impossible de charger wallet_monitors.json:",
-      error.message
+      "❌ Erreur Telegram :",
+      err.message
     );
 
-    return [];
+    return false;
   }
 }
 
-// ============================================================
+// ===============================
 // PRIX SOL
-// ============================================================
+// ===============================
 
 async function getSolPriceUsd() {
   try {
-    const response = await fetch(
-      "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112"
-    );
+    const url =
+      "https://api.dexscreener.com/token-pairs/v1/solana/So11111111111111111111111111111111111111112";
+
+    const response = await fetch(url);
 
     if (!response.ok) {
       throw new Error(
@@ -140,53 +131,43 @@ async function getSolPriceUsd() {
       );
     }
 
-    const data = await response.json();
+    const pairs = await response.json();
 
-    if (
-      !data.pairs ||
-      !Array.isArray(data.pairs) ||
-      data.pairs.length === 0
-    ) {
-      return null;
+    if (!Array.isArray(pairs) || pairs.length === 0) {
+      return 0;
     }
 
-    const validPairs = data.pairs
-      .filter(
-        (pair) =>
-          pair &&
-          pair.priceUsd &&
-          Number(pair.priceUsd) > 0
-      )
-      .sort(
-        (a, b) =>
-          Number(
-            b.liquidity?.usd || 0
-          ) -
-          Number(
-            a.liquidity?.usd || 0
-          )
-      );
+    const validPairs = pairs.filter(
+      pair =>
+        pair &&
+        pair.priceUsd &&
+        Number(pair.priceUsd) > 0
+    );
 
     if (validPairs.length === 0) {
-      return null;
+      return 0;
     }
 
-    return Number(
-      validPairs[0].priceUsd
-    );
-  } catch (error) {
-    console.error(
-      "⚠️ Erreur prix SOL:",
-      error.message
+    validPairs.sort(
+      (a, b) =>
+        Number(b.liquidity?.usd || 0) -
+        Number(a.liquidity?.usd || 0)
     );
 
-    return null;
+    return Number(validPairs[0].priceUsd);
+  } catch (err) {
+    console.error(
+      "⚠️ Prix SOL indisponible :",
+      err.message
+    );
+
+    return 0;
   }
 }
 
-// ============================================================
+// ===============================
 // PRIX TOKEN
-// ============================================================
+// ===============================
 
 async function getTokenPriceUsd(mint) {
   try {
@@ -196,52 +177,43 @@ async function getTokenPriceUsd(mint) {
     const response = await fetch(url);
 
     if (!response.ok) {
-      return null;
+      return 0;
     }
 
     const pairs = await response.json();
 
-    if (
-      !Array.isArray(pairs) ||
-      pairs.length === 0
-    ) {
-      return null;
+    if (!Array.isArray(pairs) || pairs.length === 0) {
+      return 0;
     }
 
-    const validPairs = pairs
-      .filter(
-        (pair) =>
-          pair &&
-          pair.priceUsd &&
-          Number(pair.priceUsd) > 0
-      )
-      .sort(
-        (a, b) =>
-          Number(
-            b.liquidity?.usd || 0
-          ) -
-          Number(
-            a.liquidity?.usd || 0
-          )
-      );
+    const validPairs = pairs.filter(
+      pair =>
+        pair &&
+        pair.priceUsd &&
+        Number(pair.priceUsd) > 0
+    );
 
     if (validPairs.length === 0) {
-      return null;
+      return 0;
     }
 
-    return Number(
-      validPairs[0].priceUsd
+    validPairs.sort(
+      (a, b) =>
+        Number(b.liquidity?.usd || 0) -
+        Number(a.liquidity?.usd || 0)
     );
-  } catch (error) {
-    return null;
+
+    return Number(validPairs[0].priceUsd);
+  } catch (err) {
+    return 0;
   }
 }
 
-// ============================================================
-// PORTFOLIO HELIUS
-// ============================================================
+// ===============================
+// RECUPERATION WALLET HELIUS
+// ===============================
 
-async function getWalletAssets(address) {
+async function getWalletAssets() {
   const url =
     `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
@@ -250,7 +222,7 @@ async function getWalletAssets(address) {
     id: "wallet-monitor",
     method: "getAssetsByOwner",
     params: {
-      ownerAddress: address,
+      ownerAddress: WALLET_ADDRESS,
       page: 1,
       limit: 1000,
       displayOptions: {
@@ -274,99 +246,93 @@ async function getWalletAssets(address) {
     );
   }
 
-  const result = await response.json();
+  const json = await response.json();
 
-  if (result.error) {
+  if (json.error) {
     throw new Error(
-      result.error.message ||
-        "Erreur Helius"
+      json.error.message || "Erreur Helius"
     );
   }
 
-  return result.result || {};
+  return json.result;
 }
 
-// ============================================================
+// ===============================
 // CALCUL VALEUR WALLET
-// ============================================================
+// ===============================
 
-async function calculateWalletValue(address) {
-  const assets =
-    await getWalletAssets(address);
+async function calculateWalletValueUsd() {
+  const result = await getWalletAssets();
 
   let totalUsd = 0;
 
-  let solAmount = 0;
-  let solValueUsd = 0;
-
-  const tokenValues = [];
-
-  // ----------------------------------------------------------
+  // -------------------------------
   // SOL
-  // ----------------------------------------------------------
+  // -------------------------------
 
-  if (
-    assets.nativeBalance &&
-    Number.isFinite(
-      Number(
-        assets.nativeBalance.lamports
-      )
-    )
-  ) {
-    solAmount =
-      Number(
-        assets.nativeBalance.lamports
-      ) / 1_000_000_000;
+  const nativeBalance =
+    result.nativeBalance?.lamports || 0;
+
+  const solBalance =
+    Number(nativeBalance) / 1_000_000_000;
+
+  if (solBalance > 0) {
+    const solPrice = await getSolPriceUsd();
+
+    if (solPrice > 0) {
+      totalUsd += solBalance * solPrice;
+    }
   }
 
-  const solPrice =
-    await getSolPriceUsd();
-
-  if (
-    solAmount > 0 &&
-    Number.isFinite(solPrice)
-  ) {
-    solValueUsd =
-      solAmount * solPrice;
-
-    totalUsd += solValueUsd;
-  }
-
-  // ----------------------------------------------------------
+  // -------------------------------
   // TOKENS
-  // ----------------------------------------------------------
+  // -------------------------------
 
-  const items =
-    Array.isArray(assets.items)
-      ? assets.items
-      : [];
+  const items = result.items || [];
 
-  for (const item of items) {
+  for (const asset of items) {
     try {
       const interfaceType =
-        item.interface || "";
+        asset.interface || "";
 
-      if (
-        interfaceType !==
-          "FungibleToken" &&
-        interfaceType !==
-          "FungibleAsset"
-      ) {
+      const isFungible =
+        interfaceType === "FungibleToken" ||
+        interfaceType === "FungibleAsset";
+
+      if (!isFungible) {
+        continue;
+      }
+
+      const mint =
+        asset.id;
+
+      if (!mint) {
         continue;
       }
 
       const tokenInfo =
-        item.token_info || {};
+        asset.token_info;
 
-      const balance =
-        Number(
-          tokenInfo.balance || 0
-        );
+      if (!tokenInfo) {
+        continue;
+      }
+
+      const rawBalance =
+        tokenInfo.balance;
 
       const decimals =
-        Number(
-          tokenInfo.decimals || 0
-        );
+        tokenInfo.decimals;
+
+      if (
+        rawBalance === undefined ||
+        decimals === undefined
+      ) {
+        continue;
+      }
+
+      const balance =
+        Number(rawBalance) /
+        Math.pow(10, Number(decimals));
 
       if (
         !Number.isFinite(balance) ||
@@ -375,619 +341,161 @@ async function calculateWalletValue(address) {
         continue;
       }
 
-      const amount =
-        balance /
-        Math.pow(10, decimals);
-
-      if (
-        !Number.isFinite(amount) ||
-        amount <= 0
-      ) {
-        continue;
-      }
-
-      const mint =
-        item.id;
-
-      if (!mint) {
-        continue;
-      }
-
-      // Le SOL est déjà traité séparément.
-      if (
-        mint ===
-        "So11111111111111111111111111111111111111112"
-      ) {
-        continue;
-      }
-
-      const price =
+      const priceUsd =
         await getTokenPriceUsd(mint);
 
       if (
-        !Number.isFinite(price) ||
-        price <= 0
+        !Number.isFinite(priceUsd) ||
+        priceUsd <= 0
       ) {
         continue;
       }
 
-      const valueUsd =
-        amount * price;
-
-      if (
-        !Number.isFinite(valueUsd) ||
-        valueUsd <= 0
-      ) {
-        continue;
-      }
-
-      totalUsd += valueUsd;
-
-      tokenValues.push({
-        mint,
-        amount,
-        priceUsd: price,
-        valueUsd
-      });
-    } catch {
-      // Un token impossible à valoriser
-      // n'empêche pas le calcul du reste du portefeuille.
+      totalUsd +=
+        balance * priceUsd;
+    } catch (err) {
+      continue;
     }
   }
 
-  return {
-    address,
-    totalUsd,
-    solAmount,
-    solPriceUsd: solPrice,
-    solValueUsd,
-    tokenCount: tokenValues.length,
-    tokens: tokenValues,
-    timestamp: now()
-  };
+  return totalUsd;
 }
 
-// ============================================================
-// VÉRIFICATION D'UN MONITOR
-// ============================================================
+// ===============================
+// FORMATAGE
+// ===============================
 
-async function checkMonitor(monitor) {
+function formatUsd(value) {
+  return new Intl.NumberFormat(
+    "fr-FR",
+    {
+      style: "currency",
+      currency: "USD",
+      maximumFractionDigits: 2
+    }
+  ).format(value);
+}
+
+// ===============================
+// SURVEILLANCE
+// ===============================
+
+async function checkWallet() {
   try {
-    const portfolio =
-      await calculateWalletValue(
-        monitor.address
-      );
+    console.log(
+      "🔎 Vérification du wallet..."
+    );
 
-    monitor.lastCheck =
-      portfolio.timestamp;
+    const valueUsd =
+      await calculateWalletValueUsd();
 
-    monitor.lastValueUsd =
-      portfolio.totalUsd;
+    state.lastValueUsd = valueUsd;
+    state.lastCheck =
+      new Date().toISOString();
 
-    monitor.lastSolAmount =
-      portfolio.solAmount;
-
-    monitor.lastSolValueUsd =
-      portfolio.solValueUsd;
-
-    monitor.lastTokenCount =
-      portfolio.tokenCount;
-
-    saveMonitors();
+    saveState();
 
     console.log(
-      `👀 ${shortAddress(
-        monitor.address
-      )} → ${formatUsd(
-        portfolio.totalUsd
-      )} / seuil ${formatUsd(
-        monitor.thresholdUsd
-      )}`
+      `💰 Valeur estimée : ${formatUsd(valueUsd)}`
     );
 
-    // --------------------------------------------------------
+    console.log(
+      `🎯 Seuil : ${formatUsd(THRESHOLD_USD)}`
+    );
+
+    // -------------------------------
     // SEUIL ATTEINT
-    // --------------------------------------------------------
+    // -------------------------------
 
     if (
-      !monitor.alertSent &&
-      portfolio.totalUsd >=
-        monitor.thresholdUsd
+      valueUsd >= THRESHOLD_USD &&
+      !state.alertSent
     ) {
-      monitor.alertSent = true;
-      monitor.alertTime = now();
+      const message =
+        `🚨 ALERTE WALLET\n\n` +
+        `💰 Valeur totale estimée : ${formatUsd(valueUsd)}\n` +
+        `🎯 Seuil : ${formatUsd(THRESHOLD_USD)}\n\n` +
+        `👛 Wallet :\n${WALLET_ADDRESS}\n\n` +
+        `⏰ ${new Date().toLocaleString("fr-FR")}`;
 
-      saveMonitors();
+      const sent =
+        await sendTelegramMessage(message);
 
-      await bot.telegram.sendMessage(
-        CHAT_ID,
-        `🚨 SEUIL PORTEFEUILLE ATTEINT
+      if (sent) {
+        state.alertSent = true;
+        saveState();
 
-👤 Adresse :
-${monitor.address}
+        console.log(
+          "🚨 ALERTE Telegram envoyée."
+        );
+      }
+    }
 
-💰 Valeur totale estimée :
-${formatUsd(
-  portfolio.totalUsd
-)}
+    // -------------------------------
+    // RESET SI LE WALLET REPASSE
+    // SOUS LE SEUIL
+    // -------------------------------
 
-🎯 Seuil :
-${formatUsd(
-  monitor.thresholdUsd
-)}
-
-◎ SOL :
-${portfolio.solAmount.toFixed(
-  6
-)} SOL
-
-💵 Valeur SOL :
-${formatUsd(
-  portfolio.solValueUsd
-)}
-
-🪙 Tokens valorisés :
-${portfolio.tokenCount}
-
-⏰ Heure :
-${new Date().toLocaleString(
-  "fr-FR"
-)}
-
-🛑 Surveillance de ce seuil arrêtée.`
-      );
+    if (
+      valueUsd < THRESHOLD_USD &&
+      state.alertSent
+    ) {
+      state.alertSent = false;
+      saveState();
 
       console.log(
-        `🚨 SEUIL ATTEINT pour ${monitor.address}`
+        "ℹ️ Wallet repassé sous le seuil."
       );
     }
-  } catch (error) {
+  } catch (err) {
     console.error(
-      `⚠️ Erreur surveillance ${shortAddress(
-        monitor.address
-      )}:`,
-      error.message
+      "❌ Erreur surveillance wallet :",
+      err.message
     );
   }
 }
 
-// ============================================================
-// BOUCLE DE SURVEILLANCE
-// ============================================================
-
-async function checkAllMonitors() {
-  if (checking) {
-    return;
-  }
-
-  if (monitors.length === 0) {
-    return;
-  }
-
-  checking = true;
-
-  try {
-    for (const monitor of monitors) {
-      if (monitor.alertSent) {
-        continue;
-      }
-
-      await checkMonitor(monitor);
-    }
-  } finally {
-    checking = false;
-  }
-}
-
-setInterval(
-  () => {
-    checkAllMonitors().catch(
-      (error) => {
-        console.error(
-          "❌ Erreur boucle monitor:",
-          error.message
-        );
-      }
-    );
-  },
-  CHECK_INTERVAL_MS
-);
-
-// ============================================================
-// /monitor
-// ============================================================
-
-bot.command(
-  "monitor",
-  async (ctx) => {
-    const parts =
-      ctx.message.text
-        .trim()
-        .split(/\s+/);
-
-    if (parts.length < 3) {
-      await ctx.reply(
-        `❌ Format incorrect.
-
-Utilise :
-
-/monitor ADRESSE SEUIL
-
-Exemple :
-
-/monitor D6YTMYdeTpKkaDf7RkaxGZDehmetmLcrXmj4pKopVwHE 145000`
-      );
-
-      return;
-    }
-
-    const address =
-      parts[1];
-
-    const threshold =
-      Number(parts[2]);
-
-    if (
-      !isValidSolanaAddress(
-        address
-      )
-    ) {
-      await ctx.reply(
-        "❌ Adresse Solana invalide."
-      );
-
-      return;
-    }
-
-    if (
-      !Number.isFinite(
-        threshold
-      ) ||
-      threshold <= 0
-    ) {
-      await ctx.reply(
-        "❌ Le seuil doit être un montant en dollars supérieur à 0."
-      );
-
-      return;
-    }
-
-    const existing =
-      monitors.find(
-        (monitor) =>
-          monitor.address ===
-            address &&
-          monitor.thresholdUsd ===
-            threshold &&
-          !monitor.alertSent
-      );
-
-    if (existing) {
-      await ctx.reply(
-        `⚠️ Cette surveillance existe déjà.
-
-Adresse :
-${address}
-
-Seuil :
-${formatUsd(
-  threshold
-)}`
-      );
-
-      return;
-    }
-
-    const monitor = {
-      id: `monitor_${now()}`,
-      address,
-      thresholdUsd:
-        threshold,
-      createdAt: now(),
-      lastCheck: null,
-      lastValueUsd: null,
-      lastSolAmount: null,
-      lastSolValueUsd: null,
-      lastTokenCount: null,
-      alertSent: false,
-      alertTime: null
-    };
-
-    monitors.push(monitor);
-
-    saveMonitors();
-
-    await ctx.reply(
-      `👀 SURVEILLANCE ACTIVÉE
-
-Adresse :
-${address}
-
-🎯 Seuil :
-${formatUsd(
-  threshold
-)}
-
-🔄 Vérification :
-toutes les 10 secondes
-
-🚨 Une alerte sera envoyée dès que la valeur totale estimée du portefeuille atteindra ou dépassera le seuil.
-
-🛑 Le V5.1 n'est pas modifié.`
-    );
-
-    // Première vérification immédiate
-    await checkMonitor(
-      monitor
-    );
-  }
-);
-
-// ============================================================
-// /monitors
-// ============================================================
-
-bot.command(
-  "monitors",
-  async (ctx) => {
-    const activeMonitors =
-      monitors.filter(
-        (monitor) =>
-          !monitor.alertSent
-      );
-
-    if (
-      activeMonitors.length === 0
-    ) {
-      await ctx.reply(
-        "👀 Aucune surveillance active."
-      );
-
-      return;
-    }
-
-    let message =
-      "👀 SURVEILLANCES ACTIVES\n\n";
-
-    for (
-      const monitor of activeMonitors
-    ) {
-      message +=
-        `📍 ${shortAddress(
-          monitor.address
-        )}\n`;
-
-      message +=
-        `🎯 Seuil : ${formatUsd(
-          monitor.thresholdUsd
-        )}\n`;
-
-      message +=
-        `💰 Dernière valeur : ${
-          monitor.lastValueUsd !== null
-            ? formatUsd(
-                monitor.lastValueUsd
-              )
-            : "calcul en cours"
-        }\n\n`;
-    }
-
-    await ctx.reply(
-      message
-    );
-  }
-);
-
-// ============================================================
-// /stopmonitor
-// ============================================================
-
-bot.command(
-  "stopmonitor",
-  async (ctx) => {
-    const parts =
-      ctx.message.text
-        .trim()
-        .split(/\s+/);
-
-    if (parts.length < 2) {
-      await ctx.reply(
-        `❌ Indique l'adresse à arrêter.
-
-Exemple :
-
-/stopmonitor D6YTMYdeTpKkaDf7RkaxGZDehmetmLcrXmj4pKopVwHE`
-      );
-
-      return;
-    }
-
-    const address =
-      parts[1];
-
-    const before =
-      monitors.length;
-
-    monitors =
-      monitors.filter(
-        (monitor) =>
-          monitor.address !==
-          address
-      );
-
-    saveMonitors();
-
-    if (
-      monitors.length === before
-    ) {
-      await ctx.reply(
-        "ℹ️ Aucune surveillance trouvée pour cette adresse."
-      );
-
-      return;
-    }
-
-    await ctx.reply(
-      `⛔ SURVEILLANCE ARRÊTÉE
-
-Adresse :
-${address}`
-    );
-  }
-);
-
-// ============================================================
-// /walletstatus
-// ============================================================
-
-bot.command(
-  "walletstatus",
-  async (ctx) => {
-    const parts =
-      ctx.message.text
-        .trim()
-        .split(/\s+/);
-
-    if (parts.length < 2) {
-      await ctx.reply(
-        `❌ Indique une adresse.
-
-Exemple :
-
-/walletstatus ADRESSE`
-      );
-
-      return;
-    }
-
-    const address =
-      parts[1];
-
-    if (
-      !isValidSolanaAddress(
-        address
-      )
-    ) {
-      await ctx.reply(
-        "❌ Adresse Solana invalide."
-      );
-
-      return;
-    }
-
-    await ctx.reply(
-      `🔎 Calcul de la valeur du portefeuille...
-
-Adresse :
-${address}`
-    );
-
-    try {
-      const portfolio =
-        await calculateWalletValue(
-          address
-        );
-
-      await ctx.reply(
-        `💰 PORTEFEUILLE
-
-Adresse :
-${address}
-
-💵 Valeur totale estimée :
-${formatUsd(
-  portfolio.totalUsd
-)}
-
-◎ SOL :
-${portfolio.solAmount.toFixed(
-  6
-)}
-
-💵 Valeur SOL :
-${formatUsd(
-  portfolio.solValueUsd
-)}
-
-🪙 Tokens valorisés :
-${portfolio.tokenCount}
-
-⏰ Mise à jour :
-${new Date().toLocaleString(
-  "fr-FR"
-)}
-
-⚠️ Valeur estimée à partir des prix disponibles.`
-      );
-    } catch (error) {
-      await ctx.reply(
-        `❌ Impossible de calculer la valeur du portefeuille.
-
-${error.message}`
-      );
-    }
-  }
-);
-
-// ============================================================
-// /helpwallet
-// ============================================================
-
-bot.command(
-  "helpwallet",
-  async (ctx) => {
-    await ctx.reply(
-      `🤖 WALLET MONITOR
-
-/monitor ADRESSE SEUIL
-▶️ surveille un portefeuille jusqu'au seuil indiqué
-
-/monitors
-▶️ affiche les surveillances actives
-
-/walletstatus ADRESSE
-▶️ calcule immédiatement la valeur totale estimée
-
-/stopmonitor ADRESSE
-▶️ arrête la surveillance d'une adresse
-
-Exemple :
-
-/monitor D6YTMYdeTpKkaDf7RkaxGZDehmetmLcrXmj4pKopVwHE 145000
-
-🎯 Seuil :
-145 000 $
-
-🔄 Vérification :
-toutes les 10 secondes
-
-🚨 Alerte dès que le portefeuille atteint ou dépasse le seuil.
-
-⚠️ Module indépendant du V5.1.`
-    );
-  }
-);
-
-// ============================================================
-// LANCEMENT
-// ============================================================
-
-bot.launch();
+// ===============================
+// DEMARRAGE
+// ===============================
 
 console.log(
-  "👀 Wallet Monitor lancé."
+  "========================================"
 );
 
-// ============================================================
-// ARRÊT PROPRE
-// ============================================================
-
-process.once(
-  "SIGINT",
-  () => bot.stop("SIGINT")
+console.log(
+  "👛 WALLET MONITOR"
 );
 
-process.once(
-  "SIGTERM",
-  () => bot.stop("SIGTERM")
+console.log(
+  "========================================"
+);
+
+console.log(
+  `Wallet : ${WALLET_ADDRESS}`
+);
+
+console.log(
+  `Seuil : ${formatUsd(THRESHOLD_USD)}`
+);
+
+console.log(
+  `Intervalle : ${CHECK_INTERVAL_MS / 1000}s`
+);
+
+console.log(
+  "Telegram : alertes uniquement"
+);
+
+console.log(
+  "========================================"
+);
+
+// Première vérification
+checkWallet();
+
+// Vérification périodique
+setInterval(
+  checkWallet,
+  CHECK_INTERVAL_MS
 );
