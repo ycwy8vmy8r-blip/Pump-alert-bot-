@@ -22,12 +22,13 @@ const SOLANA_RPC_URL =
 const WSOL_MINT =
   "So11111111111111111111111111111111111111112";
 
-// Programmes SPL
+// SPL Token classique
 const TOKEN_PROGRAM =
   "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
+// SPL Token-2022
 const TOKEN_2022_PROGRAM =
-  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuF";
+  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 
 // ========================================
@@ -109,7 +110,9 @@ async function solanaRpc(method, params) {
 
   if (data.error) {
     throw new Error(
-      `Solana RPC : ${data.error.message || "Erreur inconnue"}`
+      `Solana RPC : ${
+        data.error.message || "Erreur inconnue"
+      }`
     );
   }
 
@@ -125,10 +128,7 @@ async function getNativeSolBalance() {
   const result = await solanaRpc(
     "getBalance",
     [
-      WALLET_ADDRESS,
-      {
-        commitment: "finalized"
-      }
+      WALLET_ADDRESS
     ]
   );
 
@@ -146,7 +146,7 @@ async function getNativeSolBalance() {
 
 
 // ========================================
-// COMPTES SPL DU WALLET
+// COMPTES SPL
 // ========================================
 
 async function getTokenAccounts(programId) {
@@ -155,7 +155,7 @@ async function getTokenAccounts(programId) {
     [
       WALLET_ADDRESS,
       {
-        programId
+        programId: programId
       },
       {
         commitment: "finalized",
@@ -164,7 +164,10 @@ async function getTokenAccounts(programId) {
     ]
   );
 
-  if (!result || !Array.isArray(result.value)) {
+  if (
+    !result ||
+    !Array.isArray(result.value)
+  ) {
     return [];
   }
 
@@ -173,34 +176,43 @@ async function getTokenAccounts(programId) {
 
 
 // ========================================
-// TOUS LES TOKENS DU WALLET
+// TOKENS DU WALLET
 // ========================================
 
 async function getWalletTokens() {
-  const [standardTokens, token2022Tokens] =
-    await Promise.all([
-      getTokenAccounts(TOKEN_PROGRAM),
-      getTokenAccounts(TOKEN_2022_PROGRAM)
-    ]);
+
+  const [
+    standardTokens,
+    token2022Tokens
+  ] = await Promise.all([
+    getTokenAccounts(TOKEN_PROGRAM),
+    getTokenAccounts(TOKEN_2022_PROGRAM)
+  ]);
 
   const allAccounts = [
     ...standardTokens,
     ...token2022Tokens
   ];
 
-  const tokens = [];
+  const tokenMap = new Map();
 
   for (const account of allAccounts) {
+
     try {
+
       const info =
         account.account.data.parsed.info;
 
       const mint = info.mint;
 
       const amount =
-        info.tokenAmount.uiAmount;
+        Number(
+          info.tokenAmount.uiAmount
+        );
 
-      if (!mint) continue;
+      if (!mint) {
+        continue;
+      }
 
       if (
         !Number.isFinite(amount) ||
@@ -209,57 +221,64 @@ async function getWalletTokens() {
         continue;
       }
 
-      // Le SOL wrapped est volontairement ignoré.
+      // On ne compte pas le WSOL ici.
       // Le SOL natif est calculé séparément.
       if (mint === WSOL_MINT) {
         continue;
       }
 
-      tokens.push({
-        mint,
-        amount
-      });
+      // Si plusieurs comptes existent
+      // pour le même token, on additionne.
+      if (tokenMap.has(mint)) {
+
+        const existing =
+          tokenMap.get(mint);
+
+        existing.amount += amount;
+
+      } else {
+
+        tokenMap.set(
+          mint,
+          {
+            mint,
+            amount
+          }
+        );
+      }
+
     } catch (error) {
-      // On ignore les comptes impossibles à parser.
-    }
-  }
-
-  // Évite les doublons éventuels
-  const uniqueTokens = new Map();
-
-  for (const token of tokens) {
-    if (!uniqueTokens.has(token.mint)) {
-      uniqueTokens.set(
-        token.mint,
-        token
-      );
+      // Compte impossible à parser
+      // On l'ignore.
     }
   }
 
   return Array.from(
-    uniqueTokens.values()
+    tokenMap.values()
   );
 }
 
 
 // ========================================
-// PRIX DES TOKENS VIA DEXSCREENER
+// PRIX DEXSCREENER
 // ========================================
 
 async function getTokenPrices(mints) {
+
   const prices = new Map();
 
   if (!mints.length) {
     return prices;
   }
 
-  // DEX Screener accepte jusqu'à 30 adresses
-  // par requête.
+  // DEX Screener accepte jusqu'à
+  // 30 adresses par requête.
   for (
     let i = 0;
     i < mints.length;
     i += 30
   ) {
+
     const batch =
       mints.slice(i, i + 30);
 
@@ -273,13 +292,11 @@ async function getTokenPrices(mints) {
       continue;
     }
 
-    // Plusieurs pools peuvent exister pour
-    // le même token.
-    //
-    // On garde le prix de la paire avec
-    // la plus grosse liquidité.
     for (const pair of data) {
-      if (!pair) continue;
+
+      if (!pair) {
+        continue;
+      }
 
       const baseAddress =
         pair.baseToken &&
@@ -318,13 +335,17 @@ async function getTokenPrices(mints) {
         batch.includes(baseAddress)
       ) {
         mint = baseAddress;
-      } else if (
+      }
+
+      if (
         batch.includes(quoteAddress)
       ) {
         mint = quoteAddress;
       }
 
-      if (!mint) continue;
+      if (!mint) {
+        continue;
+      }
 
       const existing =
         prices.get(mint);
@@ -334,10 +355,14 @@ async function getTokenPrices(mints) {
         liquidityUsd >
           existing.liquidityUsd
       ) {
-        prices.set(mint, {
-          priceUsd,
-          liquidityUsd
-        });
+
+        prices.set(
+          mint,
+          {
+            priceUsd,
+            liquidityUsd
+          }
+        );
       }
     }
   }
@@ -351,10 +376,13 @@ async function getTokenPrices(mints) {
 // ========================================
 
 async function sendTelegram(message) {
+
   if (!BOT_TOKEN || !CHAT_ID) {
+
     console.log(
       "⚠️ BOT_TOKEN ou CHAT_ID manquant."
     );
+
     return;
   }
 
@@ -367,6 +395,7 @@ async function sendTelegram(message) {
   });
 
   try {
+
     await httpsRequest(
       url,
       {
@@ -378,7 +407,9 @@ async function sendTelegram(message) {
     console.log(
       "📨 Alerte Telegram envoyée."
     );
+
   } catch (error) {
+
     console.error(
       "❌ Erreur Telegram :",
       error.message
@@ -388,54 +419,66 @@ async function sendTelegram(message) {
 
 
 // ========================================
-// CALCUL TOTAL DU PORTEFEUILLE
+// CALCUL DU PORTEFEUILLE
 // ========================================
 
 async function calculateWalletValue() {
+
+  // SOL
   const solBalance =
     await getNativeSolBalance();
 
+  // Tokens
   const tokens =
     await getWalletTokens();
 
-  const mints =
+  const tokenMints =
     tokens.map(
-      (token) => token.mint
+      token => token.mint
     );
 
-  const prices =
-    await getTokenPrices(mints);
+  // Prix des tokens
+  const tokenPrices =
+    await getTokenPrices(
+      tokenMints
+    );
 
   // Prix SOL
-  const solPriceData =
+  const solPrices =
     await getTokenPrices([
       WSOL_MINT
     ]);
 
-  const solData =
-    solPriceData.get(
+  const solPriceData =
+    solPrices.get(
       WSOL_MINT
     );
 
-  if (!solData) {
+  if (!solPriceData) {
+
     throw new Error(
       "Prix SOL indisponible."
     );
   }
 
   const solPrice =
-    solData.priceUsd;
+    solPriceData.priceUsd;
 
   const solValueUsd =
-    solBalance * solPrice;
+    solBalance *
+    solPrice;
 
+  // Valeur des tokens
   let tokensValueUsd = 0;
 
-  const valuedTokens = [];
+  let valuedTokens = 0;
 
   for (const token of tokens) {
+
     const priceData =
-      prices.get(token.mint);
+      tokenPrices.get(
+        token.mint
+      );
 
     if (!priceData) {
       continue;
@@ -454,12 +497,7 @@ async function calculateWalletValue() {
 
     tokensValueUsd += valueUsd;
 
-    valuedTokens.push({
-      mint: token.mint,
-      amount: token.amount,
-      priceUsd: priceData.priceUsd,
-      valueUsd
-    });
+    valuedTokens++;
   }
 
   const totalValueUsd =
@@ -470,7 +508,7 @@ async function calculateWalletValue() {
     solBalance,
     solPrice,
     solValueUsd,
-    tokens,
+    tokensCount: tokens.length,
     valuedTokens,
     tokensValueUsd,
     totalValueUsd
@@ -487,6 +525,7 @@ let thresholdTriggered = false;
 let checking = false;
 
 async function checkWallet() {
+
   if (checking) {
     return;
   }
@@ -494,6 +533,7 @@ async function checkWallet() {
   checking = true;
 
   try {
+
     console.log("");
     console.log(
       "🔎 Vérification du portefeuille..."
@@ -511,11 +551,15 @@ async function checkWallet() {
     );
 
     console.log(
-      `🪙 TOKENS : ${wallet.valuedTokens.length} valorisés`
+      `🪙 TOKENS DÉTECTÉS : ${wallet.tokensCount}`
     );
 
     console.log(
-      `💵 VALEUR TOKENS : $${wallet.tokensValueUsd.toFixed(2)}`
+      `🪙 TOKENS VALORISÉS : ${wallet.valuedTokens}`
+    );
+
+    console.log(
+      `💵 VALEUR DES TOKENS : $${wallet.tokensValueUsd.toFixed(2)}`
     );
 
     console.log(
@@ -535,7 +579,7 @@ async function checkWallet() {
     );
 
     // ========================================
-    // SEUIL ATTEINT
+    // ALERTE
     // ========================================
 
     if (
@@ -543,10 +587,11 @@ async function checkWallet() {
         THRESHOLD_USD &&
       !thresholdTriggered
     ) {
+
       thresholdTriggered = true;
 
       const message =
-        `🚨 PORTEFEUILLE À ${THRESHOLD_USD.toLocaleString("fr-FR")} $ !\n\n` +
+        `🚨 PORTEFEUILLE À 200 000 $ !\n\n` +
         `💰 Valeur totale : $${wallet.totalValueUsd.toFixed(2)}\n` +
         `◎ SOL : ${wallet.solBalance.toFixed(6)}\n` +
         `💵 Valeur SOL : $${wallet.solValueUsd.toFixed(2)}\n` +
@@ -565,10 +610,11 @@ async function checkWallet() {
         THRESHOLD_USD &&
       thresholdTriggered
     ) {
+
       thresholdTriggered = false;
 
       console.log(
-        "🔄 Valeur repassée sous le seuil."
+        "🔄 Portefeuille repassé sous 200 000 $."
       );
 
       console.log(
@@ -577,11 +623,14 @@ async function checkWallet() {
     }
 
   } catch (error) {
+
     console.error(
       "❌ Erreur surveillance :",
       error.message
     );
+
   } finally {
+
     checking = false;
   }
 }
@@ -620,7 +669,7 @@ console.log(
 );
 
 console.log(
-  "🪙 SOL + TOKENS SPL : OUI"
+  "💰 SOL + TOKENS SPL + TOKEN-2022 : OUI"
 );
 
 console.log(
