@@ -1,9 +1,6 @@
 const { Telegraf } = require("telegraf");
-
 const WebSocket = require("ws");
-
 const fs = require("fs");
-
 const path = require("path");
 
 // ============================================================
@@ -11,9 +8,7 @@ const path = require("path");
 // ============================================================
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-
 const CHAT_ID = process.env.CHAT_ID;
-
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 
 if (!BOT_TOKEN || !CHAT_ID) {
@@ -26,35 +21,24 @@ const bot = new Telegraf(BOT_TOKEN);
 // ---------------- STRATÉGIE ----------------
 
 const FIXED_CAPITAL_USD = 10;
-
 const TARGET_GAIN_PERCENT = 5;
-
 const POLL_INTERVAL_MS = 2000;
-
 const HISTORY_WINDOW_MS = 120000;
-
 const CRASH_REPORT_WINDOW_MS = 60000;
-
 const OBSERVATION_AFTER_SELL_MS = 30000;
-
 const MAX_TOKEN_SESSION_MS = 45 * 60 * 1000;
-
 const NO_NEW_BUY_AFTER_MS = 43 * 60 * 1000;
 
 // ---------------- LIQUIDITÉ ----------------
 
 const MIN_LIQUIDITY_USD = 3000;
-
 const ENTRY_LIQUIDITY_DROP_10S = -10;
-
 const ENTRY_LIQUIDITY_DROP_30S = -15;
-
 const CRASH_LIQUIDITY_DROP_10S = -50;
 
 // ---------------- PRIX ----------------
 
 const ENTRY_PRICE_DROP_10S = -4;
-
 const CRASH_PRICE_DROP_10S = -20;
 
 // ---------------- ACCÉLÉRATION ----------------
@@ -63,35 +47,15 @@ const CRASH_PRICE_DROP_10S = -20;
 // Elle devient un signal de prudence lorsqu'elle est anormalement forte.
 
 const ACCEL_PRICE_5S_WARNING = 7;
-
 const ACCEL_PRICE_10S_WARNING = 10;
-
 const ACCEL_PRICE_5S_EXTREME = 10;
-
 const ACCEL_PRICE_10S_EXTREME = 15;
-
 const ACCEL_LIQUIDITY_DROP = -5;
 
 // ---------------- ENTRÉE ----------------
 
 const REQUIRED_HEALTHY_CONFIRMATIONS = 4;
-
 const MIN_HEALTH_SCORE_FOR_ENTRY = 80;
-
-// ---------------- WALLET ----------------
-
-// Valeur totale surveillée : SOL du wallet uniquement.
-// Les tokens SPL présents dans le wallet ne sont PAS comptés.
-
-const WALLET_ADDRESS =
-  "FHQA7p3XseQPnpemtckEbyJPLra9sK7Sge5QAbw1irob";
-
-const WALLET_THRESHOLD_USD = 30000;
-
-const WALLET_CHECK_INTERVAL_MS = 10000;
-
-const SOL_MINT =
-  "So11111111111111111111111111111111111111112";
 
 // ============================================================
 // FICHIERS
@@ -106,11 +70,8 @@ if (!fs.existsSync(DATA_DIR)) {
 }
 
 const MARKET_FILE = path.join(DATA_DIR, "market_history.jsonl");
-
 const TRADES_FILE = path.join(DATA_DIR, "trade_history.json");
-
 const CRASH_FILE = path.join(DATA_DIR, "crash_reports.json");
-
 const SUMMARY_FILE = path.join(DATA_DIR, "v51_summary.json");
 
 // ============================================================
@@ -118,39 +79,19 @@ const SUMMARY_FILE = path.join(DATA_DIR, "v51_summary.json");
 // ============================================================
 
 let active = false;
-
 let mint = null;
-
 let pollTimer = null;
-
-let walletMonitorTimer = null;
-
-let walletCheckInProgress = false;
-
-let walletThresholdTriggered = false;
-
 let observationUntil = 0;
-
 let sessionStartTime = 0;
-
 let position = null;
-
 let cycleNumber = 0;
-
 let sessionCycles = 0;
-
 let sessionProfit = 0;
-
 let healthyConfirmations = 0;
-
 let marketHistory = [];
-
 let accelerationWarningActive = false;
-
 let accelerationAlertSent = false;
-
 let heliusWs = null;
-
 let heliusConnected = false;
 
 // ============================================================
@@ -163,13 +104,11 @@ function now() {
 
 function shortMint(value) {
   if (!value) return "inconnu";
-
   return `${value.slice(0, 6)}...${value.slice(-6)}`;
 }
 
 function round(value, decimals = 4) {
   if (!Number.isFinite(value)) return null;
-
   return Number(value.toFixed(decimals));
 }
 
@@ -179,7 +118,6 @@ function formatUsd(value) {
 
 function formatPercent(value) {
   if (!Number.isFinite(value)) return "N/A";
-
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 
@@ -216,7 +154,6 @@ function loadTrades() {
     return Array.isArray(data) ? data : [];
   } catch (error) {
     console.error("❌ Impossible de charger trade_history.json");
-
     return [];
   }
 }
@@ -285,7 +222,6 @@ async function getMarketData(tokenMint) {
     };
 
   } catch (error) {
-
     console.error(
       "⚠️ Erreur DEX Screener:",
       error.message
@@ -300,7 +236,6 @@ async function getMarketData(tokenMint) {
 // ============================================================
 
 function addMarketPoint(data) {
-
   marketHistory.push(data);
 
   const cutoff = now() - HISTORY_WINDOW_MS;
@@ -317,23 +252,18 @@ function addMarketPoint(data) {
 }
 
 function getPointAgo(seconds) {
-
   const target = now() - seconds * 1000;
 
   let closest = null;
-
   let distance = Infinity;
 
   for (const point of marketHistory) {
-
     const currentDistance = Math.abs(
       point.timestamp - target
     );
 
     if (currentDistance < distance) {
-
       distance = currentDistance;
-
       closest = point;
     }
   }
@@ -346,7 +276,6 @@ function getPointAgo(seconds) {
 }
 
 function calculateChange(seconds, field) {
-
   const current =
     marketHistory[marketHistory.length - 1];
 
@@ -368,9 +297,7 @@ function calculateChange(seconds, field) {
 // ============================================================
 
 function calculateAcceleration() {
-
   const price5s = calculateChange(5, "price");
-
   const price10s = calculateChange(10, "price");
 
   const liquidity10s =
@@ -384,12 +311,10 @@ function calculateAcceleration() {
     Number.isFinite(price5s) &&
     Number.isFinite(price10s)
   ) {
-
     if (
       price5s >= ACCEL_PRICE_5S_EXTREME ||
       price10s >= ACCEL_PRICE_10S_EXTREME
     ) {
-
       level = "EXTREME";
 
       reasons.push(
@@ -400,7 +325,6 @@ function calculateAcceleration() {
       price5s >= ACCEL_PRICE_5S_WARNING ||
       price10s >= ACCEL_PRICE_10S_WARNING
     ) {
-
       level = "WARNING";
 
       reasons.push(
@@ -419,7 +343,6 @@ function calculateAcceleration() {
       (Number.isFinite(price10s) && price10s >= 8)
     )
   ) {
-
     level = "EXTREME";
 
     reasons.push(
@@ -441,7 +364,6 @@ function calculateAcceleration() {
 // ============================================================
 
 function calculateHealth(data) {
-
   let score = 100;
 
   const signals = [];
@@ -458,7 +380,6 @@ function calculateHealth(data) {
   // Liquidité
 
   if (data.liquidity < MIN_LIQUIDITY_USD) {
-
     score -= 20;
 
     signals.push(
@@ -470,7 +391,6 @@ function calculateHealth(data) {
     Number.isFinite(liquidity10s) &&
     liquidity10s <= ENTRY_LIQUIDITY_DROP_10S
   ) {
-
     score -= 20;
 
     signals.push(
@@ -482,7 +402,6 @@ function calculateHealth(data) {
     Number.isFinite(liquidity30s) &&
     liquidity30s <= ENTRY_LIQUIDITY_DROP_30S
   ) {
-
     score -= 20;
 
     signals.push(
@@ -496,7 +415,6 @@ function calculateHealth(data) {
     Number.isFinite(price10s) &&
     price10s <= ENTRY_PRICE_DROP_10S
   ) {
-
     score -= 20;
 
     signals.push(
@@ -510,13 +428,15 @@ function calculateHealth(data) {
     data.buys5m + data.sells5m;
 
   if (totalActivity === 0) {
-
     score -= 10;
 
     signals.push("activité faible");
   }
 
-  score = Math.max(0, Math.min(100, score));
+  score = Math.max(
+    0,
+    Math.min(100, score)
+  );
 
   return {
     score,
@@ -532,15 +452,12 @@ function calculateHealth(data) {
 // ============================================================
 
 function detectCrash(data, health) {
-
   const price10s = health.price10s;
-
   const liquidity10s = health.liquidity10s;
 
   const reasons = [];
 
   if (data.liquidity <= 1) {
-
     reasons.push(
       "liquidité quasi nulle"
     );
@@ -550,7 +467,6 @@ function detectCrash(data, health) {
     Number.isFinite(liquidity10s) &&
     liquidity10s <= CRASH_LIQUIDITY_DROP_10S
   ) {
-
     reasons.push(
       `liquidité ${formatPercent(liquidity10s)} / 10s`
     );
@@ -560,7 +476,6 @@ function detectCrash(data, health) {
     Number.isFinite(price10s) &&
     price10s <= CRASH_PRICE_DROP_10S
   ) {
-
     reasons.push(
       `prix ${formatPercent(price10s)} / 10s`
     );
@@ -574,14 +489,12 @@ function detectCrash(data, health) {
 // ============================================================
 
 function canEnter(data, health, acceleration) {
-
   const elapsed =
     now() - sessionStartTime;
 
   if (
     elapsed >= NO_NEW_BUY_AFTER_MS
   ) {
-
     return {
       ok: false,
       reason: "limite de 43 minutes atteinte"
@@ -591,7 +504,6 @@ function canEnter(data, health, acceleration) {
   if (
     observationUntil > now()
   ) {
-
     return {
       ok: false,
       reason: "phase d'observation"
@@ -601,7 +513,6 @@ function canEnter(data, health, acceleration) {
   if (
     data.liquidity < MIN_LIQUIDITY_USD
   ) {
-
     return {
       ok: false,
       reason: "liquidité insuffisante"
@@ -611,7 +522,6 @@ function canEnter(data, health, acceleration) {
   if (
     health.score < MIN_HEALTH_SCORE_FOR_ENTRY
   ) {
-
     return {
       ok: false,
       reason: `score santé ${health.score}/100`
@@ -622,7 +532,6 @@ function canEnter(data, health, acceleration) {
     acceleration.level === "WARNING" ||
     acceleration.level === "EXTREME"
   ) {
-
     return {
       ok: false,
       reason:
@@ -634,7 +543,6 @@ function canEnter(data, health, acceleration) {
     marketHistory.length <
     REQUIRED_HEALTHY_CONFIRMATIONS
   ) {
-
     return {
       ok: false,
       reason: "historique insuffisant"
@@ -652,26 +560,18 @@ function canEnter(data, health, acceleration) {
 // ============================================================
 
 async function simulateBuy(data) {
-
   cycleNumber++;
-
   sessionCycles++;
 
   const tokens =
     FIXED_CAPITAL_USD / data.price;
 
   position = {
-
     cycle: cycleNumber,
-
     entryTime: now(),
-
     entryPrice: data.price,
-
     capital: FIXED_CAPITAL_USD,
-
     tokens,
-
     targetPrice:
       data.price *
       (1 + TARGET_GAIN_PERCENT / 100)
@@ -737,7 +637,6 @@ ${heliusConnected ? "🟢 connecté" : "⚪ non connecté"}`
 // ============================================================
 
 async function simulateTargetSell(data) {
-
   if (!position) return;
 
   const entryPrice =
@@ -759,27 +658,16 @@ async function simulateTargetSell(data) {
   sessionProfit += profit;
 
   const trade = {
-
     type: "TARGET",
-
     sessionStart: sessionStartTime,
-
     timestamp: now(),
-
     mint,
-
     cycle: position.cycle,
-
     entryPrice,
-
     exitPrice: targetPrice,
-
     capital: FIXED_CAPITAL_USD,
-
     amount: simulatedAmount,
-
     profit,
-
     profitPercent:
       (profit / FIXED_CAPITAL_USD) * 100
   };
@@ -841,7 +729,6 @@ ${formatUsd(FIXED_CAPITAL_USD)}
 // ============================================================
 
 async function timeLimitExit(data) {
-
   if (!position) return;
 
   // On ne simule une sortie que si la liquidité
@@ -850,7 +737,6 @@ async function timeLimitExit(data) {
   if (
     data.liquidity <= MIN_LIQUIDITY_USD
   ) {
-
     await bot.telegram.sendMessage(
       CHAT_ID,
       `⏰ LIMITE 45 MINUTES
@@ -893,29 +779,17 @@ La liquidité n'est pas suffisamment fiable.
   sessionProfit += profit;
 
   const trade = {
-
     type: "TIME_LIMIT",
-
     sessionStart: sessionStartTime,
-
     timestamp: now(),
-
     mint,
-
     cycle: position.cycle,
-
     entryPrice: position.entryPrice,
-
     exitPrice,
-
     capital: position.capital,
-
     amount,
-
     profit,
-
     profitPercent
-
   };
 
   tradeHistory.push(trade);
@@ -965,17 +839,13 @@ ${profit >= 0 ? "+" : ""}${formatUsd(sessionProfit)}
 // ============================================================
 
 async function handleAccelerationAlert(acceleration) {
-
   const danger =
     acceleration.level === "WARNING" ||
     acceleration.level === "EXTREME";
 
   if (!danger) {
-
     accelerationWarningActive = false;
-
     accelerationAlertSent = false;
-
     return;
   }
 
@@ -1038,7 +908,6 @@ async function saveCrashReport(
   acceleration,
   reasons
 ) {
-
   const cutoff =
     now() - CRASH_REPORT_WINDOW_MS;
 
@@ -1049,78 +918,47 @@ async function saveCrashReport(
     );
 
   const report = {
-
     id: `crash_${now()}`,
-
     timestamp: new Date().toISOString(),
-
     sessionStart: new Date(
       sessionStartTime
     ).toISOString(),
-
     mint,
-
     cyclesCompleted: sessionCycles,
-
     sessionProfit,
-
     crashMarket: {
-
       price: data.price,
-
       liquidity: data.liquidity,
-
       priceChange10s: health.price10s,
-
       liquidityChange10s:
         health.liquidity10s,
-
       score: health.score
-
     },
-
     acceleration: {
-
       level: acceleration.level,
-
       price5s: acceleration.price5s,
-
       price10s: acceleration.price10s,
-
       liquidity10s:
         acceleration.liquidity10s,
-
       reasons: acceleration.reasons
-
     },
-
     reasons,
-
     openPosition: position
       ? {
-
           cycle: position.cycle,
-
           entryPrice:
             position.entryPrice,
-
           tokens: position.tokens,
-
           capital: position.capital
-
         }
       : null,
-
     last60Seconds
-
   };
 
   let reports = [];
 
   try {
-
     if (fs.existsSync(CRASH_FILE)) {
-
       const content =
         fs.readFileSync(
           CRASH_FILE,
@@ -1128,7 +966,6 @@ async function saveCrashReport(
         );
 
       if (content.trim()) {
-
         reports = JSON.parse(content);
 
         if (!Array.isArray(reports)) {
@@ -1136,9 +973,7 @@ async function saveCrashReport(
         }
       }
     }
-
   } catch {
-
     reports = [];
   }
 
@@ -1160,7 +995,6 @@ async function saveCrashReport(
 // ============================================================
 
 async function sendCrashReport(report) {
-
   const market = report.crashMarket;
 
   const acceleration =
@@ -1172,7 +1006,6 @@ async function sendCrashReport(report) {
   let lines = "";
 
   for (const point of lastPoints) {
-
     const time =
       new Date(
         point.timestamp
@@ -1261,9 +1094,7 @@ crash_reports.json`
   // Envoie aussi le fichier directement dans Telegram.
 
   try {
-
     if (fs.existsSync(CRASH_FILE)) {
-
       await bot.telegram.sendDocument(
         CHAT_ID,
         {
@@ -1275,9 +1106,7 @@ crash_reports.json`
         }
       );
     }
-
   } catch (error) {
-
     console.error(
       "⚠️ Impossible d'envoyer le fichier Telegram:",
       error.message
@@ -1295,7 +1124,6 @@ async function handleCrash(
   acceleration,
   reasons
 ) {
-
   if (!active) return;
 
   const report =
@@ -1377,7 +1205,6 @@ SAUVEGARDÉES
 // ============================================================
 
 async function handleTimeLimit(data) {
-
   if (!active) return false;
 
   const elapsed =
@@ -1413,7 +1240,6 @@ ${sessionProfit >= 0 ? "+" : ""}${formatUsd(sessionProfit)}
   );
 
   if (position) {
-
     await timeLimitExit(data);
   }
 
@@ -1425,282 +1251,10 @@ ${sessionProfit >= 0 ? "+" : ""}${formatUsd(sessionProfit)}
 }
 
 // ============================================================
-// SURVEILLANCE VALEUR DU WALLET
-// ============================================================
-
-// Cette surveillance ne regarde QUE le SOL du wallet.
-// Aucun token SPL n'est ajouté à la valeur.
-// Valeur = SOL détenus × prix actuel du SOL.
-
-// ============================================================
-
-async function getWalletSolBalance() {
-
-  const url =
-    `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-
-  const response = await fetch(url, {
-
-    method: "POST",
-
-    headers: {
-      "Content-Type": "application/json"
-    },
-
-    body: JSON.stringify({
-
-      jsonrpc: "2.0",
-
-      id: "wallet-balance",
-
-      method: "getBalance",
-
-      params: [WALLET_ADDRESS]
-
-    })
-
-  });
-
-  if (!response.ok) {
-
-    throw new Error(
-      `Helius getBalance HTTP ${response.status}`
-    );
-  }
-
-  const result = await response.json();
-
-  if (result.error) {
-
-    throw new Error(
-      result.error.message || "Erreur Helius getBalance"
-    );
-  }
-
-  const lamports =
-    result.result?.value || 0;
-
-  return lamports / 1_000_000_000;
-}
-
-async function getWalletSolPrice() {
-
-  const url =
-    `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-
-  const response = await fetch(url, {
-
-    method: "POST",
-
-    headers: {
-      "Content-Type": "application/json"
-    },
-
-    body: JSON.stringify({
-
-      jsonrpc: "2.0",
-
-      id: "wallet-sol-price",
-
-      method: "getAsset",
-
-      params: {
-
-        id: SOL_MINT,
-
-        displayOptions: {
-          showFungible: true
-        }
-
-      }
-
-    })
-
-  });
-
-  if (!response.ok) {
-
-    throw new Error(
-      `Helius getAsset HTTP ${response.status}`
-    );
-  }
-
-  const result = await response.json();
-
-  if (result.error) {
-
-    throw new Error(
-      result.error.message || "Erreur Helius getAsset"
-    );
-  }
-
-  const price =
-    result.result?.token_info?.price_info?.price_per_token;
-
-  if (
-    typeof price !== "number" ||
-    !Number.isFinite(price) ||
-    price <= 0
-  ) {
-
-    throw new Error(
-      "Prix SOL indisponible via Helius."
-    );
-  }
-
-  return price;
-}
-
-async function checkWalletThreshold() {
-
-  if (!active) return false;
-
-  if (walletThresholdTriggered) return true;
-
-  if (walletCheckInProgress) return false;
-
-  walletCheckInProgress = true;
-
-  try {
-
-    const solBalance =
-      await getWalletSolBalance();
-
-    const solPrice =
-      await getWalletSolPrice();
-
-    const walletValueUsd =
-      solBalance * solPrice;
-
-    console.log("");
-
-    console.log("👛 SURVEILLANCE WALLET V5.1");
-
-    console.log("----------------------------------------");
-
-    console.log(
-      `SOL : ${solBalance.toFixed(6)} × $${solPrice.toFixed(2)} = $${walletValueUsd.toFixed(2)}`
-    );
-
-    console.log(
-      `🎯 Seuil : $${WALLET_THRESHOLD_USD.toFixed(2)}`
-    );
-
-    console.log("----------------------------------------");
-
-    if (
-      walletValueUsd >= WALLET_THRESHOLD_USD
-    ) {
-
-      walletThresholdTriggered = true;
-
-      console.log(
-        "🚨 SEUIL WALLET ATTEINT - ARRÊT DE LA SESSION"
-      );
-
-      await bot.telegram.sendMessage(
-        CHAT_ID,
-        `🚨 SEUIL WALLET ATTEINT
-
-👛 Wallet :
-
-${WALLET_ADDRESS}
-
-💰 Valeur du wallet :
-
-$${walletValueUsd.toFixed(2)}
-
-🎯 Seuil :
-
-$${WALLET_THRESHOLD_USD.toFixed(2)}
-
-💎 SOL :
-
-${solBalance.toFixed(6)} SOL
-
-💵 Prix SOL :
-
-$${solPrice.toFixed(2)}
-
-⛔ SESSION V5.1 ARRÊTÉE AUTOMATIQUEMENT
-
-⚠️ Le calcul porte uniquement sur le SOL du wallet.
-
-⚠️ Les tokens présents dans le wallet ne sont pas comptés.`
-      );
-
-      await saveSummary("WALLET_THRESHOLD");
-
-      if (position) {
-
-        console.log(
-          "⚠️ Position ouverte au moment du seuil : aucune vente fictive supplémentaire."
-        );
-
-        position = null;
-      }
-
-      stopRadar(false);
-
-      return true;
-    }
-
-    return false;
-
-  } catch (error) {
-
-    console.error(
-      "⚠️ Erreur surveillance wallet:",
-      error.message
-    );
-
-    return false;
-
-  } finally {
-
-    walletCheckInProgress = false;
-  }
-}
-
-function startWalletMonitor() {
-
-  if (walletMonitorTimer) {
-
-    clearInterval(walletMonitorTimer);
-
-    walletMonitorTimer = null;
-  }
-
-  walletMonitorTimer = setInterval(
-    () => {
-
-      checkWalletThreshold().catch((error) => {
-
-        console.error(
-          "❌ Erreur wallet monitor:",
-          error.message
-        );
-      });
-
-    },
-    WALLET_CHECK_INTERVAL_MS
-  );
-
-  checkWalletThreshold().catch((error) => {
-
-    console.error(
-      "❌ Erreur wallet monitor initial:",
-      error.message
-    );
-  });
-}
-
-// ============================================================
 // BOUCLE PRINCIPALE
 // ============================================================
 
 async function tick() {
-
   if (!active || !mint) {
     return;
   }
@@ -1732,7 +1286,6 @@ async function tick() {
     detectCrash(data, health);
 
   if (crashReasons.length > 0) {
-
     await handleCrash(
       data,
       health,
@@ -1757,12 +1310,10 @@ async function tick() {
   // ----------------------------------------------------------
 
   if (position) {
-
     if (
       data.price >=
       position.targetPrice
     ) {
-
       await simulateTargetSell(data);
     }
 
@@ -1776,7 +1327,6 @@ async function tick() {
   if (
     observationUntil > now()
   ) {
-
     return;
   }
 
@@ -1792,9 +1342,7 @@ async function tick() {
     );
 
   if (!entry.ok) {
-
     healthyConfirmations = 0;
-
     return;
   }
 
@@ -1808,9 +1356,7 @@ async function tick() {
     healthyConfirmations >=
     REQUIRED_HEALTHY_CONFIRMATIONS
   ) {
-
     await simulateBuy(data);
-
     healthyConfirmations = 0;
   }
 }
@@ -1820,9 +1366,7 @@ async function tick() {
 // ============================================================
 
 function connectHelius() {
-
   if (!HELIUS_API_KEY) {
-
     console.log(
       "⚠️ HELIUS_API_KEY absente."
     );
@@ -1831,14 +1375,12 @@ function connectHelius() {
   }
 
   try {
-
     const url =
       `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
     heliusWs = new WebSocket(url);
 
     heliusWs.on("open", () => {
-
       heliusConnected = true;
 
       console.log(
@@ -1846,39 +1388,24 @@ function connectHelius() {
       );
 
       try {
-
         heliusWs.send(
           JSON.stringify({
-
             jsonrpc: "2.0",
-
             id: 1,
-
             method: "logsSubscribe",
-
             params: [
-
               {
-
                 mentions: [
                   "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
                 ]
-
               },
-
               {
-
                 commitment: "processed"
-
               }
-
             ]
-
           })
         );
-
       } catch (error) {
-
         console.error(
           "⚠️ Erreur abonnement Helius:",
           error.message
@@ -1887,7 +1414,6 @@ function connectHelius() {
     });
 
     heliusWs.on("close", () => {
-
       heliusConnected = false;
 
       console.log(
@@ -1896,7 +1422,6 @@ function connectHelius() {
     });
 
     heliusWs.on("error", (error) => {
-
       heliusConnected = false;
 
       console.error(
@@ -1906,14 +1431,11 @@ function connectHelius() {
     });
 
     heliusWs.on("message", () => {
-
       // Helius sert ici de source on-chain
       // de confirmation de présence d'activité.
-
     });
 
   } catch (error) {
-
     console.error(
       "⚠️ Impossible de connecter Helius:",
       error.message
@@ -1926,34 +1448,23 @@ function connectHelius() {
 // ============================================================
 
 async function saveSummary(reason) {
-
   const summary = {
-
     version: "V5.1",
-
     sessionStart: sessionStartTime
       ? new Date(
           sessionStartTime
         ).toISOString()
       : null,
-
     sessionEnd:
       new Date().toISOString(),
-
     mint,
-
     reason,
-
     cyclesCompleted:
       sessionCycles,
-
     sessionProfit,
-
     positionOpen:
       !!position,
-
     heliusConnected,
-
     marketPoints:
       marketHistory.length
   };
@@ -1969,9 +1480,7 @@ async function saveSummary(reason) {
 // ============================================================
 
 async function startRadar(tokenMint) {
-
   if (active) {
-
     await bot.telegram.sendMessage(
       CHAT_ID,
       `⚠️ Un test est déjà en cours.
@@ -2009,10 +1518,6 @@ Utilise /stoptrade avant d'en lancer un autre.`
   accelerationWarningActive = false;
 
   accelerationAlertSent = false;
-
-  walletThresholdTriggered = false;
-
-  walletCheckInProgress = false;
 
   console.log(
     `🚀 V5.1 démarrée pour ${shortMint(mint)}`
@@ -2058,16 +1563,6 @@ ACTIVÉE
 
 DIRECTEMENT DANS TELEGRAM
 
-👛 Surveillance wallet :
-
-ACTIVÉE
-
-🎯 Seuil wallet :
-
-$${WALLET_THRESHOLD_USD.toFixed(2)}
-
-⚠️ Si le seuil est atteint, la session V5.1 est arrêtée automatiquement.
-
 ⚠️ Simulation uniquement.
 
 Aucune transaction réelle.`
@@ -2075,24 +1570,14 @@ Aucune transaction réelle.`
 
   connectHelius();
 
-  // ==========================================================
-  // CORRECTION :
-  // Le radar démarre d'abord son pollTimer.
-  // Le premier tick est lancé immédiatement.
-  // Puis seulement la surveillance du wallet démarre.
-  // ==========================================================
-
   pollTimer = setInterval(
     () => {
-
       tick().catch((error) => {
-
         console.error(
           "❌ Erreur tick:",
           error.message
         );
       });
-
     },
     POLL_INTERVAL_MS
   );
@@ -2100,16 +1585,11 @@ Aucune transaction réelle.`
   // Premier passage immédiat
 
   tick().catch((error) => {
-
     console.error(
       "❌ Erreur tick initial:",
       error.message
     );
   });
-
-  // Surveillance du wallet en parallèle
-
-  startWalletMonitor();
 }
 
 // ============================================================
@@ -2117,29 +1597,16 @@ Aucune transaction réelle.`
 // ============================================================
 
 async function stopRadar(sendMessage = true) {
-
   active = false;
 
   if (pollTimer) {
-
     clearInterval(pollTimer);
-
     pollTimer = null;
   }
 
-  if (walletMonitorTimer) {
-
-    clearInterval(walletMonitorTimer);
-
-    walletMonitorTimer = null;
-  }
-
   if (heliusWs) {
-
     try {
-
       heliusWs.close();
-
     } catch {}
   }
 
@@ -2147,19 +1614,9 @@ async function stopRadar(sendMessage = true) {
 
   heliusConnected = false;
 
-  if (
-    walletThresholdTriggered
-  ) {
-
-    await saveSummary("WALLET_THRESHOLD");
-
-  } else {
-
-    await saveSummary("STOP");
-  }
+  await saveSummary("STOP");
 
   if (sendMessage) {
-
     await bot.telegram.sendMessage(
       CHAT_ID,
       `⛔ TEST ARRÊTÉ
@@ -2194,12 +1651,10 @@ ${position ? "OUI" : "NON"}
 // ============================================================
 
 bot.command("starttrade", async (ctx) => {
-
   const parts =
     ctx.message.text.trim().split(/\s+/);
 
   if (parts.length < 2) {
-
     await ctx.reply(
       `❌ Indique le mint du token.
 
@@ -2215,9 +1670,7 @@ Exemple :
 });
 
 bot.command("stoptrade", async (ctx) => {
-
   if (!active) {
-
     await ctx.reply(
       "ℹ️ Aucun test en cours."
     );
@@ -2229,9 +1682,7 @@ bot.command("stoptrade", async (ctx) => {
 });
 
 bot.command("status", async (ctx) => {
-
   if (!active) {
-
     await ctx.reply(
       `⚪ Aucun test en cours.
 
@@ -2285,10 +1736,6 @@ ${accelerationWarningActive ? "⚠️ ACTIVE" : "🟢 normale"}
 
 ${healthyConfirmations}/${REQUIRED_HEALTHY_CONFIRMATIONS}
 
-👛 Seuil wallet :
-
-$${WALLET_THRESHOLD_USD.toFixed(2)}
-
 ⛓️ Helius :
 
 ${heliusConnected ? "🟢 connecté" : "⚪ déconnecté"}`
@@ -2300,9 +1747,7 @@ ${heliusConnected ? "🟢 connecté" : "⚪ déconnecté"}`
 // ============================================================
 
 bot.command("lastcrash", async (ctx) => {
-
   if (!fs.existsSync(CRASH_FILE)) {
-
     await ctx.reply(
       `📂 Aucun crash report trouvé.
 
@@ -2313,7 +1758,6 @@ Le prochain crash sera automatiquement sauvegardé ici et envoyé dans Telegram.
   }
 
   try {
-
     const content =
       fs.readFileSync(
         CRASH_FILE,
@@ -2327,7 +1771,6 @@ Le prochain crash sera automatiquement sauvegardé ici et envoyé dans Telegram.
       !Array.isArray(reports) ||
       reports.length === 0
     ) {
-
       await ctx.reply(
         "📂 Aucun crash report disponible."
       );
@@ -2387,7 +1830,6 @@ ${last.acceleration.level}
     );
 
   } catch (error) {
-
     await ctx.reply(
       `❌ Impossible de lire le crash report.
 
@@ -2401,7 +1843,6 @@ ${error.message}`
 // ============================================================
 
 bot.command("help", async (ctx) => {
-
   await ctx.reply(
     `🤖 COMMANDES V5.1
 
@@ -2424,14 +1865,6 @@ bot.command("help", async (ctx) => {
 /help
 
 ℹ️ affiche cette aide
-
-👛 Le wallet est surveillé automatiquement.
-
-🎯 Seuil :
-
-$${WALLET_THRESHOLD_USD.toFixed(2)}
-
-⛔ Le test V5.1 s'arrête automatiquement si le seuil est atteint.
 
 ⚠️ V5.1 = SIMULATION UNIQUEMENT`
   );
