@@ -4,7 +4,8 @@ const https = require("https");
 // CONFIGURATION
 // ========================================
 
-const WALLET_ADDRESS = "7ZmUF8EcQ5tqxBfG3qW45gtYVVMCpN6dFZu43BLUVLC5";
+const WALLET_ADDRESS =
+  "Fg8bPb4BEphR8AZNup55BWaY9EuT5Mu3SYpAUpyhqxJH";
 
 const THRESHOLD_USD = 200000;
 
@@ -13,15 +14,24 @@ const CHECK_INTERVAL_MS = 10000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 
-// RPC public Solana Mainnet
-const SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com";
+// RPC public Solana
+const SOLANA_RPC_URL =
+  "https://api.mainnet-beta.solana.com";
 
-// WSOL mint utilisé pour récupérer le prix du SOL
+// WSOL
 const WSOL_MINT =
   "So11111111111111111111111111111111111111112";
 
+// Programmes SPL
+const TOKEN_PROGRAM =
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+
+const TOKEN_2022_PROGRAM =
+  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuF";
+
+
 // ========================================
-// PETIT CLIENT HTTP
+// HTTP
 // ========================================
 
 function httpsRequest(url, options = {}) {
@@ -43,7 +53,10 @@ function httpsRequest(url, options = {}) {
         });
 
         response.on("end", () => {
-          if (response.statusCode < 200 || response.statusCode >= 300) {
+          if (
+            response.statusCode < 200 ||
+            response.statusCode >= 300
+          ) {
             reject(
               new Error(
                 `HTTP ${response.statusCode} : ${data.slice(0, 300)}`
@@ -55,7 +68,9 @@ function httpsRequest(url, options = {}) {
           try {
             resolve(JSON.parse(data));
           } catch (error) {
-            reject(new Error("Réponse JSON invalide"));
+            reject(
+              new Error("Réponse JSON invalide")
+            );
           }
         });
       }
@@ -71,17 +86,280 @@ function httpsRequest(url, options = {}) {
   });
 }
 
+
+// ========================================
+// RPC SOLANA
+// ========================================
+
+async function solanaRpc(method, params) {
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method,
+    params
+  });
+
+  const data = await httpsRequest(
+    SOLANA_RPC_URL,
+    {
+      method: "POST",
+      body
+    }
+  );
+
+  if (data.error) {
+    throw new Error(
+      `Solana RPC : ${data.error.message || "Erreur inconnue"}`
+    );
+  }
+
+  return data.result;
+}
+
+
+// ========================================
+// SOL NATIF
+// ========================================
+
+async function getNativeSolBalance() {
+  const result = await solanaRpc(
+    "getBalance",
+    [
+      WALLET_ADDRESS,
+      {
+        commitment: "finalized"
+      }
+    ]
+  );
+
+  if (
+    !result ||
+    typeof result.value !== "number"
+  ) {
+    throw new Error(
+      "Solde SOL introuvable."
+    );
+  }
+
+  return result.value / 1_000_000_000;
+}
+
+
+// ========================================
+// COMPTES SPL DU WALLET
+// ========================================
+
+async function getTokenAccounts(programId) {
+  const result = await solanaRpc(
+    "getTokenAccountsByOwner",
+    [
+      WALLET_ADDRESS,
+      {
+        programId
+      },
+      {
+        commitment: "finalized",
+        encoding: "jsonParsed"
+      }
+    ]
+  );
+
+  if (!result || !Array.isArray(result.value)) {
+    return [];
+  }
+
+  return result.value;
+}
+
+
+// ========================================
+// TOUS LES TOKENS DU WALLET
+// ========================================
+
+async function getWalletTokens() {
+  const [standardTokens, token2022Tokens] =
+    await Promise.all([
+      getTokenAccounts(TOKEN_PROGRAM),
+      getTokenAccounts(TOKEN_2022_PROGRAM)
+    ]);
+
+  const allAccounts = [
+    ...standardTokens,
+    ...token2022Tokens
+  ];
+
+  const tokens = [];
+
+  for (const account of allAccounts) {
+    try {
+      const info =
+        account.account.data.parsed.info;
+
+      const mint = info.mint;
+
+      const amount =
+        info.tokenAmount.uiAmount;
+
+      if (!mint) continue;
+
+      if (
+        !Number.isFinite(amount) ||
+        amount <= 0
+      ) {
+        continue;
+      }
+
+      // Le SOL wrapped est volontairement ignoré.
+      // Le SOL natif est calculé séparément.
+      if (mint === WSOL_MINT) {
+        continue;
+      }
+
+      tokens.push({
+        mint,
+        amount
+      });
+    } catch (error) {
+      // On ignore les comptes impossibles à parser.
+    }
+  }
+
+  // Évite les doublons éventuels
+  const uniqueTokens = new Map();
+
+  for (const token of tokens) {
+    if (!uniqueTokens.has(token.mint)) {
+      uniqueTokens.set(
+        token.mint,
+        token
+      );
+    }
+  }
+
+  return Array.from(
+    uniqueTokens.values()
+  );
+}
+
+
+// ========================================
+// PRIX DES TOKENS VIA DEXSCREENER
+// ========================================
+
+async function getTokenPrices(mints) {
+  const prices = new Map();
+
+  if (!mints.length) {
+    return prices;
+  }
+
+  // DEX Screener accepte jusqu'à 30 adresses
+  // par requête.
+  for (
+    let i = 0;
+    i < mints.length;
+    i += 30
+  ) {
+    const batch =
+      mints.slice(i, i + 30);
+
+    const url =
+      `https://api.dexscreener.com/tokens/v1/solana/${batch.join(",")}`;
+
+    const data =
+      await httpsRequest(url);
+
+    if (!Array.isArray(data)) {
+      continue;
+    }
+
+    // Plusieurs pools peuvent exister pour
+    // le même token.
+    //
+    // On garde le prix de la paire avec
+    // la plus grosse liquidité.
+    for (const pair of data) {
+      if (!pair) continue;
+
+      const baseAddress =
+        pair.baseToken &&
+        pair.baseToken.address;
+
+      const quoteAddress =
+        pair.quoteToken &&
+        pair.quoteToken.address;
+
+      const priceUsd =
+        Number(pair.priceUsd);
+
+      const liquidityUsd =
+        Number(
+          pair.liquidity &&
+          pair.liquidity.usd
+        );
+
+      if (
+        !Number.isFinite(priceUsd) ||
+        priceUsd <= 0
+      ) {
+        continue;
+      }
+
+      if (
+        !Number.isFinite(liquidityUsd) ||
+        liquidityUsd <= 0
+      ) {
+        continue;
+      }
+
+      let mint = null;
+
+      if (
+        batch.includes(baseAddress)
+      ) {
+        mint = baseAddress;
+      } else if (
+        batch.includes(quoteAddress)
+      ) {
+        mint = quoteAddress;
+      }
+
+      if (!mint) continue;
+
+      const existing =
+        prices.get(mint);
+
+      if (
+        !existing ||
+        liquidityUsd >
+          existing.liquidityUsd
+      ) {
+        prices.set(mint, {
+          priceUsd,
+          liquidityUsd
+        });
+      }
+    }
+  }
+
+  return prices;
+}
+
+
 // ========================================
 // TELEGRAM
 // ========================================
 
 async function sendTelegram(message) {
   if (!BOT_TOKEN || !CHAT_ID) {
-    console.log("⚠️ BOT_TOKEN ou CHAT_ID manquant.");
+    console.log(
+      "⚠️ BOT_TOKEN ou CHAT_ID manquant."
+    );
     return;
   }
 
-  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+  const url =
+    `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
 
   const body = JSON.stringify({
     chat_id: CHAT_ID,
@@ -89,12 +367,17 @@ async function sendTelegram(message) {
   });
 
   try {
-    await httpsRequest(url, {
-      method: "POST",
-      body
-    });
+    await httpsRequest(
+      url,
+      {
+        method: "POST",
+        body
+      }
+    );
 
-    console.log("📨 Alerte Telegram envoyée.");
+    console.log(
+      "📨 Alerte Telegram envoyée."
+    );
   } catch (error) {
     console.error(
       "❌ Erreur Telegram :",
@@ -103,83 +386,97 @@ async function sendTelegram(message) {
   }
 }
 
-// ========================================
-// SOLDE SOL NATIF
-// ========================================
-
-async function getSolBalance() {
-  const body = JSON.stringify({
-    jsonrpc: "2.0",
-    id: 1,
-    method: "getBalance",
-    params: [
-      WALLET_ADDRESS,
-      {
-        commitment: "finalized"
-      }
-    ]
-  });
-
-  const data = await httpsRequest(SOLANA_RPC_URL, {
-    method: "POST",
-    body
-  });
-
-  if (
-    !data ||
-    !data.result ||
-    typeof data.result.value !== "number"
-  ) {
-    throw new Error("Solde SOL introuvable.");
-  }
-
-  // Solana retourne le solde en lamports.
-  return data.result.value / 1_000_000_000;
-}
 
 // ========================================
-// PRIX DU SOL
+// CALCUL TOTAL DU PORTEFEUILLE
 // ========================================
 
-async function getSolPriceUsd() {
-  const url =
-    `https://api.dexscreener.com/token-pairs/v1/solana/${WSOL_MINT}`;
+async function calculateWalletValue() {
+  const solBalance =
+    await getNativeSolBalance();
 
-  const pairs = await httpsRequest(url);
+  const tokens =
+    await getWalletTokens();
 
-  if (!Array.isArray(pairs) || pairs.length === 0) {
-    throw new Error("Aucune paire SOL trouvée sur DexScreener.");
-  }
-
-  const validPairs = pairs.filter((pair) => {
-    return (
-      pair &&
-      pair.priceUsd &&
-      Number.isFinite(Number(pair.priceUsd)) &&
-      pair.liquidity &&
-      Number.isFinite(Number(pair.liquidity.usd))
+  const mints =
+    tokens.map(
+      (token) => token.mint
     );
-  });
 
-  if (validPairs.length === 0) {
-    throw new Error("Prix SOL indisponible sur DexScreener.");
+  const prices =
+    await getTokenPrices(mints);
+
+  // Prix SOL
+  const solPriceData =
+    await getTokenPrices([
+      WSOL_MINT
+    ]);
+
+  const solData =
+    solPriceData.get(
+      WSOL_MINT
+    );
+
+  if (!solData) {
+    throw new Error(
+      "Prix SOL indisponible."
+    );
   }
 
-  // On prend la paire avec la plus grosse liquidité.
-  validPairs.sort(
-    (a, b) =>
-      Number(b.liquidity.usd) -
-      Number(a.liquidity.usd)
-  );
+  const solPrice =
+    solData.priceUsd;
 
-  const price = Number(validPairs[0].priceUsd);
+  const solValueUsd =
+    solBalance * solPrice;
 
-  if (!Number.isFinite(price) || price <= 0) {
-    throw new Error("Prix SOL invalide.");
+  let tokensValueUsd = 0;
+
+  const valuedTokens = [];
+
+  for (const token of tokens) {
+    const priceData =
+      prices.get(token.mint);
+
+    if (!priceData) {
+      continue;
+    }
+
+    const valueUsd =
+      token.amount *
+      priceData.priceUsd;
+
+    if (
+      !Number.isFinite(valueUsd) ||
+      valueUsd <= 0
+    ) {
+      continue;
+    }
+
+    tokensValueUsd += valueUsd;
+
+    valuedTokens.push({
+      mint: token.mint,
+      amount: token.amount,
+      priceUsd: priceData.priceUsd,
+      valueUsd
+    });
   }
 
-  return price;
+  const totalValueUsd =
+    solValueUsd +
+    tokensValueUsd;
+
+  return {
+    solBalance,
+    solPrice,
+    solValueUsd,
+    tokens,
+    valuedTokens,
+    tokensValueUsd,
+    totalValueUsd
+  };
 }
+
 
 // ========================================
 // SURVEILLANCE
@@ -187,86 +484,148 @@ async function getSolPriceUsd() {
 
 let thresholdTriggered = false;
 
+let checking = false;
+
 async function checkWallet() {
+  if (checking) {
+    return;
+  }
+
+  checking = true;
+
   try {
     console.log("");
-    console.log("🔎 Vérification du wallet...");
-    console.log("========================================");
-
-    const solBalance = await getSolBalance();
-
-    const solPrice = await getSolPriceUsd();
-
-    const walletValueUsd =
-      solBalance * solPrice;
-
     console.log(
-      `SOL : ${solBalance.toFixed(6)} × $${solPrice.toFixed(2)} = $${walletValueUsd.toFixed(2)}`
+      "🔎 Vérification du portefeuille..."
     );
 
-    console.log("========================================");
+    console.log(
+      "========================================"
+    );
+
+    const wallet =
+      await calculateWalletValue();
 
     console.log(
-      `💰 VALEUR TOTALE DU WALLET : $${walletValueUsd.toFixed(2)}`
+      `◎ SOL : ${wallet.solBalance.toFixed(6)} × $${wallet.solPrice.toFixed(2)} = $${wallet.solValueUsd.toFixed(2)}`
+    );
+
+    console.log(
+      `🪙 TOKENS : ${wallet.valuedTokens.length} valorisés`
+    );
+
+    console.log(
+      `💵 VALEUR TOKENS : $${wallet.tokensValueUsd.toFixed(2)}`
+    );
+
+    console.log(
+      "========================================"
+    );
+
+    console.log(
+      `💰 VALEUR TOTALE DU PORTEFEUILLE : $${wallet.totalValueUsd.toFixed(2)}`
     );
 
     console.log(
       `🎯 SEUIL : $${THRESHOLD_USD.toFixed(2)}`
     );
 
-    console.log("========================================");
+    console.log(
+      "========================================"
+    );
 
     // ========================================
-    // ALERTE AU FRANCHISSEMENT DU SEUIL
+    // SEUIL ATTEINT
     // ========================================
 
     if (
-      walletValueUsd >= THRESHOLD_USD &&
+      wallet.totalValueUsd >=
+        THRESHOLD_USD &&
       !thresholdTriggered
     ) {
       thresholdTriggered = true;
 
       const message =
-        `🚨 SEUIL WALLET ATTEINT !\n\n` +
-        `💰 Valeur : $${walletValueUsd.toFixed(2)}\n` +
-        `🎯 Seuil : $${THRESHOLD_USD.toFixed(2)}\n` +
-        `◎ SOL : ${solBalance.toFixed(6)}\n` +
-        `💵 Prix SOL : $${solPrice.toFixed(2)}`;
+        `🚨 PORTEFEUILLE À ${THRESHOLD_USD.toLocaleString("fr-FR")} $ !\n\n` +
+        `💰 Valeur totale : $${wallet.totalValueUsd.toFixed(2)}\n` +
+        `◎ SOL : ${wallet.solBalance.toFixed(6)}\n` +
+        `💵 Valeur SOL : $${wallet.solValueUsd.toFixed(2)}\n` +
+        `🪙 Valeur tokens : $${wallet.tokensValueUsd.toFixed(2)}\n\n` +
+        `🎯 Seuil : $${THRESHOLD_USD.toFixed(2)}`;
 
       await sendTelegram(message);
     }
 
-    // Réarmement lorsque le wallet repasse sous le seuil
+    // ========================================
+    // RÉARMEMENT
+    // ========================================
+
     if (
-      walletValueUsd < THRESHOLD_USD &&
+      wallet.totalValueUsd <
+        THRESHOLD_USD &&
       thresholdTriggered
     ) {
       thresholdTriggered = false;
 
       console.log(
-        "🔄 Seuil repassé sous la limite. Alerte réarmée."
+        "🔄 Valeur repassée sous le seuil."
+      );
+
+      console.log(
+        "🔔 Alerte réarmée."
       );
     }
+
   } catch (error) {
     console.error(
       "❌ Erreur surveillance :",
       error.message
     );
+  } finally {
+    checking = false;
   }
 }
+
 
 // ========================================
 // DÉMARRAGE
 // ========================================
 
-console.log("========================================");
-console.log("🚀 WALLET MONITOR DÉMARRÉ");
-console.log("========================================");
-console.log(`👛 Wallet : ${WALLET_ADDRESS}`);
-console.log(`🎯 Seuil : $${THRESHOLD_USD.toFixed(2)}`);
-console.log(`⏱️ Vérification : toutes les ${CHECK_INTERVAL_MS / 1000}s`);
-console.log("🚫 Helius : NON UTILISÉ");
-console.log("========================================");
+console.log(
+  "========================================"
+);
+
+console.log(
+  "🚀 WALLET MONITOR DÉMARRÉ"
+);
+
+console.log(
+  "========================================"
+);
+
+console.log(
+  `👛 Wallet : ${WALLET_ADDRESS}`
+);
+
+console.log(
+  `🎯 SEUIL PORTEFEUILLE : $${THRESHOLD_USD.toFixed(2)}`
+);
+
+console.log(
+  `⏱️ Vérification : toutes les ${CHECK_INTERVAL_MS / 1000}s`
+);
+
+console.log(
+  "🚫 Helius : NON UTILISÉ"
+);
+
+console.log(
+  "🪙 SOL + TOKENS SPL : OUI"
+);
+
+console.log(
+  "========================================"
+);
 
 checkWallet();
 
