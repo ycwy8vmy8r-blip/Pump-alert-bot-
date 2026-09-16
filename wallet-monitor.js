@@ -6,7 +6,7 @@ const CHAT_ID = process.env.CHAT_ID;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 
 // =====================================================
-// CONFIGURATION
+// CONFIGURATION TEST
 // =====================================================
 
 const WALLET_ADDRESS =
@@ -17,7 +17,7 @@ const THRESHOLD_USD = 70000;
 const CHECK_INTERVAL_MS = 10000;
 
 // =====================================================
-// DOSSIER DATA
+// DATA
 // =====================================================
 
 const DATA_DIR = fs.existsSync("/data")
@@ -39,7 +39,6 @@ if (!BOT_TOKEN || !CHAT_ID || !HELIUS_API_KEY) {
   console.error(
     "❌ BOT_TOKEN, CHAT_ID ou HELIUS_API_KEY manquant."
   );
-
   process.exit(1);
 }
 
@@ -107,7 +106,6 @@ async function sendTelegramMessage(text) {
         "❌ Telegram :",
         data.description || "erreur inconnue"
       );
-
       return false;
     }
 
@@ -117,40 +115,29 @@ async function sendTelegramMessage(text) {
       "❌ Erreur Telegram :",
       err.message
     );
-
     return false;
   }
 }
 
 // =====================================================
-// HELIUS
+// APPEL HELIUS
 // =====================================================
 
-async function getWalletAssets() {
+async function heliusRpc(method, params) {
   const url =
     `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-
-  const body = {
-    jsonrpc: "2.0",
-    id: "wallet-monitor",
-    method: "getAssetsByOwner",
-    params: {
-      ownerAddress: WALLET_ADDRESS,
-      page: 1,
-      limit: 1000,
-      displayOptions: {
-        showFungible: true,
-        showNativeBalance: true
-      }
-    }
-  };
 
   const response = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "wallet-monitor",
+      method,
+      params
+    })
   });
 
   if (!response.ok) {
@@ -167,132 +154,52 @@ async function getWalletAssets() {
     );
   }
 
-  if (!json.result) {
-    throw new Error(
-      "Helius n'a retourné aucun résultat."
-    );
-  }
-
   return json.result;
 }
 
 // =====================================================
-// PRIX SOL
+// RECUPERATION WALLET
 // =====================================================
 
-async function getSolPriceUsd(result) {
-  const nativeBalance =
-    result.nativeBalance?.lamports || 0;
-
-  if (!nativeBalance) {
-    return {
-      balance: 0,
-      priceUsd: 0,
-      valueUsd: 0
-    };
-  }
-
-  const solBalance =
-    Number(nativeBalance) / 1_000_000_000;
-
-  // Helius peut fournir directement le prix SOL
-  const nativePrice =
-    result.nativeBalance?.price_per_sol;
-
-  const priceFromHelius =
-    Number(nativePrice);
-
-  if (
-    Number.isFinite(priceFromHelius) &&
-    priceFromHelius > 0
-  ) {
-    return {
-      balance: solBalance,
-      priceUsd: priceFromHelius,
-      valueUsd: solBalance * priceFromHelius
-    };
-  }
-
-  // Fallback très sécurisé :
-  // on récupère le prix SOL via l'API Helius DAS
-  // si le champ direct n'est pas présent.
-  try {
-    const url =
-      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-
-    const body = {
-      jsonrpc: "2.0",
-      id: "sol-price",
-      method: "getAsset",
-      params: {
-        id: "So11111111111111111111111111111111111111112"
-      }
-    };
-
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(body)
-    });
-
-    if (response.ok) {
-      const json = await response.json();
-
-      const price =
-        Number(
-          json.result?.token_info?.price_info?.price_per_token
-        );
-
-      if (
-        Number.isFinite(price) &&
-        price > 0
-      ) {
-        return {
-          balance: solBalance,
-          priceUsd: price,
-          valueUsd: solBalance * price
-        };
+async function getWalletAssets() {
+  return await heliusRpc(
+    "getAssetsByOwner",
+    {
+      ownerAddress: WALLET_ADDRESS,
+      page: 1,
+      limit: 1000,
+      displayOptions: {
+        showFungible: true,
+        showNativeBalance: true,
+        showZeroBalance: false
       }
     }
-  } catch (err) {
-    // On ignore le fallback
-  }
-
-  console.warn(
-    "⚠️ Prix SOL indisponible."
   );
-
-  return {
-    balance: solBalance,
-    priceUsd: 0,
-    valueUsd: 0
-  };
 }
 
 // =====================================================
-// PRIX TOKEN HELIUS
+// PRIX SOL VIA WRAPPED SOL
 // =====================================================
 
-function getHeliusTokenPrice(asset) {
-  const priceInfo =
-    asset.token_info?.price_info;
+async function getSolPriceUsd() {
+  const WSOL_MINT =
+    "So11111111111111111111111111111111111111112";
 
-  if (!priceInfo) {
-    return 0;
-  }
+  try {
+    const asset = await heliusRpc(
+      "getAsset",
+      {
+        id: WSOL_MINT,
+        displayOptions: {
+          showFungible: true
+        }
+      }
+    );
 
-  const possiblePrices = [
-    priceInfo.price_per_token,
-    priceInfo.pricePerToken,
-    priceInfo.price_usd,
-    priceInfo.priceUsd
-  ];
-
-  for (const candidate of possiblePrices) {
     const price =
-      Number(candidate);
+      Number(
+        asset?.token_info?.price_info?.price_per_token
+      );
 
     if (
       Number.isFinite(price) &&
@@ -300,13 +207,24 @@ function getHeliusTokenPrice(asset) {
     ) {
       return price;
     }
-  }
 
-  return 0;
+    console.warn(
+      "⚠️ Prix SOL Helius indisponible."
+    );
+
+    return 0;
+  } catch (err) {
+    console.error(
+      "⚠️ Erreur prix SOL :",
+      err.message
+    );
+
+    return 0;
+  }
 }
 
 // =====================================================
-// CALCUL TOTAL
+// CALCUL DU PORTEFEUILLE
 // =====================================================
 
 async function calculateWalletValueUsd() {
@@ -317,7 +235,7 @@ async function calculateWalletValueUsd() {
 
   console.log("");
   console.log(
-    "----------------------------------------"
+    "========================================"
   );
 
   console.log(
@@ -325,26 +243,37 @@ async function calculateWalletValueUsd() {
   );
 
   console.log(
-    "----------------------------------------"
+    "========================================"
   );
 
   // ===================================================
   // SOL
   // ===================================================
 
-  const sol =
-    await getSolPriceUsd(result);
+  const lamports =
+    Number(
+      result?.nativeBalance?.lamports || 0
+    );
 
-  if (sol.balance > 0) {
-    if (sol.priceUsd > 0) {
+  const solBalance =
+    lamports / 1_000_000_000;
+
+  if (solBalance > 0) {
+    const solPrice =
+      await getSolPriceUsd();
+
+    if (solPrice > 0) {
+      const solValue =
+        solBalance * solPrice;
+
       console.log(
-        `SOL : ${sol.balance.toFixed(6)} × $${sol.priceUsd.toFixed(2)} = $${sol.valueUsd.toFixed(2)}`
+        `SOL : ${solBalance.toFixed(6)} × $${solPrice.toFixed(2)} = $${solValue.toFixed(2)}`
       );
 
-      totalUsd += sol.valueUsd;
+      totalUsd += solValue;
     } else {
       console.log(
-        `SOL : ${sol.balance.toFixed(6)} → prix indisponible`
+        `SOL : ${solBalance.toFixed(6)} → prix indisponible`
       );
     }
   }
@@ -354,12 +283,12 @@ async function calculateWalletValueUsd() {
   // ===================================================
 
   const items =
-    Array.isArray(result.items)
+    Array.isArray(result?.items)
       ? result.items
       : [];
 
   console.log(
-    `Assets récupérés : ${items.length}`
+    `Assets Helius : ${items.length}`
   );
 
   for (const asset of items) {
@@ -382,32 +311,8 @@ async function calculateWalletValueUsd() {
         continue;
       }
 
-      const rawBalance =
-        Number(tokenInfo.balance);
-
-      const decimals =
-        Number(tokenInfo.decimals);
-
-      if (
-        !Number.isFinite(rawBalance) ||
-        !Number.isFinite(decimals)
-      ) {
-        continue;
-      }
-
-      const balance =
-        rawBalance /
-        Math.pow(10, decimals);
-
-      if (
-        !Number.isFinite(balance) ||
-        balance <= 0
-      ) {
-        continue;
-      }
-
-      const priceUsd =
-        getHeliusTokenPrice(asset);
+      const priceInfo =
+        tokenInfo.price_info;
 
       const symbol =
         tokenInfo.symbol ||
@@ -415,44 +320,42 @@ async function calculateWalletValueUsd() {
         asset.id?.slice(0, 8) ||
         "TOKEN";
 
-      // -----------------------------------------------
-      // PRIX DISPONIBLE
-      // -----------------------------------------------
+      const decimals =
+        Number(tokenInfo.decimals || 0);
+
+      const rawBalance =
+        Number(tokenInfo.balance || 0);
+
+      const uiBalance =
+        rawBalance /
+        Math.pow(10, decimals);
+
+      // -------------------------------------------------
+      // Helius fournit directement la valeur totale
+      // -------------------------------------------------
+
+      const totalPrice =
+        Number(priceInfo?.total_price);
+
+      const currency =
+        priceInfo?.currency || "";
 
       if (
-        Number.isFinite(priceUsd) &&
-        priceUsd > 0
+        Number.isFinite(totalPrice) &&
+        totalPrice > 0 &&
+        currency === "USDC"
       ) {
-        const valueUsd =
-          balance * priceUsd;
+        console.log(
+          `${symbol} : ${uiBalance.toFixed(6)} → Helius total_price = $${totalPrice.toFixed(2)}`
+        );
 
-        // Sécurité contre les valeurs absurdes
-        // accidentelles de l'API.
-        if (
-          Number.isFinite(valueUsd) &&
-          valueUsd >= 0 &&
-          valueUsd < 100000000
-        ) {
-          console.log(
-            `${symbol} : ${balance.toFixed(6)} × $${priceUsd.toFixed(8)} = $${valueUsd.toFixed(2)}`
-          );
-
-          totalUsd += valueUsd;
-        } else {
-          console.log(
-            `${symbol} : valeur ignorée (valeur anormale)`
-          );
-        }
+        totalUsd += totalPrice;
 
         continue;
       }
 
-      // -----------------------------------------------
-      // PAS DE PRIX
-      // -----------------------------------------------
-
       console.log(
-        `${symbol} : ${balance.toFixed(6)} → prix indisponible, ignoré`
+        `${symbol} : ${uiBalance.toFixed(6)} → prix indisponible, ignoré`
       );
     } catch (err) {
       console.log(
@@ -475,7 +378,7 @@ async function calculateWalletValueUsd() {
   );
 
   console.log(
-    "----------------------------------------"
+    "========================================"
   );
 
   console.log("");
@@ -484,7 +387,7 @@ async function calculateWalletValueUsd() {
 }
 
 // =====================================================
-// SURVEILLANCE
+// VERIFICATION
 // =====================================================
 
 async function checkWallet() {
@@ -520,9 +423,7 @@ async function checkWallet() {
         `⏰ ${new Date().toLocaleString("fr-FR")}`;
 
       const sent =
-        await sendTelegramMessage(
-          message
-        );
+        await sendTelegramMessage(message);
 
       if (sent) {
         state.alertSent = true;
@@ -566,7 +467,7 @@ console.log(
 );
 
 console.log(
-  "👛 WALLET MONITOR V2"
+  "👛 WALLET MONITOR V3"
 );
 
 console.log(
@@ -586,7 +487,7 @@ console.log(
 );
 
 console.log(
-  "Source prix tokens : Helius"
+  "Valorisation : Helius total_price"
 );
 
 console.log(
@@ -597,10 +498,8 @@ console.log(
   "========================================"
 );
 
-// Première vérification
 checkWallet();
 
-// Vérifications périodiques
 setInterval(
   checkWallet,
   CHECK_INTERVAL_MS
