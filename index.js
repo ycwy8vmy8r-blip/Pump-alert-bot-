@@ -1,5 +1,4 @@
 const { Telegraf } = require("telegraf");
-const WebSocket = require("ws");
 const fs = require("fs");
 const path = require("path");
 
@@ -9,7 +8,6 @@ const path = require("path");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
-const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 
 if (!BOT_TOKEN || !CHAT_ID) {
   console.error("❌ BOT_TOKEN ou CHAT_ID manquant.");
@@ -91,8 +89,6 @@ let healthyConfirmations = 0;
 let marketHistory = [];
 let accelerationWarningActive = false;
 let accelerationAlertSent = false;
-let heliusWs = null;
-let heliusConnected = false;
 
 // ============================================================
 // OUTILS
@@ -624,11 +620,7 @@ ${acceleration.level}
 
 🛡️ Entrée confirmée :
 
-${healthyConfirmations}/${REQUIRED_HEALTHY_CONFIRMATIONS}
-
-⛓️ Helius :
-
-${heliusConnected ? "🟢 connecté" : "⚪ non connecté"}`
+${healthyConfirmations}/${REQUIRED_HEALTHY_CONFIRMATIONS}`
   );
 }
 
@@ -1362,88 +1354,6 @@ async function tick() {
 }
 
 // ============================================================
-// HELIUS
-// ============================================================
-
-function connectHelius() {
-  if (!HELIUS_API_KEY) {
-    console.log(
-      "⚠️ HELIUS_API_KEY absente."
-    );
-
-    return;
-  }
-
-  try {
-    const url =
-      `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-
-    heliusWs = new WebSocket(url);
-
-    heliusWs.on("open", () => {
-      heliusConnected = true;
-
-      console.log(
-        "⛓️ Helius WSS connecté."
-      );
-
-      try {
-        heliusWs.send(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            id: 1,
-            method: "logsSubscribe",
-            params: [
-              {
-                mentions: [
-                  "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
-                ]
-              },
-              {
-                commitment: "processed"
-              }
-            ]
-          })
-        );
-      } catch (error) {
-        console.error(
-          "⚠️ Erreur abonnement Helius:",
-          error.message
-        );
-      }
-    });
-
-    heliusWs.on("close", () => {
-      heliusConnected = false;
-
-      console.log(
-        "⚠️ Helius WSS fermé."
-      );
-    });
-
-    heliusWs.on("error", (error) => {
-      heliusConnected = false;
-
-      console.error(
-        "⚠️ Helius WSS:",
-        error.message
-      );
-    });
-
-    heliusWs.on("message", () => {
-      // Helius sert ici de source on-chain
-      // de confirmation de présence d'activité.
-    });
-
-  } catch (error) {
-    console.error(
-      "⚠️ Impossible de connecter Helius:",
-      error.message
-    );
-  }
-}
-
-// ============================================================
 // SUMMARY
 // ============================================================
 
@@ -1464,7 +1374,6 @@ async function saveSummary(reason) {
     sessionProfit,
     positionOpen:
       !!position,
-    heliusConnected,
     marketPoints:
       marketHistory.length
   };
@@ -1568,8 +1477,6 @@ DIRECTEMENT DANS TELEGRAM
 Aucune transaction réelle.`
   );
 
-  connectHelius();
-
   pollTimer = setInterval(
     () => {
       tick().catch((error) => {
@@ -1603,16 +1510,6 @@ async function stopRadar(sendMessage = true) {
     clearInterval(pollTimer);
     pollTimer = null;
   }
-
-  if (heliusWs) {
-    try {
-      heliusWs.close();
-    } catch {}
-  }
-
-  heliusWs = null;
-
-  heliusConnected = false;
 
   await saveSummary("STOP");
 
@@ -1734,11 +1631,7 @@ ${accelerationWarningActive ? "⚠️ ACTIVE" : "🟢 normale"}
 
 🛡️ Confirmations :
 
-${healthyConfirmations}/${REQUIRED_HEALTHY_CONFIRMATIONS}
-
-⛓️ Helius :
-
-${heliusConnected ? "🟢 connecté" : "⚪ déconnecté"}`
+${healthyConfirmations}/${REQUIRED_HEALTHY_CONFIRMATIONS}`
   );
 });
 
