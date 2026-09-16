@@ -4,9 +4,9 @@ const https = require("https");
 // CONFIGURATION
 // ========================================
 
-const WALLET_ADDRESS = "Fg8bPb4BEphR8AZNup55BWaY9EuT5Mu3SYpAUpyhqxJH";
+const WALLET_ADDRESS = "7ZmUF8EcQ5tqxBfG3qW45gtYVVMCpN6dFZu43BLUVLC5";
 
-const THRESHOLD_USD = 70000;
+const THRESHOLD_USD = 200000;
 
 const CHECK_INTERVAL_MS = 10000;
 
