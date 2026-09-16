@@ -12,7 +12,7 @@ const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const WALLET_ADDRESS =
   "D6YTMYdeTpKkaDf7RkaxGZDehmetmLcrXmj4pKopVwHE";
 
-const THRESHOLD_USD = 145000;
+const THRESHOLD_USD = 150000;
 
 const CHECK_INTERVAL_MS = 10000;
 
