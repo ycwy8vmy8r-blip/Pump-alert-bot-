@@ -1329,7 +1329,25 @@ async function monitoringLoop() {
     );
   }
 }
+function formatNumber(value) {
+  if (!Number.isFinite(value)) {
+    return "N/A";
+  }
 
+  if (value < 0.000001) {
+    return value.toExponential(4);
+  }
+
+  if (value < 0.01) {
+    return value.toFixed(8);
+  }
+
+  if (value < 1) {
+    return value.toFixed(6);
+  }
+
+  return value.toFixed(4);
+}
 // ============================================================
 // INITIALISATION
 // ============================================================
