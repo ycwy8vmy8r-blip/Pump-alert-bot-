@@ -7,7 +7,7 @@ const CHAT_ID = process.env.CHAT_ID;
 
 const MINT =
   process.env.CRASH_MINT ||
-  "GutF7Rz8tutEi53gXA5ufNZTcJs7ed32XBbHHQ6ppump";
+  "GE4EfPtjfYfA8AmFsfJ6GBE7XAtxHSWsfwmaiQQLh2YS"
 
 const CHECK_INTERVAL_MS = 5000;
 
