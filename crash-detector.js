@@ -11,7 +11,7 @@ const CHAT_ID = process.env.CHAT_ID;
 
 // Token surveillé
 const MINT =
-  "GE4EfPtjfYfA8AmFsfJ6GBE7XAtxHSWsfwmaiQQLh2YS";
+  "AEUYZvD6s8WwE9EdtTBnw627AxNDxhMvmhr4PLmW41Km";
 
 // PumpSwap / Pump AMM
 const PUMPSWAP_PROGRAM_ID =
