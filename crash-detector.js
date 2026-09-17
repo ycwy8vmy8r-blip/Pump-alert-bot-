@@ -1,6 +1,6 @@
+const WebSocket = require("ws");
 const fs = require("fs");
 const path = require("path");
-const WebSocket = require("ws");
 
 // ============================================================
 // CONFIGURATION
@@ -9,46 +9,57 @@ const WebSocket = require("ws");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 
-// TOKEN À SURVEILLER
-const MINT =
-  "GE4EfPtjfYfA8AmFsfJ6GBE7XAtxHSWsfwmaiQQLh2YS";
+// Token surveillé
+const MINT = "GE4EfPtjfYfA8AmFsfJ6GBE7XAtxHSWsfwmaiQQLh2YS";
 
-const SOL_MINT =
-  "So11111111111111111111111111111111111111112";
-
+// PumpSwap
 const PUMPSWAP_PROGRAM_ID =
   "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
-const RPC_HTTP =
-  "https://api.mainnet-beta.solana.com";
+// SOL
+const SOL_MINT = "So11111111111111111111111111111111111111112";
 
-const RPC_WS =
-  "wss://api.mainnet-beta.solana.com/";
+// USDC
+const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
-const DEX_URL =
+// RPC publics Solana
+const HTTP_RPC = "https://api.mainnet-beta.solana.com";
+const WS_RPC = "wss://api.mainnet-beta.solana.com/";
+
+// DexScreener
+const DEX_API =
   `https://api.dexscreener.com/token-pairs/v1/solana/${MINT}`;
 
-const CHECK_INTERVAL_MS = 1000;
-const ALERT_COOLDOWN_MS = 30000;
+// Intervalle de surveillance
+const MONITOR_INTERVAL_MS = 5000;
+
+// Minimum entre deux lectures RPC des vaults
+const VAULT_REFRESH_MS = 5000;
+
+// En cas de 429, attendre avant nouvelle requête
+const RPC_BACKOFF_MS = 15000;
+
+// Cooldown Telegram
+const TELEGRAM_COOLDOWN_MS = 30000;
 
 // ============================================================
-// SEUILS
+// SEUILS RADAR
 // ============================================================
 
-const WATCH_LIQUIDITY_5S = -5;
-const WATCH_LIQUIDITY_10S = -10;
+const WATCH_LIQ_5S = -5;
+const WATCH_LIQ_10S = -10;
 const WATCH_PRICE_5S = -5;
 
-const DANGER_LIQUIDITY_5S = -10;
-const DANGER_LIQUIDITY_10S = -20;
+const DANGER_LIQ_5S = -10;
+const DANGER_LIQ_10S = -20;
 const DANGER_PRICE_5S = -10;
 
-const CRITICAL_LIQUIDITY_5S = -20;
-const CRITICAL_LIQUIDITY_10S = -40;
+const CRITICAL_LIQ_5S = -20;
+const CRITICAL_LIQ_10S = -40;
 const CRITICAL_PRICE_5S = -20;
 
 // ============================================================
-// FICHIERS
+// DATA
 // ============================================================
 
 const DATA_DIR = fs.existsSync("/data")
@@ -56,16 +67,13 @@ const DATA_DIR = fs.existsSync("/data")
   : path.join(__dirname, "data");
 
 if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, {
-    recursive: true
-  });
+  fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-const LOG_FILE =
-  path.join(DATA_DIR, "crash_radar.jsonl");
+const LOG_FILE = path.join(DATA_DIR, "crash_radar.jsonl");
 
 // ============================================================
-// VARIABLES
+// ETAT
 // ============================================================
 
 let poolAddress = null;
@@ -73,164 +81,102 @@ let poolAddress = null;
 let tokenVault = null;
 let solVault = null;
 
-let tokenDecimals = 0;
+let tokenDecimals = 6;
 
 let currentPriceUsd = null;
 let currentLiquidityUsd = null;
+let currentSolPriceUsd = null;
 
-let currentLevel = "NORMAL";
-
-let lastAlertTime = 0;
+let lastVaultRefresh = 0;
+let rpcBackoffUntil = 0;
 
 let history = [];
 
+let currentLevel = "NORMAL";
+let lastTelegramTime = 0;
+
 let ws = null;
+let reconnectTimer = null;
+
+let monitoring = false;
 
 // ============================================================
-// BASE58
+// UTILITAIRES
 // ============================================================
 
-const BASE58_ALPHABET =
-  "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-function base58Encode(buffer) {
-  let num = 0n;
-
-  for (const byte of buffer) {
-    num =
-      (num << 8n) +
-      BigInt(byte);
+function formatNumber(value) {
+  if (!Number.isFinite(value)) {
+    return "N/A";
   }
 
-  let result = "";
-
-  while (num > 0n) {
-    const remainder =
-      Number(num % 58n);
-
-    result =
-      BASE58_ALPHABET[remainder] +
-      result;
-
-    num =
-      num / 58n;
+  if (Math.abs(value) < 0.000001) {
+    return value.toExponential(4);
   }
 
-  for (const byte of buffer) {
-    if (byte === 0) {
-      result = "1" + result;
-    } else {
-      break;
-    }
+  if (Math.abs(value) < 0.01) {
+    return value.toFixed(8);
   }
 
-  return result || "1";
+  if (Math.abs(value) < 1) {
+    return value.toFixed(6);
+  }
+
+  return value.toFixed(4);
 }
 
-// ============================================================
-// PUBKEY
-// ============================================================
-
-function readPubkey(buffer, offset) {
-  const bytes =
-    buffer.subarray(
-      offset,
-      offset + 32
-    );
-
-  if (bytes.length !== 32) {
-    throw new Error(
-      `Pubkey invalide à l'offset ${offset}`
-    );
+function formatUsd(value) {
+  if (!Number.isFinite(value)) {
+    return "N/A";
   }
 
-  return base58Encode(bytes);
+  if (value >= 1000000) {
+    return `$${(value / 1000000).toFixed(2)}M`;
+  }
+
+  if (value >= 1000) {
+    return `$${(value / 1000).toFixed(2)}k`;
+  }
+
+  return `$${value.toFixed(2)}`;
 }
 
-// ============================================================
-// RPC
-// ============================================================
+function now() {
+  return Date.now();
+}
 
-async function rpcRequest(
-  method,
-  params = []
-) {
-  const response =
-    await fetch(
-      RPC_HTTP,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type":
-            "application/json"
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method,
-          params
-        })
-      }
-    );
-
-  if (!response.ok) {
-    throw new Error(
-      `RPC HTTP ${response.status}`
-    );
-  }
-
-  const json =
-    await response.json();
-
-  if (json.error) {
-    throw new Error(
-      `RPC ${json.error.message}`
-    );
-  }
-
-  return json.result;
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // ============================================================
 // TELEGRAM
 // ============================================================
 
-async function sendTelegram(
-  message
-) {
+async function sendTelegram(message) {
   if (!BOT_TOKEN || !CHAT_ID) {
-    console.log(
-      "⚠️ BOT_TOKEN ou CHAT_ID absent."
-    );
-
+    console.log("⚠️ BOT_TOKEN ou CHAT_ID absent.");
     return;
   }
 
   try {
-    const response =
-      await fetch(
-        `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type":
-              "application/json"
-          },
-          body: JSON.stringify({
-            chat_id: CHAT_ID,
-            text: message
-          })
-        }
-      );
+    const url =
+      `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        chat_id: CHAT_ID,
+        text: message,
+        disable_web_page_preview: true
+      })
+    });
 
     if (!response.ok) {
       console.log(
-        "⚠️ Telegram HTTP",
-        response.status
-      );
-    } else {
-      console.log(
-        "📨 Alerte Telegram envoyée."
+        `⚠️ Telegram HTTP ${response.status}`
       );
     }
   } catch (error) {
@@ -242,12 +188,121 @@ async function sendTelegram(
 }
 
 // ============================================================
+// RPC SOLANA
+// ============================================================
+
+async function rpcRequest(method, params = []) {
+  if (Date.now() < rpcBackoffUntil) {
+    throw new Error("RPC en cooldown après HTTP 429");
+  }
+
+  try {
+    const response = await fetch(HTTP_RPC, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: Date.now(),
+        method,
+        params
+      })
+    });
+
+    if (response.status === 429) {
+      rpcBackoffUntil = Date.now() + RPC_BACKOFF_MS;
+
+      throw new Error("RPC HTTP 429");
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        `RPC HTTP ${response.status}`
+      );
+    }
+
+    const data = await response.json();
+
+    if (data.error) {
+      throw new Error(
+        data.error.message || "Erreur RPC"
+      );
+    }
+
+    return data.result;
+  } catch (error) {
+    if (error.message.includes("429")) {
+      rpcBackoffUntil = Date.now() + RPC_BACKOFF_MS;
+    }
+
+    throw error;
+  }
+}
+
+// ============================================================
+// LECTURE SOLANA VAULT
+// ============================================================
+
+async function getTokenAccountBalance(address) {
+  const result = await rpcRequest(
+    "getTokenAccountBalance",
+    [address]
+  );
+
+  if (
+    !result ||
+    !result.value
+  ) {
+    throw new Error(
+      `Solde introuvable pour ${address}`
+    );
+  }
+
+  const amount = Number(result.value.uiAmount);
+
+  if (!Number.isFinite(amount)) {
+    throw new Error(
+      `Solde invalide pour ${address}`
+    );
+  }
+
+  return amount;
+}
+
+async function getSolBalance(address) {
+  const result = await rpcRequest(
+    "getBalance",
+    [
+      address,
+      {
+        commitment: "processed"
+      }
+    ]
+  );
+
+  if (
+    !result ||
+    !Number.isFinite(result.value)
+  ) {
+    throw new Error(
+      `Solde SOL introuvable pour ${address}`
+    );
+  }
+
+  return result.value / 1e9;
+}
+
+// ============================================================
 // DEXSCREENER
 // ============================================================
 
-async function getDexPair() {
-  const response =
-    await fetch(DexURL());
+async function getDexData() {
+  const response = await fetch(DEX_API, {
+    headers: {
+      "Accept": "application/json"
+    }
+  });
 
   if (!response.ok) {
     throw new Error(
@@ -255,67 +310,200 @@ async function getDexPair() {
     );
   }
 
-  const pairs =
-    await response.json();
+  const data = await response.json();
 
-  if (
-    !Array.isArray(pairs) ||
-    pairs.length === 0
-  ) {
+  if (!Array.isArray(data)) {
     throw new Error(
-      "Aucune paire trouvée sur DexScreener."
+      "Réponse DexScreener invalide"
     );
   }
 
-  const pumpPairs =
-    pairs.filter(
-      pair =>
-        String(
-          pair.dexId || ""
-        ).toLowerCase() ===
-        "pumpswap"
-    );
-
-  if (
-    pumpPairs.length === 0
-  ) {
-    throw new Error(
-      "Aucune paire PumpSwap trouvée."
-    );
-  }
-
-  pumpPairs.sort(
-    (a, b) =>
-      Number(
-        b.liquidity?.usd || 0
-      ) -
-      Number(
-        a.liquidity?.usd || 0
-      )
+  const pumpswapPairs = data.filter(
+    pair =>
+      pair &&
+      pair.dexId === "pumpswap"
   );
 
-  return pumpPairs[0];
-}
+  if (pumpswapPairs.length === 0) {
+    throw new Error(
+      "Aucune paire PumpSwap trouvée"
+    );
+  }
 
-function DexURL() {
-  return DEX_URL;
+  pumpswapPairs.sort((a, b) => {
+    const liqA =
+      Number(a?.liquidity?.usd) || 0;
+
+    const liqB =
+      Number(b?.liquidity?.usd) || 0;
+
+    return liqB - liqA;
+  });
+
+  const pair = pumpswapPairs[0];
+
+  const priceUsd =
+    Number(pair.priceUsd);
+
+  const liquidityUsd =
+    Number(pair?.liquidity?.usd);
+
+  if (!Number.isFinite(priceUsd)) {
+    throw new Error(
+      "Prix USD invalide"
+    );
+  }
+
+  if (!Number.isFinite(liquidityUsd)) {
+    throw new Error(
+      "Liquidité USD invalide"
+    );
+  }
+
+  return {
+    pair,
+    priceUsd,
+    liquidityUsd
+  };
 }
 
 // ============================================================
-// TROUVER LE POOL
+// SOL PRICE
+// ============================================================
+
+async function getSolPriceUsd() {
+  try {
+    const url =
+      "https://api.dexscreener.com/token-pairs/v1/solana/" +
+      SOL_MINT;
+
+    const response = await fetch(url, {
+      headers: {
+        "Accept": "application/json"
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `DexScreener SOL HTTP ${response.status}`
+      );
+    }
+
+    const data = await response.json();
+
+    if (!Array.isArray(data)) {
+      throw new Error(
+        "Réponse SOL DexScreener invalide"
+      );
+    }
+
+    const stableMints = new Set([
+      USDC_MINT,
+      "Es9vMFrzaCERmJfrF4H2FYD4mHfFqZ2eXfWm6gkT9Q",
+      "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    ]);
+
+    const candidates = data.filter(pair => {
+      if (!pair) {
+        return false;
+      }
+
+      const base =
+        pair.baseToken?.address;
+
+      const quote =
+        pair.quoteToken?.address;
+
+      return (
+        (base === SOL_MINT &&
+          stableMints.has(quote)) ||
+        (quote === SOL_MINT &&
+          stableMints.has(base))
+      );
+    });
+
+    candidates.sort((a, b) => {
+      const liqA =
+        Number(a?.liquidity?.usd) || 0;
+
+      const liqB =
+        Number(b?.liquidity?.usd) || 0;
+
+      return liqB - liqA;
+    });
+
+    if (candidates.length > 0) {
+      const pair = candidates[0];
+
+      const price =
+        Number(pair.priceUsd);
+
+      if (Number.isFinite(price)) {
+        return price;
+      }
+    }
+
+    // Fallback : chercher une paire SOL très liquide
+    // même si le stablecoin n'est pas directement identifié.
+    const fallback = data
+      .filter(pair => {
+        if (!pair) {
+          return false;
+        }
+
+        return (
+          pair.baseToken?.address === SOL_MINT ||
+          pair.quoteToken?.address === SOL_MINT
+        );
+      })
+      .sort((a, b) => {
+        const liqA =
+          Number(a?.liquidity?.usd) || 0;
+
+        const liqB =
+          Number(b?.liquidity?.usd) || 0;
+
+        return liqB - liqA;
+      });
+
+    if (fallback.length > 0) {
+      const price =
+        Number(fallback[0].priceUsd);
+
+      if (Number.isFinite(price)) {
+        return price;
+      }
+    }
+
+    throw new Error(
+      "Impossible de trouver le prix SOL/USD"
+    );
+  } catch (error) {
+    console.log(
+      "⚠️ Prix SOL indisponible :",
+      error.message
+    );
+
+    return currentSolPriceUsd;
+  }
+}
+
+// ============================================================
+// RECHERCHE DU POOL PUMPSWAP
 // ============================================================
 
 async function findPool() {
-  console.log("");
-  console.log(
-    "🔎 Recherche du pool PumpSwap..."
-  );
+  const dexData = await getDexData();
 
-  const pair =
-    await getDexPair();
+  const pair = dexData.pair;
 
-  poolAddress =
-    pair.pairAddress;
+  if (!pair.pairAddress) {
+    throw new Error(
+      "Adresse du pool absente"
+    );
+  }
+
+  poolAddress = pair.pairAddress;
 
   const baseMint =
     pair.baseToken?.address;
@@ -324,18 +512,15 @@ async function findPool() {
     pair.quoteToken?.address;
 
   console.log(
-    "Pool :",
-    poolAddress
+    `Base mint  : ${baseMint}`
   );
 
   console.log(
-    "Base mint  :",
-    baseMint
+    `Quote mint : ${quoteMint}`
   );
 
   console.log(
-    "Quote mint :",
-    quoteMint
+    `Pool       : ${poolAddress}`
   );
 
   if (
@@ -343,7 +528,7 @@ async function findPool() {
     quoteMint !== MINT
   ) {
     throw new Error(
-      `Le token ${MINT} n'est pas présent dans cette paire.`
+      "Le token surveillé ne correspond pas au pool"
     );
   }
 
@@ -352,48 +537,127 @@ async function findPool() {
     quoteMint === SOL_MINT
   ) {
     console.log(
-      "🔄 Orientation DexScreener : TOKEN → SOL"
+      "🔄 Orientation détectée : TOKEN → SOL"
     );
   } else if (
     baseMint === SOL_MINT &&
     quoteMint === MINT
   ) {
     console.log(
-      "🔄 Orientation DexScreener : SOL → TOKEN"
-    );
-  } else {
-    console.log(
-      "⚠️ Le pool n'est pas directement TOKEN/SOL."
+      "🔄 Orientation détectée : SOL → TOKEN"
     );
   }
+
+  return {
+    poolAddress,
+    baseMint,
+    quoteMint
+  };
 }
 
 // ============================================================
-// DÉCODER LE POOL
+// DECODAGE DU POOL PUMPSWAP
 // ============================================================
 
-async function decodePool() {
-  console.log("");
-  console.log(
-    "🔎 Lecture du compte pool..."
-  );
-
-  const result =
-    await rpcRequest(
-      "getAccountInfo",
-      [
-        poolAddress,
-        {
-          encoding: "base64"
-        }
-      ]
-    );
-
+function decodePublicKey(buffer, offset) {
   if (
-    !result?.value?.data
+    !buffer ||
+    offset < 0 ||
+    offset + 32 > buffer.length
   ) {
     throw new Error(
-      "Impossible de lire le compte pool."
+      `Offset PublicKey invalide : ${offset}`
+    );
+  }
+
+  return bs58Encode(
+    buffer.subarray(
+      offset,
+      offset + 32
+    )
+  );
+}
+
+// Base58 minimal
+const ALPHABET =
+  "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+function bs58Encode(buffer) {
+  if (!buffer || buffer.length === 0) {
+    return "";
+  }
+
+  const digits = [0];
+
+  for (const byte of buffer) {
+    let carry = byte;
+
+    for (
+      let i = 0;
+      i < digits.length;
+      i++
+    ) {
+      const value =
+        digits[i] * 256 + carry;
+
+      digits[i] =
+        value % 58;
+
+      carry =
+        Math.floor(value / 58);
+    }
+
+    while (carry > 0) {
+      digits.push(
+        carry % 58
+      );
+
+      carry =
+        Math.floor(carry / 58);
+    }
+  }
+
+  let result = "";
+
+  for (
+    let i = 0;
+    i < buffer.length &&
+    buffer[i] === 0;
+    i++
+  ) {
+    result += "1";
+  }
+
+  for (
+    let i = digits.length - 1;
+    i >= 0;
+    i--
+  ) {
+    result += ALPHABET[digits[i]];
+  }
+
+  return result;
+}
+
+async function decodePool() {
+  const result = await rpcRequest(
+    "getAccountInfo",
+    [
+      poolAddress,
+      {
+        encoding: "base64",
+        commitment: "processed"
+      }
+    ]
+  );
+
+  if (
+    !result ||
+    !result.value ||
+    !result.value.data
+  ) {
+    throw new Error(
+      "Compte pool introuvable"
     );
   }
 
@@ -407,430 +671,242 @@ async function decodePool() {
     );
 
   console.log(
-    "Taille du compte pool :",
-    buffer.length,
-    "bytes"
+    `Taille du compte pool : ${buffer.length} bytes`
   );
 
-  if (
-    buffer.length < 203
-  ) {
+  if (buffer.length < 203) {
     throw new Error(
-      `Compte pool trop petit : ${buffer.length} bytes`
+      "Compte pool trop petit"
     );
   }
 
-  // Layout PumpSwap
+  // Layout PumpSwap utilisé par le radar
   const baseMint =
-    readPubkey(buffer, 43);
+    decodePublicKey(buffer, 43);
 
   const quoteMint =
-    readPubkey(buffer, 75);
+    decodePublicKey(buffer, 75);
 
   const baseVault =
-    readPubkey(buffer, 139);
+    decodePublicKey(buffer, 139);
 
   const quoteVault =
-    readPubkey(buffer, 171);
+    decodePublicKey(buffer, 171);
 
-  console.log("");
+  console.log("✅ Pool décodé");
+
   console.log(
-    "✅ Pool décodé"
+    `Base mint  : ${baseMint}`
   );
 
   console.log(
-    "Base mint  :",
-    baseMint
+    `Quote mint : ${quoteMint}`
   );
 
   console.log(
-    "Quote mint :",
-    quoteMint
+    `Base vault : ${baseVault}`
   );
 
   console.log(
-    "Base vault :",
-    baseVault
+    `Quote vault: ${quoteVault}`
   );
-
-  console.log(
-    "Quote vault:",
-    quoteVault
-  );
-
-  // ==========================================================
-  // IDENTIFICATION AUTOMATIQUE
-  // ==========================================================
 
   if (
-    baseMint === MINT
+    baseMint === MINT &&
+    quoteMint === SOL_MINT
   ) {
-    tokenVault =
-      baseVault;
+    tokenVault = baseVault;
+    solVault = quoteVault;
 
-    if (
-      quoteMint === SOL_MINT
-    ) {
-      solVault =
-        quoteVault;
-    } else {
-      throw new Error(
-        "Le quote mint du pool n'est pas SOL."
-      );
-    }
-
-    console.log("");
     console.log(
       "🟢 Token surveillé = BASE"
     );
-  }
-
-  else if (
+  } else if (
+    baseMint === SOL_MINT &&
     quoteMint === MINT
   ) {
-    tokenVault =
-      quoteVault;
+    tokenVault = quoteVault;
+    solVault = baseVault;
 
-    if (
-      baseMint === SOL_MINT
-    ) {
-      solVault =
-        baseVault;
-    } else {
-      throw new Error(
-        "Le base mint du pool n'est pas SOL."
-      );
-    }
-
-    console.log("");
     console.log(
       "🟢 Token surveillé = QUOTE"
     );
-  }
-
-  else {
+  } else {
     throw new Error(
-      "Le token surveillé n'est pas présent dans le pool."
+      "Impossible de déterminer les vaults token/SOL"
     );
   }
 
   console.log(
-    "Token vault :",
-    tokenVault
+    `Token vault : ${tokenVault}`
   );
 
   console.log(
-    "SOL vault   :",
-    solVault
+    `SOL vault   : ${solVault}`
   );
 }
 
 // ============================================================
-// DÉCIMALES
+// DECIMALES TOKEN
 // ============================================================
 
 async function getTokenDecimals() {
-  const result =
-    await rpcRequest(
-      "getTokenSupply",
-      [MINT]
+  try {
+    const result = await rpcRequest(
+      "getTokenAccountBalance",
+      [
+        tokenVault,
+        {
+          commitment: "processed"
+        }
+      ]
     );
 
-  if (
-    !result?.value
-  ) {
-    throw new Error(
-      "Impossible de récupérer les décimales du token."
+    const decimals =
+      Number(
+        result?.value?.decimals
+      );
+
+    if (
+      Number.isFinite(decimals)
+    ) {
+      tokenDecimals = decimals;
+    }
+  } catch (error) {
+    console.log(
+      "⚠️ Impossible de lire les décimales :",
+      error.message
     );
+
+    tokenDecimals = 6;
   }
-
-  tokenDecimals =
-    result.value.decimals;
 
   console.log(
-    "Décimales token :",
-    tokenDecimals
+    `Décimales token : ${tokenDecimals}`
   );
 }
 
 // ============================================================
-// SOL/USD
+// LECTURE DES RESERVES
 // ============================================================
 
-async function getSolPriceUsd() {
-  // ----------------------------------------------------------
-  // On utilise une paire SOL/USDC directe.
-  // L'adresse USDC est connue et stable sur Solana.
-  // ----------------------------------------------------------
+async function refreshVaults() {
+  const timestamp = Date.now();
 
-  const USDC =
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-
-  const url =
-    `https://api.dexscreener.com/latest/dex/tokens/${SOL_MINT}`;
-
-  const response =
-    await fetch(url);
-
-  if (!response.ok) {
-    throw new Error(
-      `Prix SOL indisponible : HTTP ${response.status}`
-    );
+  // Protection supplémentaire contre les appels trop rapprochés
+  if (
+    timestamp - lastVaultRefresh <
+    VAULT_REFRESH_MS
+  ) {
+    return;
   }
 
-  const data =
-    await response.json();
+  // Si le RPC est en cooldown après un 429,
+  // on ne fait absolument aucune requête.
+  if (
+    timestamp < rpcBackoffUntil
+  ) {
+    return;
+  }
 
-  const pairs =
-    Array.isArray(data.pairs)
-      ? data.pairs
-      : [];
+  lastVaultRefresh = timestamp;
 
-  const solUsdPairs =
-    pairs.filter(pair => {
-      const base =
-        pair.baseToken?.address;
+  try {
+    const [
+      tokenAmount,
+      solAmount
+    ] = await Promise.all([
+      getTokenAccountBalance(tokenVault),
+      getSolBalance(solVault)
+    ]);
 
-      const quote =
-        pair.quoteToken?.address;
+    if (
+      !Number.isFinite(tokenAmount) ||
+      !Number.isFinite(solAmount)
+    ) {
+      return;
+    }
 
-      return (
-        base === SOL_MINT &&
-        quote === USDC
+    return {
+      tokenAmount,
+      solAmount
+    };
+  } catch (error) {
+    if (
+      error.message.includes("429")
+    ) {
+      console.log(
+        `⏳ RPC limité, pause ${RPC_BACKOFF_MS / 1000}s`
       );
-    });
+    } else {
+      console.log(
+        "⚠️ Erreur lecture vaults :",
+        error.message
+      );
+    }
 
-  if (
-    solUsdPairs.length === 0
-  ) {
-    throw new Error(
-      "Impossible de trouver une paire SOL/USDC."
-    );
+    return null;
   }
-
-  solUsdPairs.sort(
-    (a, b) =>
-      Number(
-        b.liquidity?.usd || 0
-      ) -
-      Number(
-        a.liquidity?.usd || 0
-      )
-  );
-
-  const price =
-    Number(
-      solUsdPairs[0].priceUsd
-    );
-
-  if (
-    !Number.isFinite(price) ||
-    price <= 0
-  ) {
-    throw new Error(
-      "Prix SOL invalide."
-    );
-  }
-
-  return price;
-}
-
-// ============================================================
-// VAULT BALANCE
-// ============================================================
-
-async function getVaultBalance(
-  vault
-) {
-  const result =
-    await rpcRequest(
-      "getTokenAccountBalance",
-      [vault]
-    );
-
-  if (
-    !result?.value
-  ) {
-    throw new Error(
-      `Impossible de lire le vault ${vault}`
-    );
-  }
-
-  return {
-    amount:
-      Number(
-        result.value.amount
-      ),
-    decimals:
-      result.value.decimals
-  };
-}
-
-// ============================================================
-// RÉSERVES
-// ============================================================
-
-async function getReserves() {
-  const token =
-    await getVaultBalance(
-      tokenVault
-    );
-
-  const sol =
-    await getVaultBalance(
-      solVault
-    );
-
-  const tokenAmount =
-    token.amount /
-    Math.pow(
-      10,
-      token.decimals
-    );
-
-  const solAmount =
-    sol.amount /
-    Math.pow(
-      10,
-      sol.decimals
-    );
-
-  return {
-    tokenAmount,
-    solAmount
-  };
-}
-
-// ============================================================
-// DONNÉES MARCHÉ
-// ============================================================
-
-async function calculateMarketData() {
-  const reserves =
-    await getReserves();
-
-  const solPriceUsd =
-    await getSolPriceUsd();
-
-  if (
-    reserves.tokenAmount <= 0 ||
-    reserves.solAmount <= 0
-  ) {
-    throw new Error(
-      "Réserves invalides."
-    );
-  }
-
-  // Prix du token en SOL
-  const tokenPriceSol =
-    reserves.solAmount /
-    reserves.tokenAmount;
-
-  // Prix USD
-  const tokenPriceUsd =
-    tokenPriceSol *
-    solPriceUsd;
-
-  // Liquidité approximative
-  const liquidityUsd =
-    reserves.solAmount *
-    solPriceUsd *
-    2;
-
-  return {
-    tokenAmount:
-      reserves.tokenAmount,
-
-    solAmount:
-      reserves.solAmount,
-
-    solPriceUsd,
-
-    tokenPriceSol,
-
-    tokenPriceUsd,
-
-    liquidityUsd
-  };
 }
 
 // ============================================================
 // HISTORIQUE
 // ============================================================
 
-function addHistory(data) {
-  const now =
-    Date.now();
+function addHistory(price, liquidity) {
+  const timestamp = Date.now();
 
   history.push({
-    timestamp: now,
-
-    price:
-      data.tokenPriceUsd,
-
-    liquidity:
-      data.liquidityUsd
+    timestamp,
+    price,
+    liquidity
   });
 
+  // Garder seulement les 2 dernières minutes
   const cutoff =
-    now - 60000;
+    timestamp - 120000;
 
   history =
     history.filter(
       item =>
-        item.timestamp >=
-        cutoff
+        item.timestamp >= cutoff
     );
 }
 
-// ============================================================
-// VALEUR HISTORIQUE
-// ============================================================
-
-function findPrevious(
-  seconds
-) {
+function findHistorical(seconds) {
   const target =
-    Date.now() -
-    seconds * 1000;
+    Date.now() - seconds * 1000;
 
-  let closest = null;
+  if (history.length === 0) {
+    return null;
+  }
 
-  let smallest =
-    Infinity;
+  let closest =
+    history[0];
 
-  for (
-    const item of history
-  ) {
-    const difference =
+  let smallestDiff =
+    Math.abs(
+      closest.timestamp -
+      target
+    );
+
+  for (const item of history) {
+    const diff =
       Math.abs(
         item.timestamp -
-          target
+        target
       );
 
-    if (
-      difference <
-      smallest
-    ) {
-      smallest =
-        difference;
-
-      closest =
-        item;
+    if (diff < smallestDiff) {
+      smallestDiff = diff;
+      closest = item;
     }
   }
 
   return closest;
 }
 
-// ============================================================
-// POURCENTAGE
-// ============================================================
-
-function percentChange(
-  current,
-  previous
-) {
+function percentChange(current, previous) {
   if (
     !Number.isFinite(current) ||
     !Number.isFinite(previous) ||
@@ -847,380 +923,422 @@ function percentChange(
 }
 
 // ============================================================
-// ANALYSE
+// NIVEAU RADAR
 // ============================================================
 
-function analyzeRadar() {
-  const p5 =
-    findPrevious(5);
+function calculateLevel() {
+  const h5 =
+    findHistorical(5);
 
-  const p10 =
-    findPrevious(10);
+  const h10 =
+    findHistorical(10);
 
   const price5 =
-    p5
+    h5
       ? percentChange(
           currentPriceUsd,
-          p5.price
+          h5.price
         )
       : null;
 
   const price10 =
-    p10
+    h10
       ? percentChange(
           currentPriceUsd,
-          p10.price
+          h10.price
         )
       : null;
 
-  const liquidity5 =
-    p5
+  const liq5 =
+    h5
       ? percentChange(
           currentLiquidityUsd,
-          p5.liquidity
+          h5.liquidity
         )
       : null;
 
-  const liquidity10 =
-    p10
+  const liq10 =
+    h10
       ? percentChange(
           currentLiquidityUsd,
-          p10.liquidity
+          h10.liquidity
         )
       : null;
 
-  let level =
-    "NORMAL";
+  let level = "NORMAL";
 
-  // CRITICAL
   if (
     (
-      liquidity5 !== null &&
-      liquidity5 <=
-        CRITICAL_LIQUIDITY_5S
+      Number.isFinite(liq10) &&
+      liq10 <= CRITICAL_LIQ_10S
     ) ||
     (
-      liquidity10 !== null &&
-      liquidity10 <=
-        CRITICAL_LIQUIDITY_10S
+      Number.isFinite(liq5) &&
+      liq5 <= CRITICAL_LIQ_5S
     ) ||
     (
-      price5 !== null &&
-      price5 <=
-        CRITICAL_PRICE_5S
+      Number.isFinite(price5) &&
+      price5 <= CRITICAL_PRICE_5S
     )
   ) {
-    level =
-      "CRITICAL";
-  }
-
-  // DANGER
-  else if (
+    level = "CRITICAL";
+  } else if (
     (
-      liquidity5 !== null &&
-      liquidity5 <=
-        DANGER_LIQUIDITY_5S
+      Number.isFinite(liq10) &&
+      liq10 <= DANGER_LIQ_10S
     ) ||
     (
-      liquidity10 !== null &&
-      liquidity10 <=
-        DANGER_LIQUIDITY_10S
+      Number.isFinite(liq5) &&
+      liq5 <= DANGER_LIQ_5S
     ) ||
     (
-      price5 !== null &&
-      price5 <=
-        DANGER_PRICE_5S
+      Number.isFinite(price5) &&
+      price5 <= DANGER_PRICE_5S
     )
   ) {
-    level =
-      "DANGER";
-  }
-
-  // WATCH
-  else if (
+    level = "DANGER";
+  } else if (
     (
-      liquidity5 !== null &&
-      liquidity5 <=
-        WATCH_LIQUIDITY_5S
+      Number.isFinite(liq10) &&
+      liq10 <= WATCH_LIQ_10S
     ) ||
     (
-      liquidity10 !== null &&
-      liquidity10 <=
-        WATCH_LIQUIDITY_10S
+      Number.isFinite(liq5) &&
+      liq5 <= WATCH_LIQ_5S
     ) ||
     (
-      price5 !== null &&
-      price5 <=
-        WATCH_PRICE_5S
+      Number.isFinite(price5) &&
+      price5 <= WATCH_PRICE_5S
     )
   ) {
-    level =
-      "WATCH";
+    level = "WATCH";
   }
 
   return {
     level,
     price5,
     price10,
-    liquidity5,
-    liquidity10
+    liq5,
+    liq10
   };
-}
-
-// ============================================================
-// ALERTE
-// ============================================================
-
-async function handleAlert(
-  analysis
-) {
-  if (
-    analysis.level ===
-    "NORMAL"
-  ) {
-    currentLevel =
-      "NORMAL";
-
-    return;
-  }
-
-  if (
-    analysis.level ===
-    currentLevel
-  ) {
-    return;
-  }
-
-  currentLevel =
-    analysis.level;
-
-  const now =
-    Date.now();
-
-  if (
-    now - lastAlertTime <
-    ALERT_COOLDOWN_MS
-  ) {
-    return;
-  }
-
-  lastAlertTime =
-    now;
-
-  let emoji =
-    "⚠️";
-
-  if (
-    analysis.level ===
-    "DANGER"
-  ) {
-    emoji =
-      "🚨";
-  }
-
-  if (
-    analysis.level ===
-    "CRITICAL"
-  ) {
-    emoji =
-      "🔴";
-  }
-
-  const message = [
-    `${emoji} CRASH RADAR ${analysis.level}`,
-    "",
-    `Token : ${MINT}`,
-    "",
-    `💵 Prix : $${formatNumber(
-      currentPriceUsd
-    )}`,
-    `💧 Liquidité : $${formatNumber(
-      currentLiquidityUsd
-    )}`,
-    "",
-    `Prix 5s : ${formatPercent(
-      analysis.price5
-    )}`,
-    `Prix 10s : ${formatPercent(
-      analysis.price10
-    )}`,
-    "",
-    `Liquidité 5s : ${formatPercent(
-      analysis.liquidity5
-    )}`,
-    `Liquidité 10s : ${formatPercent(
-      analysis.liquidity10
-    )}`,
-    "",
-    "⚡ Mouvement détecté par le Crash Radar."
-  ].join("\n");
-
-  console.log("");
-  console.log(message);
-
-  await sendTelegram(
-    message
-  );
 }
 
 // ============================================================
 // LOG
 // ============================================================
 
-function saveLog(
-  analysis
-) {
+function writeLog(data) {
   try {
-    const entry = {
-      timestamp:
-        new Date().toISOString(),
-
-      mint:
-        MINT,
-
-      pool:
-        poolAddress,
-
-      tokenVault:
-        tokenVault,
-
-      solVault:
-        solVault,
-
-      price:
-        currentPriceUsd,
-
-      liquidity:
-        currentLiquidityUsd,
-
-      level:
-        analysis.level,
-
-      price5:
-        analysis.price5,
-
-      price10:
-        analysis.price10,
-
-      liquidity5:
-        analysis.liquidity5,
-
-      liquidity10:
-        analysis.liquidity10
-    };
-
     fs.appendFileSync(
       LOG_FILE,
-      JSON.stringify(entry) +
+      JSON.stringify(data) +
         "\n"
     );
   } catch (error) {
     console.log(
-      "⚠️ Erreur écriture log :",
+      "⚠️ Impossible d'écrire le log :",
       error.message
     );
   }
 }
 
 // ============================================================
-// WEBSOCKET
+// TELEGRAM ALERT
 // ============================================================
 
-function subscribeToVault(
-  vault,
-  label
+async function alertLevel(
+  radar
 ) {
-  if (!ws) {
+  const timestamp =
+    Date.now();
+
+  if (
+    radar.level === currentLevel
+  ) {
     return;
   }
 
-  const id =
-    Math.floor(
-      Math.random() *
-        1000000
-    );
+  const previousLevel =
+    currentLevel;
 
-  ws.send(
-    JSON.stringify({
-      jsonrpc: "2.0",
-      id,
-      method:
-        "accountSubscribe",
-      params: [
-        vault,
-        {
-          encoding:
-            "base64",
-          commitment:
-            "processed"
-        }
-      ]
-    })
-  );
+  currentLevel =
+    radar.level;
 
   console.log(
-    `📡 Subscription ${label} : ${vault}`
+    `🚨 RADAR ${previousLevel} → ${radar.level}`
   );
+
+  if (
+    timestamp - lastTelegramTime <
+    TELEGRAM_COOLDOWN_MS
+  ) {
+    return;
+  }
+
+  lastTelegramTime =
+    timestamp;
+
+  let emoji = "⚠️";
+
+  if (
+    radar.level === "DANGER"
+  ) {
+    emoji = "🔴";
+  }
+
+  if (
+    radar.level === "CRITICAL"
+  ) {
+    emoji = "🚨";
+  }
+
+  if (
+    radar.level === "NORMAL"
+  ) {
+    emoji = "🟢";
+  }
+
+  const message =
+`${emoji} CRASH RADAR
+
+Niveau : ${radar.level}
+
+Prix : $${formatNumber(currentPriceUsd)}
+Liquidité : ${formatUsd(currentLiquidityUsd)}
+
+Prix 5s : ${
+  Number.isFinite(radar.price5)
+    ? radar.price5.toFixed(2) + "%"
+    : "N/A"
+}
+
+Prix 10s : ${
+  Number.isFinite(radar.price10)
+    ? radar.price10.toFixed(2) + "%"
+    : "N/A"
+}
+
+Liquidité 5s : ${
+  Number.isFinite(radar.liq5)
+    ? radar.liq5.toFixed(2) + "%"
+    : "N/A"
+}
+
+Liquidité 10s : ${
+  Number.isFinite(radar.liq10)
+    ? radar.liq10.toFixed(2) + "%"
+    : "N/A"
+}`;
+
+  await sendTelegram(message);
+}
+
+// ============================================================
+// CYCLE PRINCIPAL
+// ============================================================
+
+async function monitorCycle() {
+  if (!monitoring) {
+    return;
+  }
+
+  try {
+    // --------------------------------------------------------
+    // 1. DexScreener
+    // --------------------------------------------------------
+
+    const dex =
+      await getDexData();
+
+    currentPriceUsd =
+      dex.priceUsd;
+
+    currentLiquidityUsd =
+      dex.liquidityUsd;
+
+    // --------------------------------------------------------
+    // 2. SOL price
+    // --------------------------------------------------------
+
+    const solPrice =
+      await getSolPriceUsd();
+
+    if (
+      Number.isFinite(solPrice)
+    ) {
+      currentSolPriceUsd =
+        solPrice;
+    }
+
+    // --------------------------------------------------------
+    // 3. Historique
+    // --------------------------------------------------------
+
+    addHistory(
+      currentPriceUsd,
+      currentLiquidityUsd
+    );
+
+    // --------------------------------------------------------
+    // 4. Radar
+    // --------------------------------------------------------
+
+    const radar =
+      calculateLevel();
+
+    console.log(
+      `[RADAR] Prix $${formatNumber(currentPriceUsd)} | Liq ${currentLiquidityUsd} | ${radar.level}`
+    );
+
+    // --------------------------------------------------------
+    // 5. Alertes
+    // --------------------------------------------------------
+
+    await alertLevel(
+      radar
+    );
+
+    // --------------------------------------------------------
+    // 6. RPC vaults
+    // --------------------------------------------------------
+
+    // Les vaults sont maintenant lus à intervalle contrôlé.
+    // Ils ne sont PAS lus à chaque événement WebSocket.
+    const reserves =
+      await refreshVaults();
+
+    if (reserves) {
+      const impliedLiquidity =
+        reserves.solAmount *
+        (currentSolPriceUsd || 0);
+
+      writeLog({
+        timestamp:
+          new Date().toISOString(),
+
+        mint: MINT,
+
+        pool: poolAddress,
+
+        priceUsd:
+          currentPriceUsd,
+
+        dexscreenerLiquidityUsd:
+          currentLiquidityUsd,
+
+        solPriceUsd:
+          currentSolPriceUsd,
+
+        tokenReserve:
+          reserves.tokenAmount,
+
+        solReserve:
+          reserves.solAmount,
+
+        solReserveUsd:
+          impliedLiquidity,
+
+        level:
+          radar.level,
+
+        priceChange5s:
+          radar.price5,
+
+        priceChange10s:
+          radar.price10,
+
+        liquidityChange5s:
+          radar.liq5,
+
+        liquidityChange10s:
+          radar.liq10
+      });
+    }
+  } catch (error) {
+    if (
+      error.message.includes("429")
+    ) {
+      console.log(
+        "⚠️ Erreur monitoring : RPC HTTP 429"
+      );
+    } else {
+      console.log(
+        "⚠️ Erreur monitoring :",
+        error.message
+      );
+    }
+  }
 }
 
 // ============================================================
 // WEBSOCKET
 // ============================================================
 
-function startWebSocket() {
-  console.log("");
+function subscribeVault(address) {
+  if (
+    !ws ||
+    ws.readyState !==
+      WebSocket.OPEN
+  ) {
+    return;
+  }
+
+  const message = {
+    jsonrpc: "2.0",
+    id:
+      Math.floor(
+        Math.random() * 1000000
+      ),
+    method: "accountSubscribe",
+    params: [
+      address,
+      {
+        encoding: "base64",
+        commitment: "processed"
+      }
+    ]
+  };
+
+  ws.send(
+    JSON.stringify(message)
+  );
+}
+
+function connectWebSocket() {
+  if (
+    ws &&
+    (
+      ws.readyState ===
+        WebSocket.OPEN ||
+      ws.readyState ===
+        WebSocket.CONNECTING
+    )
+  ) {
+    return;
+  }
+
   console.log(
     "🔌 Connexion WebSocket Solana..."
   );
 
   ws =
     new WebSocket(
-      RPC_WS
+      WS_RPC
     );
 
   ws.on(
     "open",
     () => {
       console.log(
-        "✅ WebSocket Solana connecté."
+        "✅ WebSocket Solana connecté"
       );
 
-      subscribeToVault(
-        tokenVault,
-        "TOKEN"
+      subscribeVault(
+        tokenVault
       );
 
-      subscribeToVault(
-        solVault,
-        "SOL"
-      );
-
-      console.log(
-        "📡 Surveillance des deux vaults active."
-      );
-    }
-  );
-
-  ws.on(
-    "error",
-    error => {
-      console.log(
-        "⚠️ WebSocket erreur :",
-        error.message
-      );
-    }
-  );
-
-  ws.on(
-    "close",
-    () => {
-      console.log(
-        "⚠️ WebSocket fermé."
-      );
-
-      setTimeout(
-        startWebSocket,
-        5000
+      subscribeVault(
+        solVault
       );
     }
   );
@@ -1235,41 +1353,24 @@ function startWebSocket() {
           );
 
         if (
-          !message.params ||
-          !message.params.result
+          message.method ===
+          "accountNotification"
         ) {
-          return;
+          /*
+           * IMPORTANT :
+           *
+           * On ne fait PLUS de requête HTTP RPC ici.
+           *
+           * Avant, chaque notification WebSocket
+           * pouvait provoquer plusieurs appels RPC.
+           *
+           * C'était la cause principale des 429.
+           *
+           * Le monitoring principal tourne maintenant
+           * toutes les 5 secondes et décide lui-même
+           * quand lire les vaults.
+           */
         }
-
-        const data =
-          await calculateMarketData();
-
-        currentPriceUsd =
-          data.tokenPriceUsd;
-
-        currentLiquidityUsd =
-          data.liquidityUsd;
-
-        addHistory(data);
-
-        const analysis =
-          analyzeRadar();
-
-        saveLog(
-          analysis
-        );
-
-        console.log(
-          `[RADAR] Prix $${formatNumber(
-            currentPriceUsd
-          )} | Liq $${formatNumber(
-            currentLiquidityUsd
-          )} | ${analysis.level}`
-        );
-
-        await handleAlert(
-          analysis
-        );
       } catch (error) {
         console.log(
           "⚠️ Erreur traitement WebSocket :",
@@ -1278,203 +1379,156 @@ function startWebSocket() {
       }
     }
   );
-}
 
-// ============================================================
-// BOUCLE DE SÉCURITÉ
-// ============================================================
-
-async function monitoringLoop() {
-  try {
-    if (
-      !tokenVault ||
-      !solVault
-    ) {
-      return;
+  ws.on(
+    "error",
+    error => {
+      console.log(
+        "⚠️ WebSocket :",
+        error.message
+      );
     }
+  );
 
-    const data =
-      await calculateMarketData();
+  ws.on(
+    "close",
+    () => {
+      console.log(
+        "⚠️ WebSocket fermé."
+      );
 
-    currentPriceUsd =
-      data.tokenPriceUsd;
+      if (
+        reconnectTimer
+      ) {
+        return;
+      }
 
-    currentLiquidityUsd =
-      data.liquidityUsd;
+      reconnectTimer =
+        setTimeout(
+          () => {
+            reconnectTimer =
+              null;
 
-    addHistory(data);
-
-    const analysis =
-      analyzeRadar();
-
-    saveLog(
-      analysis
-    );
-
-    console.log(
-      `[RADAR] Prix $${formatNumber(
-        currentPriceUsd
-      )} | Liq $${formatNumber(
-        currentLiquidityUsd
-      )} | ${analysis.level}`
-    );
-
-    await handleAlert(
-      analysis
-    );
-  } catch (error) {
-    console.log(
-      "⚠️ Erreur monitoring :",
-      error.message
-    );
-  }
+            connectWebSocket();
+          },
+          10000
+        );
+    }
+  );
 }
-function formatNumber(value) {
-  if (!Number.isFinite(value)) {
-    return "N/A";
-  }
 
-  if (value < 0.000001) {
-    return value.toExponential(4);
-  }
-
-  if (value < 0.01) {
-    return value.toFixed(8);
-  }
-
-  if (value < 1) {
-    return value.toFixed(6);
-  }
-
-  return value.toFixed(4);
-}
 // ============================================================
 // INITIALISATION
 // ============================================================
 
 async function init() {
-  console.log("");
-  console.log(
-    "=================================================="
-  );
-  console.log(
-    "🚨 CRASH RADAR"
-  );
-  console.log(
-    "=================================================="
-  );
-
-  console.log("");
-  console.log(
-    "Token surveillé :"
-  );
-  console.log(
-    MINT
-  );
-
   try {
-    // 1. Trouver le pool
+    console.log(
+      "======================================"
+    );
+
+    console.log(
+      "🚨 CRASH RADAR"
+    );
+
+    console.log(
+      `Token : ${MINT}`
+    );
+
+    console.log(
+      "======================================"
+    );
+
+    // --------------------------------------------------------
+    // Pool
+    // --------------------------------------------------------
+
     await findPool();
 
-    // 2. Décoder le pool
+    console.log(
+      "🔎 Lecture du compte pool..."
+    );
+
     await decodePool();
 
-    // 3. Décimales
+    // --------------------------------------------------------
+    // Décimales
+    // --------------------------------------------------------
+
     await getTokenDecimals();
 
-    // 4. Première mesure
-    const data =
-      await calculateMarketData();
+    // --------------------------------------------------------
+    // Prix SOL
+    // --------------------------------------------------------
+
+    currentSolPriceUsd =
+      await getSolPriceUsd();
+
+    console.log(
+      `💵 SOL/USD : $${formatNumber(currentSolPriceUsd)}`
+    );
+
+    // --------------------------------------------------------
+    // Première lecture Dex
+    // --------------------------------------------------------
+
+    const dex =
+      await getDexData();
 
     currentPriceUsd =
-      data.tokenPriceUsd;
+      dex.priceUsd;
 
     currentLiquidityUsd =
-      data.liquidityUsd;
+      dex.liquidityUsd;
 
-    console.log("");
-    console.log(
-      "=================================================="
-    );
-    console.log(
-      "📊 PREMIÈRE MESURE"
-    );
-    console.log(
-      "=================================================="
+    addHistory(
+      currentPriceUsd,
+      currentLiquidityUsd
     );
 
     console.log(
-      "Prix SOL :",
-      `$${formatNumber(
-        data.solPriceUsd
-      )}`
+      `💰 Prix initial : $${formatNumber(currentPriceUsd)}`
     );
 
     console.log(
-      "Prix token :",
-      `$${formatNumber(
-        data.tokenPriceUsd
-      )}`
+      `💧 Liquidité initiale : ${formatUsd(currentLiquidityUsd)}`
+    );
+
+    // --------------------------------------------------------
+    // Démarrage
+    // --------------------------------------------------------
+
+    monitoring = true;
+
+    connectWebSocket();
+
+    console.log(
+      "🚀 Radar démarré."
     );
 
     console.log(
-      "Réserve token :",
-      formatNumber(
-        data.tokenAmount
-      )
+      `⏱️ Surveillance toutes les ${MONITOR_INTERVAL_MS / 1000}s`
     );
 
     console.log(
-      "Réserve SOL :",
-      formatNumber(
-        data.solAmount
-      )
+      "🛡️ Protection RPC anti-429 activée."
     );
 
-    console.log(
-      "Liquidité :",
-      `$${formatNumber(
-        data.liquidityUsd
-      )}`
-    );
+    // Premier cycle
+    await monitorCycle();
 
-    console.log(
-      "=================================================="
-    );
-
-    addHistory(data);
-
-    // 5. WebSocket
-    startWebSocket();
-
-    // 6. Boucle de sécurité
     setInterval(
-      monitoringLoop,
-      CHECK_INTERVAL_MS
+      monitorCycle,
+      MONITOR_INTERVAL_MS
     );
-
-    console.log("");
-    console.log(
-      "🟢 CRASH RADAR ACTIF"
-    );
-
-    console.log(
-      "📡 Surveillance des réserves PumpSwap..."
-    );
-
-    console.log("");
   } catch (error) {
-    console.log("");
     console.log(
-      "❌ Impossible d'initialiser le radar :",
-      error.message
+      `❌ Impossible d'initialiser le radar : ${error.message}`
     );
 
     console.log(
       "🔄 Nouvelle tentative dans 10 secondes..."
     );
-
-    console.log("");
 
     setTimeout(
       init,
