@@ -7,7 +7,7 @@ const path = require("path");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 
-const MINT = "AEUYZvD6s8WwE9EdtTBnw627AxNDxhMvmhr4PLmW41Km";
+const MINT = "Rcopty53MejswAzB26spbwggKxtJf59cHefbwCzpump";
 
 const PUMPSWAP_PROGRAM_ID =
   "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
