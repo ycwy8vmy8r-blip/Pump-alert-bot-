@@ -1,6 +1,7 @@
 const { Telegraf } = require("telegraf");
 const fs = require("fs");
 const path = require("path");
+const http = require("http");
 
 // ============================================================
 // CONFIGURATION V5.1 TEST
@@ -8,6 +9,15 @@ const path = require("path");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
+
+const CRASH_GUARD_URL =
+  process.env.CRASH_GUARD_URL || "";
+
+const CRASH_GUARD_SECRET =
+  process.env.CRASH_GUARD_SECRET || "";
+
+const PORT =
+  Number(process.env.PORT || 3000);
 
 if (!BOT_TOKEN || !CHAT_ID) {
   console.error("❌ BOT_TOKEN ou CHAT_ID manquant.");
@@ -40,9 +50,6 @@ const ENTRY_PRICE_DROP_10S = -4;
 const CRASH_PRICE_DROP_10S = -20;
 
 // ---------------- ACCÉLÉRATION ----------------
-
-// Une hausse très rapide n'est PAS automatiquement un crash.
-// Elle devient un signal de prudence lorsqu'elle est anormalement forte.
 
 const ACCEL_PRICE_5S_WARNING = 7;
 const ACCEL_PRICE_10S_WARNING = 10;
@@ -89,6 +96,18 @@ let healthyConfirmations = 0;
 let marketHistory = [];
 let accelerationWarningActive = false;
 let accelerationAlertSent = false;
+
+// ============================================================
+// CRASH GUARD
+// ============================================================
+
+let crashGuardLevel = "NORMAL";
+let crashGuardBuyBlocked = false;
+let crashGuardLocked = false;
+let crashGuardEmergencyExitDone = false;
+let crashGuardEmergencyExitInProgress = false;
+let crashGuardLastEventId = null;
+let crashGuardArmed = false;
 
 // ============================================================
 // OUTILS
@@ -157,6 +176,827 @@ function loadTrades() {
 let tradeHistory = loadTrades();
 
 // ============================================================
+// CRASH GUARD HTTP
+// ============================================================
+
+function isCrashGuardConfigured() {
+  return Boolean(
+    CRASH_GUARD_URL &&
+    CRASH_GUARD_SECRET
+  );
+}
+
+async function crashGuardRequest(
+  endpoint,
+  method = "GET",
+  body = null
+) {
+  if (!isCrashGuardConfigured()) {
+    throw new Error(
+      "Crash Guard non configuré"
+    );
+  }
+
+  const controller =
+    new AbortController();
+
+  const timeout =
+    setTimeout(() => {
+      controller.abort();
+    }, 5000);
+
+  try {
+    const options = {
+      method,
+      headers: {
+        "x-crash-guard-secret":
+          CRASH_GUARD_SECRET
+      },
+      signal: controller.signal
+    };
+
+    if (body !== null) {
+      options.headers[
+        "Content-Type"
+      ] = "application/json";
+
+      options.body =
+        JSON.stringify(body);
+    }
+
+    const response =
+      await fetch(
+        `${CRASH_GUARD_URL.replace(/\/$/, "")}${endpoint}`,
+        options
+      );
+
+    if (!response.ok) {
+      throw new Error(
+        `Crash Guard HTTP ${response.status}`
+      );
+    }
+
+    return await response.json();
+
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ============================================================
+// ARM CRASH GUARD
+// ============================================================
+
+async function armCrashGuard(tokenMint) {
+  if (!isCrashGuardConfigured()) {
+    throw new Error(
+      "CRASH_GUARD_URL ou CRASH_GUARD_SECRET manquant"
+    );
+  }
+
+  console.log(
+    `🛡️ Armement Crash Guard pour ${shortMint(tokenMint)}...`
+  );
+
+  const result =
+    await crashGuardRequest(
+      "/arm",
+      "POST",
+      {
+        mint: tokenMint
+      }
+    );
+
+  if (
+    !result ||
+    result.ok !== true
+  ) {
+    throw new Error(
+      "Le Crash Guard n'a pas confirmé son armement"
+    );
+  }
+
+  crashGuardArmed = true;
+  crashGuardLevel = "NORMAL";
+  crashGuardBuyBlocked = false;
+  crashGuardLocked = false;
+  crashGuardEmergencyExitDone = false;
+  crashGuardEmergencyExitInProgress = false;
+  crashGuardLastEventId = null;
+
+  console.log(
+    `🟢 Crash Guard armé pour ${shortMint(tokenMint)}`
+  );
+
+  return result;
+}
+
+// ============================================================
+// DISARM CRASH GUARD
+// ============================================================
+
+async function disarmCrashGuard() {
+  if (!isCrashGuardConfigured()) {
+    crashGuardArmed = false;
+    return;
+  }
+
+  try {
+    await crashGuardRequest(
+      "/disarm",
+      "POST"
+    );
+
+    console.log(
+      "🛡️ Crash Guard désarmé."
+    );
+
+  } catch (error) {
+    console.error(
+      "⚠️ Impossible de désarmer le Crash Guard:",
+      error.message
+    );
+  }
+
+  crashGuardArmed = false;
+  crashGuardLevel = "NORMAL";
+  crashGuardBuyBlocked = false;
+  crashGuardLocked = false;
+  crashGuardEmergencyExitDone = false;
+  crashGuardEmergencyExitInProgress = false;
+  crashGuardLastEventId = null;
+}
+
+// ============================================================
+// PRIX DE SORTIE D'URGENCE
+// ============================================================
+
+function getLatestValidMarketPrice() {
+  for (
+    let i = marketHistory.length - 1;
+    i >= 0;
+    i--
+  ) {
+    const point =
+      marketHistory[i];
+
+    if (
+      point &&
+      Number.isFinite(point.price) &&
+      point.price > 0
+    ) {
+      return point.price;
+    }
+  }
+
+  return null;
+}
+
+// ============================================================
+// SORTIE D'URGENCE CRASH GUARD
+// ============================================================
+
+async function emergencyExitFromCrashGuard(
+  signal
+) {
+  if (
+    crashGuardEmergencyExitDone ||
+    crashGuardEmergencyExitInProgress
+  ) {
+    return;
+  }
+
+  crashGuardEmergencyExitInProgress =
+    true;
+
+  try {
+    /*
+    Une seule sortie d'urgence
+    pour toute la session.
+    */
+
+    crashGuardEmergencyExitDone =
+      true;
+
+    if (!position) {
+      await bot.telegram.sendMessage(
+        CHAT_ID,
+        `🔴 CRASH GUARD CRITICAL
+
+Token :
+
+${mint}
+
+🚨 Signal critique reçu.
+
+ℹ️ Aucune position ouverte.
+
+⛔ Trading verrouillé.`
+      );
+
+      return;
+    }
+
+    /*
+    On tente d'abord une nouvelle lecture
+    DexScreener.
+    */
+
+    let data =
+      await getMarketData(mint);
+
+    let exitPrice =
+      data?.price || null;
+
+    /*
+    Si DexScreener ne répond plus,
+    on utilise le dernier prix valide
+    réellement observé par V5.1.
+    */
+
+    if (
+      !Number.isFinite(exitPrice) ||
+      exitPrice <= 0
+    ) {
+      exitPrice =
+        getLatestValidMarketPrice();
+    }
+
+    /*
+    Aucun prix disponible :
+    on ne fabrique pas de prix.
+    */
+
+    if (
+      !Number.isFinite(exitPrice) ||
+      exitPrice <= 0
+    ) {
+      await bot.telegram.sendMessage(
+        CHAT_ID,
+        `🔴 CRASH GUARD CRITICAL
+
+Token :
+
+${mint}
+
+🚨 Signal critique confirmé.
+
+⚠️ Aucun prix DEX fiable disponible
+pour calculer une sortie simulée.
+
+⛔ Aucun bénéfice fictif ajouté.
+
+⛔ Trading verrouillé.`
+      );
+
+      position = null;
+
+      return;
+    }
+
+    const entryPrice =
+      position.entryPrice;
+
+    const amount =
+      position.tokens *
+      exitPrice;
+
+    const profit =
+      amount -
+      position.capital;
+
+    const profitPercent =
+      (profit /
+        position.capital) *
+      100;
+
+    sessionProfit +=
+      profit;
+
+    const trade = {
+      type:
+        "CRASH_GUARD_EMERGENCY",
+      sessionStart:
+        sessionStartTime,
+      timestamp:
+        now(),
+      mint,
+      cycle:
+        position.cycle,
+      entryPrice,
+      exitPrice,
+      capital:
+        position.capital,
+      tokens:
+        position.tokens,
+      amount,
+      profit,
+      profitPercent,
+      guardLevel:
+        signal?.level || "CRITICAL",
+      guardEventId:
+        signal?.id || null,
+      guardTimestamp:
+        signal?.timestamp || null,
+      priceSource:
+        data?.price
+          ? "fresh_dexscreener"
+          : "latest_valid_v51_observation"
+    };
+
+    tradeHistory.push(
+      trade
+    );
+
+    saveJson(
+      TRADES_FILE,
+      tradeHistory
+    );
+
+    const cycle =
+      position.cycle;
+
+    position = null;
+
+    observationUntil = 0;
+    healthyConfirmations = 0;
+
+    await bot.telegram.sendMessage(
+      CHAT_ID,
+      `🚨 SORTIE D'URGENCE CRASH GUARD
+
+Token :
+
+${mint}
+
+Cycle :
+
+#${cycle}
+
+🔴 Niveau :
+
+CRITICAL
+
+🚨 Signal critique reçu.
+
+💵 Prix d'entrée :
+
+$${entryPrice.toFixed(8)}
+
+🛑 Prix de sortie simulé :
+
+$${exitPrice.toFixed(8)}
+
+💰 Montant simulé :
+
+${formatUsd(amount)}
+
+📊 Résultat :
+
+${profit >= 0 ? "+" : ""}${formatUsd(profit)}
+
+📈 Variation :
+
+${formatPercent(profitPercent)}
+
+💰 Bénéfice session :
+
+${sessionProfit >= 0 ? "+" : ""}${formatUsd(sessionProfit)}
+
+⛔ ACHATS BLOQUÉS
+
+⛔ VENTES NORMALES BLOQUÉES
+
+⛔ SESSION VERROUILLÉE`
+    );
+
+  } catch (error) {
+
+    console.error(
+      "❌ Erreur sortie urgence Crash Guard:",
+      error.message
+    );
+
+    /*
+    Même en cas d'erreur, on ne permet
+    pas une seconde tentative automatique
+    qui pourrait créer une double sortie.
+    */
+
+    await bot.telegram.sendMessage(
+      CHAT_ID,
+      `🔴 CRASH GUARD CRITICAL
+
+Token :
+
+${mint}
+
+🚨 Signal critique reçu.
+
+⚠️ Erreur pendant la sortie simulée :
+
+${error.message}
+
+⛔ Trading verrouillé.
+
+❗ Aucune seconde vente automatique.`
+    );
+
+  } finally {
+    crashGuardEmergencyExitInProgress =
+      false;
+  }
+}
+
+// ============================================================
+// SIGNAL CRASH GUARD
+// ============================================================
+
+async function applyCrashGuardSignal(
+  signal
+) {
+  if (
+    !signal ||
+    !signal.level
+  ) {
+    return;
+  }
+
+  /*
+  Ignore les anciens événements.
+  */
+
+  if (
+    signal.id !== undefined &&
+    signal.id !== null
+  ) {
+    if (
+      crashGuardLastEventId ===
+      signal.id
+    ) {
+      return;
+    }
+
+    crashGuardLastEventId =
+      signal.id;
+  }
+
+  /*
+  CRITICAL reste prioritaire.
+  */
+
+  if (
+    crashGuardLocked
+  ) {
+    return;
+  }
+
+  const level =
+    String(
+      signal.level
+    ).toUpperCase();
+
+  /*
+  Vérification du token.
+  */
+
+  if (
+    signal.mint &&
+    mint &&
+    signal.mint !== mint
+  ) {
+    console.error(
+      `⚠️ Signal Crash Guard ignoré : mauvais mint ${signal.mint}`
+    );
+
+    return;
+  }
+
+  if (
+    level === "WATCH"
+  ) {
+    crashGuardLevel =
+      "WATCH";
+
+    console.log(
+      "🟡 Crash Guard WATCH"
+    );
+
+    return;
+  }
+
+  if (
+    level === "DANGER"
+  ) {
+    crashGuardLevel =
+      "DANGER";
+
+    /*
+    DANGER bloque les nouveaux achats
+    pour le reste de la session.
+    */
+
+    crashGuardBuyBlocked =
+      true;
+
+    console.log(
+      "🟠 Crash Guard DANGER : nouveaux achats bloqués."
+    );
+
+    await bot.telegram.sendMessage(
+      CHAT_ID,
+      `🟠 CRASH GUARD DANGER
+
+Token :
+
+${mint}
+
+⛔ Nouveaux achats bloqués.
+
+📌 La position ouverte éventuelle
+reste gérée normalement tant qu'aucun
+CRITICAL n'est reçu.`
+    );
+
+    return;
+  }
+
+  if (
+    level === "CRITICAL"
+  ) {
+    crashGuardLevel =
+      "CRITICAL";
+
+    crashGuardBuyBlocked =
+      true;
+
+    crashGuardLocked =
+      true;
+
+    console.log(
+      "🔴 Crash Guard CRITICAL : VERROUILLAGE TOTAL."
+    );
+
+    await emergencyExitFromCrashGuard(
+      signal
+    );
+
+    /*
+    Après la sortie d'urgence,
+    aucun nouveau cycle.
+    */
+
+    if (active) {
+      await saveSummary(
+        "CRASH_GUARD_CRITICAL"
+      );
+
+      stopRadar(
+        false,
+        true
+      );
+    }
+  }
+}
+
+// ============================================================
+// SERVEUR HTTP V5.1
+// ============================================================
+
+function parseRequestBody(req) {
+  return new Promise(
+    (resolve, reject) => {
+      let body = "";
+
+      req.on(
+        "data",
+        chunk => {
+          body +=
+            chunk.toString();
+
+          if (
+            body.length >
+            100000
+          ) {
+            reject(
+              new Error(
+                "Body trop volumineux"
+              )
+            );
+
+            req.destroy();
+          }
+        }
+      );
+
+      req.on(
+        "end",
+        () => {
+          try {
+            resolve(
+              body
+                ? JSON.parse(body)
+                : {}
+            );
+          } catch (error) {
+            reject(
+              new Error(
+                "JSON invalide"
+              )
+            );
+          }
+        }
+      );
+
+      req.on(
+        "error",
+        reject
+      );
+    }
+  );
+}
+
+function authorizeCrashGuardRequest(
+  req
+) {
+  if (
+    !CRASH_GUARD_SECRET
+  ) {
+    return false;
+  }
+
+  return (
+    req.headers[
+      "x-crash-guard-secret"
+    ] ===
+    CRASH_GUARD_SECRET
+  );
+}
+
+const v51Server =
+  http.createServer(
+    async (req, res) => {
+
+      /*
+      HEALTH
+      */
+
+      if (
+        req.method === "GET" &&
+        req.url === "/health"
+      ) {
+        const body =
+          JSON.stringify({
+            ok: true,
+            service:
+              "pump-alert-bot-v5.1",
+            active,
+            mint,
+            timestamp:
+              new Date().toISOString()
+          });
+
+        res.writeHead(
+          200,
+          {
+            "Content-Type":
+              "application/json",
+            "Content-Length":
+              Buffer.byteLength(body)
+          }
+        );
+
+        res.end(body);
+
+        return;
+      }
+
+      /*
+      CRASH GUARD EVENT
+      */
+
+      if (
+        req.method === "POST" &&
+        req.url ===
+          "/crash-guard/event"
+      ) {
+
+        if (
+          !authorizeCrashGuardRequest(
+            req
+          )
+        ) {
+          res.writeHead(
+            401,
+            {
+              "Content-Type":
+                "application/json"
+            }
+          );
+
+          res.end(
+            JSON.stringify({
+              ok: false,
+              error:
+                "Unauthorized"
+            })
+          );
+
+          return;
+        }
+
+        try {
+          const signal =
+            await parseRequestBody(
+              req
+            );
+
+          await applyCrashGuardSignal(
+            signal
+          );
+
+          const body =
+            JSON.stringify({
+              ok: true,
+              level:
+                crashGuardLevel,
+              locked:
+                crashGuardLocked,
+              buyBlocked:
+                crashGuardBuyBlocked
+            });
+
+          res.writeHead(
+            200,
+            {
+              "Content-Type":
+                "application/json",
+              "Content-Length":
+                Buffer.byteLength(body)
+            }
+          );
+
+          res.end(body);
+
+        } catch (error) {
+          console.error(
+            "❌ Crash Guard event:",
+            error.message
+          );
+
+          res.writeHead(
+            400,
+            {
+              "Content-Type":
+                "application/json"
+            }
+          );
+
+          res.end(
+            JSON.stringify({
+              ok: false,
+              error:
+                error.message
+            })
+          );
+        }
+
+        return;
+      }
+
+      /*
+      404
+      */
+
+      res.writeHead(
+        404,
+        {
+          "Content-Type":
+            "application/json"
+        }
+      );
+
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error:
+            "Not found"
+        })
+      );
+    }
+  );
+
+v51Server.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `🌐 Serveur V5.1 écoute sur le port ${PORT}.`
+    );
+  }
+);
+
+// ============================================================
 // DEXSCREENER
 // ============================================================
 
@@ -165,39 +1005,54 @@ async function getMarketData(tokenMint) {
     `https://api.dexscreener.com/token-pairs/v1/solana/${tokenMint}`;
 
   try {
-    const response = await fetch(url);
+    const response =
+      await fetch(url);
 
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+      throw new Error(
+        `HTTP ${response.status}`
+      );
     }
 
-    const pairs = await response.json();
+    const pairs =
+      await response.json();
 
-    if (!Array.isArray(pairs) || pairs.length === 0) {
+    if (
+      !Array.isArray(pairs) ||
+      pairs.length === 0
+    ) {
       return null;
     }
 
-    // PumpSwap uniquement
-
-    const pumpPair = pairs.find((pair) => {
-      return (
-        pair &&
-        pair.dexId &&
-        pair.dexId.toLowerCase() === "pumpswap"
-      );
-    });
+    const pumpPair =
+      pairs.find((pair) => {
+        return (
+          pair &&
+          pair.dexId &&
+          pair.dexId.toLowerCase() ===
+            "pumpswap"
+        );
+      });
 
     if (!pumpPair) {
       return null;
     }
 
-    const price = Number(pumpPair.priceUsd || 0);
+    const price =
+      Number(
+        pumpPair.priceUsd || 0
+      );
 
-    const liquidity = Number(
-      pumpPair.liquidity?.usd || 0
-    );
+    const liquidity =
+      Number(
+        pumpPair.liquidity?.usd ||
+          0
+      );
 
-    if (!price || price <= 0) {
+    if (
+      !price ||
+      price <= 0
+    ) {
       return null;
     }
 
@@ -205,16 +1060,24 @@ async function getMarketData(tokenMint) {
       timestamp: now(),
       price,
       liquidity,
-      pairAddress: pumpPair.pairAddress || null,
-      volume24h: Number(
-        pumpPair.volume?.h24 || 0
-      ),
-      buys5m: Number(
-        pumpPair.txns?.m5?.buys || 0
-      ),
-      sells5m: Number(
-        pumpPair.txns?.m5?.sells || 0
-      )
+      pairAddress:
+        pumpPair.pairAddress ||
+        null,
+      volume24h:
+        Number(
+          pumpPair.volume?.h24 ||
+            0
+        ),
+      buys5m:
+        Number(
+          pumpPair.txns?.m5?.buys ||
+            0
+        ),
+      sells5m:
+        Number(
+          pumpPair.txns?.m5?.sells ||
+            0
+        )
     };
 
   } catch (error) {
@@ -234,55 +1097,94 @@ async function getMarketData(tokenMint) {
 function addMarketPoint(data) {
   marketHistory.push(data);
 
-  const cutoff = now() - HISTORY_WINDOW_MS;
+  const cutoff =
+    now() -
+    HISTORY_WINDOW_MS;
 
-  marketHistory = marketHistory.filter(
-    (point) => point.timestamp >= cutoff
+  marketHistory =
+    marketHistory.filter(
+      (point) =>
+        point.timestamp >=
+        cutoff
+    );
+
+  appendJsonLine(
+    MARKET_FILE,
+    {
+      sessionStart:
+        sessionStartTime,
+      mint,
+      ...data
+    }
   );
-
-  appendJsonLine(MARKET_FILE, {
-    sessionStart: sessionStartTime,
-    mint,
-    ...data
-  });
 }
 
 function getPointAgo(seconds) {
-  const target = now() - seconds * 1000;
+  const target =
+    now() -
+    seconds * 1000;
 
   let closest = null;
   let distance = Infinity;
 
-  for (const point of marketHistory) {
-    const currentDistance = Math.abs(
-      point.timestamp - target
-    );
+  for (
+    const point of
+    marketHistory
+  ) {
+    const currentDistance =
+      Math.abs(
+        point.timestamp -
+          target
+      );
 
-    if (currentDistance < distance) {
-      distance = currentDistance;
-      closest = point;
+    if (
+      currentDistance <
+      distance
+    ) {
+      distance =
+        currentDistance;
+
+      closest =
+        point;
     }
   }
 
-  if (!closest || distance > 5000) {
+  if (
+    !closest ||
+    distance > 5000
+  ) {
     return null;
   }
 
   return closest;
 }
 
-function calculateChange(seconds, field) {
+function calculateChange(
+  seconds,
+  field
+) {
   const current =
-    marketHistory[marketHistory.length - 1];
+    marketHistory[
+      marketHistory.length - 1
+    ];
 
-  if (!current) return null;
+  if (!current) {
+    return null;
+  }
 
-  const old = getPointAgo(seconds);
+  const old =
+    getPointAgo(seconds);
 
-  if (!old || !old[field]) return null;
+  if (
+    !old ||
+    !old[field]
+  ) {
+    return null;
+  }
 
   return (
-    ((current[field] - old[field]) /
+    ((current[field] -
+      old[field]) /
       old[field]) *
     100
   );
@@ -293,35 +1195,58 @@ function calculateChange(seconds, field) {
 // ============================================================
 
 function calculateAcceleration() {
-  const price5s = calculateChange(5, "price");
-  const price10s = calculateChange(10, "price");
+  const price5s =
+    calculateChange(
+      5,
+      "price"
+    );
+
+  const price10s =
+    calculateChange(
+      10,
+      "price"
+    );
 
   const liquidity10s =
-    calculateChange(10, "liquidity");
+    calculateChange(
+      10,
+      "liquidity"
+    );
 
-  let level = "NORMAL";
+  let level =
+    "NORMAL";
 
   const reasons = [];
 
   if (
-    Number.isFinite(price5s) &&
-    Number.isFinite(price10s)
+    Number.isFinite(
+      price5s
+    ) &&
+    Number.isFinite(
+      price10s
+    )
   ) {
     if (
-      price5s >= ACCEL_PRICE_5S_EXTREME ||
-      price10s >= ACCEL_PRICE_10S_EXTREME
+      price5s >=
+        ACCEL_PRICE_5S_EXTREME ||
+      price10s >=
+        ACCEL_PRICE_10S_EXTREME
     ) {
-      level = "EXTREME";
+      level =
+        "EXTREME";
 
       reasons.push(
         `hausse prix très rapide (${formatPercent(price5s)} / 5s)`
       );
 
     } else if (
-      price5s >= ACCEL_PRICE_5S_WARNING ||
-      price10s >= ACCEL_PRICE_10S_WARNING
+      price5s >=
+        ACCEL_PRICE_5S_WARNING ||
+      price10s >=
+        ACCEL_PRICE_10S_WARNING
     ) {
-      level = "WARNING";
+      level =
+        "WARNING";
 
       reasons.push(
         `accélération prix (${formatPercent(price5s)} / 5s)`
@@ -329,17 +1254,29 @@ function calculateAcceleration() {
     }
   }
 
-  // Hausse rapide + liquidité qui commence à baisser
-
   if (
-    Number.isFinite(liquidity10s) &&
-    liquidity10s <= ACCEL_LIQUIDITY_DROP &&
+    Number.isFinite(
+      liquidity10s
+    ) &&
+    liquidity10s <=
+      ACCEL_LIQUIDITY_DROP &&
     (
-      (Number.isFinite(price5s) && price5s >= 5) ||
-      (Number.isFinite(price10s) && price10s >= 8)
+      (
+        Number.isFinite(
+          price5s
+        ) &&
+        price5s >= 5
+      ) ||
+      (
+        Number.isFinite(
+          price10s
+        ) &&
+        price10s >= 8
+      )
     )
   ) {
-    level = "EXTREME";
+    level =
+      "EXTREME";
 
     reasons.push(
       `prix en accélération + liquidité ${formatPercent(liquidity10s)} / 10s`
@@ -365,17 +1302,27 @@ function calculateHealth(data) {
   const signals = [];
 
   const liquidity10s =
-    calculateChange(10, "liquidity");
+    calculateChange(
+      10,
+      "liquidity"
+    );
 
   const liquidity30s =
-    calculateChange(30, "liquidity");
+    calculateChange(
+      30,
+      "liquidity"
+    );
 
   const price10s =
-    calculateChange(10, "price");
+    calculateChange(
+      10,
+      "price"
+    );
 
-  // Liquidité
-
-  if (data.liquidity < MIN_LIQUIDITY_USD) {
+  if (
+    data.liquidity <
+    MIN_LIQUIDITY_USD
+  ) {
     score -= 20;
 
     signals.push(
@@ -384,8 +1331,11 @@ function calculateHealth(data) {
   }
 
   if (
-    Number.isFinite(liquidity10s) &&
-    liquidity10s <= ENTRY_LIQUIDITY_DROP_10S
+    Number.isFinite(
+      liquidity10s
+    ) &&
+    liquidity10s <=
+      ENTRY_LIQUIDITY_DROP_10S
   ) {
     score -= 20;
 
@@ -395,8 +1345,11 @@ function calculateHealth(data) {
   }
 
   if (
-    Number.isFinite(liquidity30s) &&
-    liquidity30s <= ENTRY_LIQUIDITY_DROP_30S
+    Number.isFinite(
+      liquidity30s
+    ) &&
+    liquidity30s <=
+      ENTRY_LIQUIDITY_DROP_30S
   ) {
     score -= 20;
 
@@ -405,11 +1358,12 @@ function calculateHealth(data) {
     );
   }
 
-  // Prix
-
   if (
-    Number.isFinite(price10s) &&
-    price10s <= ENTRY_PRICE_DROP_10S
+    Number.isFinite(
+      price10s
+    ) &&
+    price10s <=
+      ENTRY_PRICE_DROP_10S
   ) {
     score -= 20;
 
@@ -418,21 +1372,28 @@ function calculateHealth(data) {
     );
   }
 
-  // Activité
-
   const totalActivity =
-    data.buys5m + data.sells5m;
+    data.buys5m +
+    data.sells5m;
 
-  if (totalActivity === 0) {
+  if (
+    totalActivity === 0
+  ) {
     score -= 10;
 
-    signals.push("activité faible");
+    signals.push(
+      "activité faible"
+    );
   }
 
-  score = Math.max(
-    0,
-    Math.min(100, score)
-  );
+  score =
+    Math.max(
+      0,
+      Math.min(
+        100,
+        score
+      )
+    );
 
   return {
     score,
@@ -447,21 +1408,32 @@ function calculateHealth(data) {
 // CRASH
 // ============================================================
 
-function detectCrash(data, health) {
-  const price10s = health.price10s;
-  const liquidity10s = health.liquidity10s;
+function detectCrash(
+  data,
+  health
+) {
+  const price10s =
+    health.price10s;
+
+  const liquidity10s =
+    health.liquidity10s;
 
   const reasons = [];
 
-  if (data.liquidity <= 1) {
+  if (
+    data.liquidity <= 1
+  ) {
     reasons.push(
       "liquidité quasi nulle"
     );
   }
 
   if (
-    Number.isFinite(liquidity10s) &&
-    liquidity10s <= CRASH_LIQUIDITY_DROP_10S
+    Number.isFinite(
+      liquidity10s
+    ) &&
+    liquidity10s <=
+      CRASH_LIQUIDITY_DROP_10S
   ) {
     reasons.push(
       `liquidité ${formatPercent(liquidity10s)} / 10s`
@@ -469,8 +1441,11 @@ function detectCrash(data, health) {
   }
 
   if (
-    Number.isFinite(price10s) &&
-    price10s <= CRASH_PRICE_DROP_10S
+    Number.isFinite(
+      price10s
+    ) &&
+    price10s <=
+      CRASH_PRICE_DROP_10S
   ) {
     reasons.push(
       `prix ${formatPercent(price10s)} / 10s`
@@ -484,16 +1459,57 @@ function detectCrash(data, health) {
 // ENTRÉE
 // ============================================================
 
-function canEnter(data, health, acceleration) {
+function canEnter(
+  data,
+  health,
+  acceleration
+) {
   const elapsed =
-    now() - sessionStartTime;
+    now() -
+    sessionStartTime;
+
+  /*
+  CRASH GUARD
+  */
 
   if (
-    elapsed >= NO_NEW_BUY_AFTER_MS
+    crashGuardLocked
   ) {
     return {
       ok: false,
-      reason: "limite de 43 minutes atteinte"
+      reason:
+        "Crash Guard verrouillé"
+    };
+  }
+
+  if (
+    crashGuardBuyBlocked
+  ) {
+    return {
+      ok: false,
+      reason:
+        `Crash Guard ${crashGuardLevel} : achats bloqués`
+    };
+  }
+
+  if (
+    !crashGuardArmed
+  ) {
+    return {
+      ok: false,
+      reason:
+        "Crash Guard non armé"
+    };
+  }
+
+  if (
+    elapsed >=
+    NO_NEW_BUY_AFTER_MS
+  ) {
+    return {
+      ok: false,
+      reason:
+        "limite de 43 minutes atteinte"
     };
   }
 
@@ -502,31 +1518,38 @@ function canEnter(data, health, acceleration) {
   ) {
     return {
       ok: false,
-      reason: "phase d'observation"
+      reason:
+        "phase d'observation"
     };
   }
 
   if (
-    data.liquidity < MIN_LIQUIDITY_USD
+    data.liquidity <
+    MIN_LIQUIDITY_USD
   ) {
     return {
       ok: false,
-      reason: "liquidité insuffisante"
+      reason:
+        "liquidité insuffisante"
     };
   }
 
   if (
-    health.score < MIN_HEALTH_SCORE_FOR_ENTRY
+    health.score <
+    MIN_HEALTH_SCORE_FOR_ENTRY
   ) {
     return {
       ok: false,
-      reason: `score santé ${health.score}/100`
+      reason:
+        `score santé ${health.score}/100`
     };
   }
 
   if (
-    acceleration.level === "WARNING" ||
-    acceleration.level === "EXTREME"
+    acceleration.level ===
+      "WARNING" ||
+    acceleration.level ===
+      "EXTREME"
   ) {
     return {
       ok: false,
@@ -541,13 +1564,15 @@ function canEnter(data, health, acceleration) {
   ) {
     return {
       ok: false,
-      reason: "historique insuffisant"
+      reason:
+        "historique insuffisant"
     };
   }
 
   return {
     ok: true,
-    reason: "conditions favorables"
+    reason:
+      "conditions favorables"
   };
 }
 
@@ -556,24 +1581,52 @@ function canEnter(data, health, acceleration) {
 // ============================================================
 
 async function simulateBuy(data) {
+  /*
+  Double sécurité juste avant achat.
+  */
+
+  if (
+    crashGuardLocked ||
+    crashGuardBuyBlocked ||
+    !crashGuardArmed
+  ) {
+    console.log(
+      "🛡️ Achat ignoré : Crash Guard actif."
+    );
+
+    return;
+  }
+
   cycleNumber++;
   sessionCycles++;
 
   const tokens =
-    FIXED_CAPITAL_USD / data.price;
+    FIXED_CAPITAL_USD /
+    data.price;
 
   position = {
-    cycle: cycleNumber,
-    entryTime: now(),
-    entryPrice: data.price,
-    capital: FIXED_CAPITAL_USD,
+    cycle:
+      cycleNumber,
+    entryTime:
+      now(),
+    entryPrice:
+      data.price,
+    capital:
+      FIXED_CAPITAL_USD,
     tokens,
     targetPrice:
       data.price *
-      (1 + TARGET_GAIN_PERCENT / 100)
+      (
+        1 +
+        TARGET_GAIN_PERCENT /
+          100
+      )
   };
 
-  const health = calculateHealth(data);
+  const health =
+    calculateHealth(
+      data
+    );
 
   const acceleration =
     calculateAcceleration();
@@ -628,8 +1681,27 @@ ${healthyConfirmations}/${REQUIRED_HEALTHY_CONFIRMATIONS}`
 // VENTE CIBLE
 // ============================================================
 
-async function simulateTargetSell(data) {
-  if (!position) return;
+async function simulateTargetSell(
+  data
+) {
+  if (!position) {
+    return;
+  }
+
+  /*
+  Crash Guard :
+  aucune vente normale après CRITICAL.
+  */
+
+  if (
+    crashGuardLocked
+  ) {
+    console.log(
+      "🛡️ Vente cible annulée : Crash Guard verrouillé."
+    );
+
+    return;
+  }
 
   const entryPrice =
     position.entryPrice;
@@ -637,40 +1709,61 @@ async function simulateTargetSell(data) {
   const targetPrice =
     position.targetPrice;
 
-  // On utilise le prix cible exact.
-
   const simulatedAmount =
     FIXED_CAPITAL_USD *
-    (targetPrice / entryPrice);
+    (
+      targetPrice /
+      entryPrice
+    );
 
   const profit =
     simulatedAmount -
     FIXED_CAPITAL_USD;
 
-  sessionProfit += profit;
+  sessionProfit +=
+    profit;
 
   const trade = {
     type: "TARGET",
-    sessionStart: sessionStartTime,
-    timestamp: now(),
+    sessionStart:
+      sessionStartTime,
+    timestamp:
+      now(),
     mint,
-    cycle: position.cycle,
+    cycle:
+      position.cycle,
     entryPrice,
-    exitPrice: targetPrice,
-    capital: FIXED_CAPITAL_USD,
-    amount: simulatedAmount,
+    exitPrice:
+      targetPrice,
+    capital:
+      FIXED_CAPITAL_USD,
+    amount:
+      simulatedAmount,
     profit,
     profitPercent:
-      (profit / FIXED_CAPITAL_USD) * 100
+      (
+        profit /
+        FIXED_CAPITAL_USD
+      ) * 100
   };
 
-  tradeHistory.push(trade);
+  tradeHistory.push(
+    trade
+  );
 
-  saveJson(TRADES_FILE, tradeHistory);
+  saveJson(
+    TRADES_FILE,
+    tradeHistory
+  );
+
+  const cycle =
+    position.cycle;
+
+  position = null;
 
   await bot.telegram.sendMessage(
     CHAT_ID,
-    `🔴 VENTE TEST #${position.cycle}
+    `🔴 VENTE TEST #${cycle}
 
 Token :
 
@@ -707,27 +1800,34 @@ ${formatUsd(FIXED_CAPITAL_USD)}
 ❌ Aucun rachat immédiat.`
   );
 
-  position = null;
-
   observationUntil =
     now() +
     OBSERVATION_AFTER_SELL_MS;
 
-  healthyConfirmations = 0;
+  healthyConfirmations =
+    0;
 }
 
 // ============================================================
-// SORTIE À 180 MINUTES
+// SORTIE À 45 MINUTES
 // ============================================================
 
-async function timeLimitExit(data) {
-  if (!position) return;
-
-  // On ne simule une sortie que si la liquidité
-  // est suffisamment crédible.
+async function timeLimitExit(
+  data
+) {
+  if (!position) {
+    return;
+  }
 
   if (
-    data.liquidity <= MIN_LIQUIDITY_USD
+    crashGuardLocked
+  ) {
+    return;
+  }
+
+  if (
+    data.liquidity <=
+    MIN_LIQUIDITY_USD
   ) {
     await bot.telegram.sendMessage(
       CHAT_ID,
@@ -757,36 +1857,59 @@ La liquidité n'est pas suffisamment fiable.
     return;
   }
 
-  const exitPrice = data.price;
+  const exitPrice =
+    data.price;
 
   const amount =
-    position.tokens * exitPrice;
+    position.tokens *
+    exitPrice;
 
   const profit =
-    amount - position.capital;
+    amount -
+    position.capital;
 
   const profitPercent =
-    (profit / position.capital) * 100;
+    (
+      profit /
+      position.capital
+    ) * 100;
 
-  sessionProfit += profit;
+  sessionProfit +=
+    profit;
 
   const trade = {
-    type: "TIME_LIMIT",
-    sessionStart: sessionStartTime,
-    timestamp: now(),
+    type:
+      "TIME_LIMIT",
+    sessionStart:
+      sessionStartTime,
+    timestamp:
+      now(),
     mint,
-    cycle: position.cycle,
-    entryPrice: position.entryPrice,
+    cycle:
+      position.cycle,
+    entryPrice:
+      position.entryPrice,
     exitPrice,
-    capital: position.capital,
+    capital:
+      position.capital,
     amount,
     profit,
     profitPercent
   };
 
-  tradeHistory.push(trade);
+  tradeHistory.push(
+    trade
+  );
 
-  saveJson(TRADES_FILE, tradeHistory);
+  saveJson(
+    TRADES_FILE,
+    tradeHistory
+  );
+
+  const cycle =
+    position.cycle;
+
+  position = null;
 
   await bot.telegram.sendMessage(
     CHAT_ID,
@@ -798,11 +1921,11 @@ ${mint}
 
 Cycle :
 
-#${position.cycle}
+#${cycle}
 
 Prix d'entrée :
 
-$${position.entryPrice.toFixed(8)}
+$${trade.entryPrice.toFixed(8)}
 
 Prix de sortie :
 
@@ -822,35 +1945,46 @@ ${profit >= 0 ? "+" : ""}${formatUsd(sessionProfit)}
 
 ⛔ Aucun nouveau cycle.`
   );
-
-  position = null;
 }
 
 // ============================================================
 // ACCÉLÉRATION TELEGRAM
 // ============================================================
 
-async function handleAccelerationAlert(acceleration) {
+async function handleAccelerationAlert(
+  acceleration
+) {
   const danger =
-    acceleration.level === "WARNING" ||
-    acceleration.level === "EXTREME";
+    acceleration.level ===
+      "WARNING" ||
+    acceleration.level ===
+      "EXTREME";
 
   if (!danger) {
-    accelerationWarningActive = false;
-    accelerationAlertSent = false;
+    accelerationWarningActive =
+      false;
+
+    accelerationAlertSent =
+      false;
+
     return;
   }
 
-  accelerationWarningActive = true;
+  accelerationWarningActive =
+    true;
 
-  if (accelerationAlertSent) {
+  if (
+    accelerationAlertSent
+  ) {
     return;
   }
 
-  accelerationAlertSent = true;
+  accelerationAlertSent =
+    true;
 
   const message =
-    acceleration.level === "EXTREME"
+    acceleration.level ===
+    "EXTREME"
       ? "🚨 ACCÉLÉRATION TRÈS FORTE"
       : "⚡ ACCÉLÉRATION ANORMALE";
 
@@ -885,7 +2019,10 @@ ${
 Raisons :
 
 ${acceleration.reasons
-  .map((reason) => `• ${reason}`)
+  .map(
+    (reason) =>
+      `• ${reason}`
+  )
   .join("\n")}`
   );
 }
@@ -901,66 +2038,97 @@ async function saveCrashReport(
   reasons
 ) {
   const cutoff =
-    now() - CRASH_REPORT_WINDOW_MS;
+    now() -
+    CRASH_REPORT_WINDOW_MS;
 
   const last60Seconds =
     marketHistory.filter(
       (point) =>
-        point.timestamp >= cutoff
+        point.timestamp >=
+        cutoff
     );
 
   const report = {
-    id: `crash_${now()}`,
-    timestamp: new Date().toISOString(),
-    sessionStart: new Date(
-      sessionStartTime
-    ).toISOString(),
+    id:
+      `crash_${now()}`,
+    timestamp:
+      new Date().toISOString(),
+    sessionStart:
+      new Date(
+        sessionStartTime
+      ).toISOString(),
     mint,
-    cyclesCompleted: sessionCycles,
+    cyclesCompleted:
+      sessionCycles,
     sessionProfit,
     crashMarket: {
-      price: data.price,
-      liquidity: data.liquidity,
-      priceChange10s: health.price10s,
+      price:
+        data.price,
+      liquidity:
+        data.liquidity,
+      priceChange10s:
+        health.price10s,
       liquidityChange10s:
         health.liquidity10s,
-      score: health.score
+      score:
+        health.score
     },
     acceleration: {
-      level: acceleration.level,
-      price5s: acceleration.price5s,
-      price10s: acceleration.price10s,
+      level:
+        acceleration.level,
+      price5s:
+        acceleration.price5s,
+      price10s:
+        acceleration.price10s,
       liquidity10s:
         acceleration.liquidity10s,
-      reasons: acceleration.reasons
+      reasons:
+        acceleration.reasons
     },
     reasons,
-    openPosition: position
-      ? {
-          cycle: position.cycle,
-          entryPrice:
-            position.entryPrice,
-          tokens: position.tokens,
-          capital: position.capital
-        }
-      : null,
+    openPosition:
+      position
+        ? {
+            cycle:
+              position.cycle,
+            entryPrice:
+              position.entryPrice,
+            tokens:
+              position.tokens,
+            capital:
+              position.capital
+          }
+        : null,
     last60Seconds
   };
 
   let reports = [];
 
   try {
-    if (fs.existsSync(CRASH_FILE)) {
+    if (
+      fs.existsSync(
+        CRASH_FILE
+      )
+    ) {
       const content =
         fs.readFileSync(
           CRASH_FILE,
           "utf8"
         );
 
-      if (content.trim()) {
-        reports = JSON.parse(content);
+      if (
+        content.trim()
+      ) {
+        reports =
+          JSON.parse(
+            content
+          );
 
-        if (!Array.isArray(reports)) {
+        if (
+          !Array.isArray(
+            reports
+          )
+        ) {
           reports = [];
         }
       }
@@ -969,15 +2137,22 @@ async function saveCrashReport(
     reports = [];
   }
 
-  reports.push(report);
+  reports.push(
+    report
+  );
 
-  // On garde les 20 derniers crash reports
-
-  if (reports.length > 20) {
-    reports = reports.slice(-20);
+  if (
+    reports.length >
+    20
+  ) {
+    reports =
+      reports.slice(-20);
   }
 
-  saveJson(CRASH_FILE, reports);
+  saveJson(
+    CRASH_FILE,
+    reports
+  );
 
   return report;
 }
@@ -986,27 +2161,38 @@ async function saveCrashReport(
 // RAPPORT TELEGRAM
 // ============================================================
 
-async function sendCrashReport(report) {
-  const market = report.crashMarket;
+async function sendCrashReport(
+  report
+) {
+  const market =
+    report.crashMarket;
 
   const acceleration =
     report.acceleration;
 
   const lastPoints =
-    report.last60Seconds.slice(-15);
+    report.last60Seconds.slice(
+      -15
+    );
 
   let lines = "";
 
-  for (const point of lastPoints) {
+  for (
+    const point of
+    lastPoints
+  ) {
     const time =
       new Date(
         point.timestamp
       ).toLocaleTimeString(
         "fr-FR",
         {
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit"
+          hour:
+            "2-digit",
+          minute:
+            "2-digit",
+          second:
+            "2-digit"
         }
       );
 
@@ -1063,7 +2249,10 @@ ${formatPercent(acceleration.price10s)}
 🚨 Signaux :
 
 ${report.reasons
-  .map((reason) => `• ${reason}`)
+  .map(
+    (reason) =>
+      `• ${reason}`
+  )
   .join("\n")}
 
 📈 DERNIERS POINTS AVANT CRASH
@@ -1072,7 +2261,9 @@ ${lines}
 
 💰 Bénéfices session :
 
-${formatUsd(report.sessionProfit)}
+${formatUsd(
+  report.sessionProfit
+)}
 
 🔄 Cycles terminés :
 
@@ -1083,14 +2274,17 @@ ${report.cyclesCompleted}
 crash_reports.json`
   );
 
-  // Envoie aussi le fichier directement dans Telegram.
-
   try {
-    if (fs.existsSync(CRASH_FILE)) {
+    if (
+      fs.existsSync(
+        CRASH_FILE
+      )
+    ) {
       await bot.telegram.sendDocument(
         CHAT_ID,
         {
-          source: CRASH_FILE
+          source:
+            CRASH_FILE
         },
         {
           caption:
@@ -1107,7 +2301,7 @@ crash_reports.json`
 }
 
 // ============================================================
-// CRASH
+// CRASH V5.1
 // ============================================================
 
 async function handleCrash(
@@ -1116,7 +2310,9 @@ async function handleCrash(
   acceleration,
   reasons
 ) {
-  if (!active) return;
+  if (!active) {
+    return;
+  }
 
   const report =
     await saveCrashReport(
@@ -1140,15 +2336,21 @@ $${data.price.toFixed(8)}
 
 Variation prix ~10s :
 
-${formatPercent(health.price10s)}
+${formatPercent(
+  health.price10s
+)}
 
 Liquidité :
 
-${formatUsd(data.liquidity)}
+${formatUsd(
+  data.liquidity
+)}
 
 Variation liquidité ~10s :
 
-${formatPercent(health.liquidity10s)}
+${formatPercent(
+  health.liquidity10s
+)}
 
 ⚡ Accélération :
 
@@ -1161,7 +2363,10 @@ ${health.score}/100
 ⚠️ Signaux :
 
 ${reasons
-  .map((reason) => `• ${reason}`)
+  .map(
+    (reason) =>
+      `• ${reason}`
+  )
   .join("\n")}
 
 ${
@@ -1187,7 +2392,11 @@ SAUVEGARDÉES
 ⛔ RADAR ARRÊTÉ`
   );
 
-  await sendCrashReport(report);
+  await sendCrashReport(
+    report
+  );
+
+  await disarmCrashGuard();
 
   stopRadar(false);
 }
@@ -1196,14 +2405,20 @@ SAUVEGARDÉES
 // LIMITE TEMPORELLE
 // ============================================================
 
-async function handleTimeLimit(data) {
-  if (!active) return false;
+async function handleTimeLimit(
+  data
+) {
+  if (!active) {
+    return false;
+  }
 
   const elapsed =
-    now() - sessionStartTime;
+    now() -
+    sessionStartTime;
 
   if (
-    elapsed < MAX_TOKEN_SESSION_MS
+    elapsed <
+    MAX_TOKEN_SESSION_MS
   ) {
     return false;
   }
@@ -1231,11 +2446,19 @@ ${sessionProfit >= 0 ? "+" : ""}${formatUsd(sessionProfit)}
 ⛔ Aucun nouveau cycle.`
   );
 
-  if (position) {
-    await timeLimitExit(data);
+  if (
+    position
+  ) {
+    await timeLimitExit(
+      data
+    );
   }
 
-  await saveSummary("TIME_LIMIT");
+  await saveSummary(
+    "TIME_LIMIT"
+  );
+
+  await disarmCrashGuard();
 
   stopRadar(false);
 
@@ -1247,37 +2470,63 @@ ${sessionProfit >= 0 ? "+" : ""}${formatUsd(sessionProfit)}
 // ============================================================
 
 async function tick() {
-  if (!active || !mint) {
+  if (
+    !active ||
+    !mint
+  ) {
+    return;
+  }
+
+  /*
+  Si le Guard a déjà verrouillé V5.1,
+  on arrête immédiatement les actions.
+  */
+
+  if (
+    crashGuardLocked
+  ) {
     return;
   }
 
   const data =
-    await getMarketData(mint);
+    await getMarketData(
+      mint
+    );
 
   if (!data) {
     return;
   }
 
-  addMarketPoint(data);
+  addMarketPoint(
+    data
+  );
 
   const health =
-    calculateHealth(data);
+    calculateHealth(
+      data
+    );
 
   const acceleration =
     calculateAcceleration();
-
-  // Accélération
 
   await handleAccelerationAlert(
     acceleration
   );
 
-  // Crash prioritaire
+  /*
+  Crash V5.1 existant.
+  */
 
   const crashReasons =
-    detectCrash(data, health);
+    detectCrash(
+      data,
+      health
+    );
 
-  if (crashReasons.length > 0) {
+  if (
+    crashReasons.length >
+    0
+  ) {
     await handleCrash(
       data,
       health,
@@ -1288,43 +2537,65 @@ async function tick() {
     return;
   }
 
-  // Limite 45 min
+  /*
+  Limite 45 minutes.
+  */
 
   const timeStopped =
-    await handleTimeLimit(data);
+    await handleTimeLimit(
+      data
+    );
 
-  if (timeStopped) {
+  if (
+    timeStopped
+  ) {
     return;
   }
 
-  // ----------------------------------------------------------
-  // POSITION OUVERTE
-  // ----------------------------------------------------------
+  /*
+  Vérification supplémentaire juste
+  avant toute action de trading.
+  */
 
-  if (position) {
+  if (
+    crashGuardLocked
+  ) {
+    return;
+  }
+
+  /*
+  POSITION OUVERTE
+  */
+
+  if (
+    position
+  ) {
     if (
       data.price >=
       position.targetPrice
     ) {
-      await simulateTargetSell(data);
+      await simulateTargetSell(
+        data
+      );
     }
 
     return;
   }
 
-  // ----------------------------------------------------------
-  // OBSERVATION
-  // ----------------------------------------------------------
+  /*
+  OBSERVATION
+  */
 
   if (
-    observationUntil > now()
+    observationUntil >
+    now()
   ) {
     return;
   }
 
-  // ----------------------------------------------------------
-  // FILTRE D'ENTRÉE
-  // ----------------------------------------------------------
+  /*
+  FILTRE D'ENTRÉE
+  */
 
   const entry =
     canEnter(
@@ -1333,8 +2604,12 @@ async function tick() {
       acceleration
     );
 
-  if (!entry.ok) {
-    healthyConfirmations = 0;
+  if (
+    !entry.ok
+  ) {
+    healthyConfirmations =
+      0;
+
     return;
   }
 
@@ -1348,8 +2623,27 @@ async function tick() {
     healthyConfirmations >=
     REQUIRED_HEALTHY_CONFIRMATIONS
   ) {
-    await simulateBuy(data);
-    healthyConfirmations = 0;
+    /*
+    Dernière vérification.
+    */
+
+    if (
+      crashGuardLocked ||
+      crashGuardBuyBlocked ||
+      !crashGuardArmed
+    ) {
+      healthyConfirmations =
+        0;
+
+      return;
+    }
+
+    await simulateBuy(
+      data
+    );
+
+    healthyConfirmations =
+      0;
   }
 }
 
@@ -1357,14 +2651,18 @@ async function tick() {
 // SUMMARY
 // ============================================================
 
-async function saveSummary(reason) {
+async function saveSummary(
+  reason
+) {
   const summary = {
-    version: "V5.1",
-    sessionStart: sessionStartTime
-      ? new Date(
-          sessionStartTime
-        ).toISOString()
-      : null,
+    version:
+      "V5.1",
+    sessionStart:
+      sessionStartTime
+        ? new Date(
+            sessionStartTime
+          ).toISOString()
+        : null,
     sessionEnd:
       new Date().toISOString(),
     mint,
@@ -1375,7 +2673,19 @@ async function saveSummary(reason) {
     positionOpen:
       !!position,
     marketPoints:
-      marketHistory.length
+      marketHistory.length,
+    crashGuard: {
+      armed:
+        crashGuardArmed,
+      level:
+        crashGuardLevel,
+      buyBlocked:
+        crashGuardBuyBlocked,
+      locked:
+        crashGuardLocked,
+      emergencyExitDone:
+        crashGuardEmergencyExitDone
+    }
   };
 
   saveJson(
@@ -1388,7 +2698,9 @@ async function saveSummary(reason) {
 // START
 // ============================================================
 
-async function startRadar(tokenMint) {
+async function startRadar(
+  tokenMint
+) {
   if (active) {
     await bot.telegram.sendMessage(
       CHAT_ID,
@@ -1404,29 +2716,84 @@ Utilise /stoptrade avant d'en lancer un autre.`
     return;
   }
 
-  mint = tokenMint.trim();
+  /*
+  ARMEMENT DU CRASH GUARD AVANT
+  DE DÉMARRER LA SESSION V5.1.
+  */
 
-  active = true;
+  try {
+    await armCrashGuard(
+      tokenMint.trim()
+    );
 
-  sessionStartTime = now();
+  } catch (error) {
 
-  observationUntil = 0;
+    console.error(
+      "❌ Impossible d'armer le Crash Guard:",
+      error.message
+    );
 
-  position = null;
+    await bot.telegram.sendMessage(
+      CHAT_ID,
+      `❌ V5.1 NON DÉMARRÉE
 
-  cycleNumber = 0;
+Token :
 
-  sessionCycles = 0;
+${tokenMint}
 
-  sessionProfit = 0;
+🛡️ Crash Guard :
 
-  healthyConfirmations = 0;
+❌ ARMEMENT IMPOSSIBLE
 
-  marketHistory = [];
+Erreur :
 
-  accelerationWarningActive = false;
+${error.message}
 
-  accelerationAlertSent = false;
+⛔ Aucun achat ne sera lancé.
+
+Vérifie que le service Crash Guard
+est bien démarré et que les variables
+sont correctement configurées.`
+    );
+
+    return;
+  }
+
+  mint =
+    tokenMint.trim();
+
+  active =
+    true;
+
+  sessionStartTime =
+    now();
+
+  observationUntil =
+    0;
+
+  position =
+    null;
+
+  cycleNumber =
+    0;
+
+  sessionCycles =
+    0;
+
+  sessionProfit =
+    0;
+
+  healthyConfirmations =
+    0;
+
+  marketHistory =
+    [];
+
+  accelerationWarningActive =
+    false;
+
+  accelerationAlertSent =
+    false;
 
   console.log(
     `🚀 V5.1 démarrée pour ${shortMint(mint)}`
@@ -1456,6 +2823,22 @@ ${formatUsd(FIXED_CAPITAL_USD)}
 
 ACTIF
 
+🛡️ CRASH GUARD :
+
+ACTIF
+
+🟢 WATCH :
+
+Aucune action
+
+🟠 DANGER :
+
+Nouveaux achats bloqués
+
+🔴 CRITICAL :
+
+Sortie d'urgence + verrouillage
+
 ⏱️ Durée maximale :
 
 45 minutes
@@ -1477,43 +2860,66 @@ DIRECTEMENT DANS TELEGRAM
 Aucune transaction réelle.`
   );
 
-  pollTimer = setInterval(
-    () => {
-      tick().catch((error) => {
-        console.error(
-          "❌ Erreur tick:",
-          error.message
+  pollTimer =
+    setInterval(
+      () => {
+        tick().catch(
+          (error) => {
+            console.error(
+              "❌ Erreur tick:",
+              error.message
+            );
+          }
         );
-      });
-    },
-    POLL_INTERVAL_MS
-  );
-
-  // Premier passage immédiat
-
-  tick().catch((error) => {
-    console.error(
-      "❌ Erreur tick initial:",
-      error.message
+      },
+      POLL_INTERVAL_MS
     );
-  });
+
+  tick().catch(
+    (error) => {
+      console.error(
+        "❌ Erreur tick initial:",
+        error.message
+      );
+    }
+  );
 }
 
 // ============================================================
 // STOP
 // ============================================================
 
-async function stopRadar(sendMessage = true) {
-  active = false;
+async function stopRadar(
+  sendMessage = true,
+  skipGuardDisarm = false
+) {
+  active =
+    false;
 
-  if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = null;
+  if (
+    pollTimer
+  ) {
+    clearInterval(
+      pollTimer
+    );
+
+    pollTimer =
+      null;
   }
 
-  await saveSummary("STOP");
+  await saveSummary(
+    "STOP"
+  );
 
-  if (sendMessage) {
+  if (
+    !skipGuardDisarm
+  ) {
+    await disarmCrashGuard();
+  }
+
+  if (
+    sendMessage
+  ) {
     await bot.telegram.sendMessage(
       CHAT_ID,
       `⛔ TEST ARRÊTÉ
@@ -1534,6 +2940,10 @@ ${sessionProfit >= 0 ? "+" : ""}${formatUsd(sessionProfit)}
 
 ${position ? "OUI" : "NON"}
 
+🛡️ Crash Guard :
+
+DÉSARMÉ
+
 ⚠️ Simulation uniquement.`
     );
   }
@@ -1547,63 +2957,84 @@ ${position ? "OUI" : "NON"}
 // COMMANDES TELEGRAM
 // ============================================================
 
-bot.command("starttrade", async (ctx) => {
-  const parts =
-    ctx.message.text.trim().split(/\s+/);
+bot.command(
+  "starttrade",
+  async (ctx) => {
+    const parts =
+      ctx.message.text
+        .trim()
+        .split(/\s+/);
 
-  if (parts.length < 2) {
-    await ctx.reply(
-      `❌ Indique le mint du token.
+    if (
+      parts.length < 2
+    ) {
+      await ctx.reply(
+        `❌ Indique le mint du token.
 
 Exemple :
 
 /starttrade TON_MINT`
+      );
+
+      return;
+    }
+
+    await startRadar(
+      parts[1]
     );
-
-    return;
   }
+);
 
-  await startRadar(parts[1]);
-});
+bot.command(
+  "stoptrade",
+  async (ctx) => {
+    if (!active) {
+      await ctx.reply(
+        "ℹ️ Aucun test en cours."
+      );
 
-bot.command("stoptrade", async (ctx) => {
-  if (!active) {
-    await ctx.reply(
-      "ℹ️ Aucun test en cours."
+      return;
+    }
+
+    await stopRadar(
+      true
     );
-
-    return;
   }
+);
 
-  await stopRadar(true);
-});
-
-bot.command("status", async (ctx) => {
-  if (!active) {
-    await ctx.reply(
-      `⚪ Aucun test en cours.
+bot.command(
+  "status",
+  async (ctx) => {
+    if (!active) {
+      await ctx.reply(
+        `⚪ Aucun test en cours.
 
 V5.1 prête.`
-    );
+      );
 
-    return;
-  }
+      return;
+    }
 
-  const elapsed =
-    now() - sessionStartTime;
+    const elapsed =
+      now() -
+      sessionStartTime;
 
-  const minutes =
-    Math.floor(
-      elapsed / 60000
-    );
+    const minutes =
+      Math.floor(
+        elapsed /
+          60000
+      );
 
-  const seconds =
-    Math.floor(
-      (elapsed % 60000) / 1000
-    );
+    const seconds =
+      Math.floor(
+        (
+          elapsed %
+          60000
+        ) / 1000
+      );
 
-  await ctx.reply(
-    `📊 STATUS V5.1
+    await ctx.reply(
+      `📊 STATUS V5.1
 
 Token :
 
@@ -1629,53 +3060,83 @@ ${position ? "OUVERTE" : "AUCUNE"}
 
 ${accelerationWarningActive ? "⚠️ ACTIVE" : "🟢 normale"}
 
+🛡️ Crash Guard :
+
+${crashGuardLevel}
+
+🛒 Achats :
+
+${crashGuardBuyBlocked ? "⛔ BLOQUÉS" : "🟢 AUTORISÉS"}
+
+🔒 Verrouillage :
+
+${crashGuardLocked ? "🔴 OUI" : "🟢 NON"}
+
+🚨 Sortie urgence :
+
+${crashGuardEmergencyExitDone ? "EFFECTUÉE" : "NON"}
+
 🛡️ Confirmations :
 
 ${healthyConfirmations}/${REQUIRED_HEALTHY_CONFIRMATIONS}`
-  );
-});
+    );
+  }
+);
 
 // ============================================================
 // DERNIER CRASH
 // ============================================================
 
-bot.command("lastcrash", async (ctx) => {
-  if (!fs.existsSync(CRASH_FILE)) {
-    await ctx.reply(
-      `📂 Aucun crash report trouvé.
-
-Le prochain crash sera automatiquement sauvegardé ici et envoyé dans Telegram.`
-    );
-
-    return;
-  }
-
-  try {
-    const content =
-      fs.readFileSync(
-        CRASH_FILE,
-        "utf8"
-      );
-
-    const reports =
-      JSON.parse(content);
-
+bot.command(
+  "lastcrash",
+  async (ctx) => {
     if (
-      !Array.isArray(reports) ||
-      reports.length === 0
+      !fs.existsSync(
+        CRASH_FILE
+      )
     ) {
       await ctx.reply(
-        "📂 Aucun crash report disponible."
+        `📂 Aucun crash report trouvé.
+
+Le prochain crash sera automatiquement sauvegardé ici et envoyé dans Telegram.`
       );
 
       return;
     }
 
-    const last =
-      reports[reports.length - 1];
+    try {
+      const content =
+        fs.readFileSync(
+          CRASH_FILE,
+          "utf8"
+        );
 
-    await ctx.reply(
-      `📊 DERNIER CRASH
+      const reports =
+        JSON.parse(
+          content
+        );
+
+      if (
+        !Array.isArray(
+          reports
+        ) ||
+        reports.length ===
+          0
+      ) {
+        await ctx.reply(
+          "📂 Aucun crash report disponible."
+        );
+
+        return;
+      }
+
+      const last =
+        reports[
+          reports.length - 1
+        ];
+
+      await ctx.reply(
+        `📊 DERNIER CRASH
 
 Token :
 
@@ -1691,7 +3152,9 @@ ${last.cyclesCompleted}
 
 Bénéfice session :
 
-${formatUsd(last.sessionProfit)}
+${formatUsd(
+  last.sessionProfit
+)}
 
 Prix :
 
@@ -1710,34 +3173,38 @@ ${formatUsd(
 ${last.acceleration.level}
 
 📁 Le fichier complet va être envoyé.`
-    );
+      );
 
-    await ctx.replyWithDocument(
-      {
-        source: CRASH_FILE
-      },
-      {
-        caption:
-          "📁 crash_reports.json"
-      }
-    );
+      await ctx.replyWithDocument(
+        {
+          source:
+            CRASH_FILE
+        },
+        {
+          caption:
+            "📁 crash_reports.json"
+        }
+      );
 
-  } catch (error) {
-    await ctx.reply(
-      `❌ Impossible de lire le crash report.
+    } catch (error) {
+      await ctx.reply(
+        `❌ Impossible de lire le crash report.
 
 ${error.message}`
-    );
+      );
+    }
   }
-});
+);
 
 // ============================================================
 // AIDE
 // ============================================================
 
-bot.command("help", async (ctx) => {
-  await ctx.reply(
-    `🤖 COMMANDES V5.1
+bot.command(
+  "help",
+  async (ctx) => {
+    await ctx.reply(
+      `🤖 COMMANDES V5.1
 
 /starttrade MINT
 
@@ -1759,9 +3226,21 @@ bot.command("help", async (ctx) => {
 
 ℹ️ affiche cette aide
 
+🛡️ CRASH GUARD
+
+🟡 WATCH
+Aucune action
+
+🟠 DANGER
+Achats bloqués
+
+🔴 CRITICAL
+Sortie d'urgence + verrouillage total
+
 ⚠️ V5.1 = SIMULATION UNIQUEMENT`
-  );
-});
+    );
+  }
+);
 
 // ============================================================
 // LANCEMENT
@@ -1773,14 +3252,30 @@ console.log(
   "🤖 Bot Telegram V5.1 lancé."
 );
 
-// Arrêt propre
+// ============================================================
+// ARRÊT PROPRE
+// ============================================================
+
+async function shutdown() {
+  try {
+    await disarmCrashGuard();
+  } catch {}
+
+  try {
+    v51Server.close();
+  } catch {}
+
+  bot.stop(
+    "SHUTDOWN"
+  );
+}
 
 process.once(
   "SIGINT",
-  () => bot.stop("SIGINT")
+  shutdown
 );
 
 process.once(
   "SIGTERM",
-  () => bot.stop("SIGTERM")
+  shutdown
 );
