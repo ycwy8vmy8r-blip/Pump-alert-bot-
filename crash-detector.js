@@ -255,20 +255,21 @@ async function getDexTokenPairs() {
 
 async function getSolPriceUsd() {
   try {
-    const response = await fetch(
-      DEX_SEARCH_URL
-    );
+    const url =
+      `https://api.dexscreener.com/tokens/v1/solana/${SOL_MINT},${USDC_MINT}`;
+
+    const response = await fetch(url);
 
     if (!response.ok) {
       throw new Error(
-        `DexScreener SOL/USDC HTTP ${response.status}`
+        `DexScreener SOL/USD HTTP ${response.status}`
       );
     }
 
     const data = await response.json();
 
-    const pairs = Array.isArray(data.pairs)
-      ? data.pairs
+    const pairs = Array.isArray(data)
+      ? data
       : [];
 
     const validPairs = pairs.filter(pair => {
@@ -282,8 +283,11 @@ async function getSolPriceUsd() {
         return false;
       }
 
-      const base = pair.baseToken.address;
-      const quote = pair.quoteToken.address;
+      const base =
+        pair.baseToken.address;
+
+      const quote =
+        pair.quoteToken.address;
 
       const isSolUsdc =
         (base === SOL_MINT && quote === USDC_MINT) ||
@@ -293,9 +297,13 @@ async function getSolPriceUsd() {
         return false;
       }
 
-      const price = Number(pair.priceUsd);
+      const price =
+        Number(pair.priceUsd);
 
-      return Number.isFinite(price) && price > 0;
+      return (
+        Number.isFinite(price) &&
+        price > 0
+      );
     });
 
     if (!validPairs.length) {
@@ -304,6 +312,8 @@ async function getSolPriceUsd() {
       );
     }
 
+    // On prend la paire SOL/USDC
+    // avec la plus grosse liquidité.
     validPairs.sort((a, b) => {
       const liquidityA =
         Number(a.liquidity?.usd) || 0;
@@ -317,7 +327,10 @@ async function getSolPriceUsd() {
     const price =
       Number(validPairs[0].priceUsd);
 
-    if (!Number.isFinite(price) || price <= 0) {
+    if (
+      !Number.isFinite(price) ||
+      price <= 0
+    ) {
       throw new Error(
         "Prix SOL/USD invalide"
       );
@@ -329,6 +342,8 @@ async function getSolPriceUsd() {
 
   } catch (err) {
 
+    // Si DexScreener répond temporairement mal,
+    // on conserve le dernier prix connu.
     if (
       solPriceUsd !== null &&
       Number.isFinite(solPriceUsd)
