@@ -253,8 +253,9 @@ async function getDexData() {
 // ============================================================
 
 async function getSolPriceUsd() {
+  // Endpoint le plus fiable actuellement
   const urls = [
-    "https://api.dexscreener.com/latest/dex/pairs/solana/So11111111111111111111111111111111111111112",
+    "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112",
     "https://api.dexscreener.com/latest/dex/search?q=SOL%20USDC",
   ];
 
@@ -266,9 +267,7 @@ async function getSolPriceUsd() {
 
       const data = await response.json();
 
-      const pairs = Array.isArray(data?.pairs)
-        ? data.pairs
-        : [];
+      const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
 
       const valid = pairs
         .filter((pair) => {
@@ -276,10 +275,12 @@ async function getSolPriceUsd() {
 
           const base = pair.baseToken?.address;
           const quote = pair.quoteToken?.address;
+          const chain = pair.chainId;
 
+          // On ne garde que les paires Solana qui contiennent vraiment le mint SOL
           return (
-            base === SOL_MINT ||
-            quote === SOL_MINT
+            chain === "solana" &&
+            (base === SOL_MINT || quote === SOL_MINT)
           );
         })
         .sort(
