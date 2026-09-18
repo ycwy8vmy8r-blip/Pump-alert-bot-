@@ -717,7 +717,7 @@ ${formatUsd(FIXED_CAPITAL_USD)}
 }
 
 // ============================================================
-// SORTIE À 45 MINUTES
+// SORTIE À 180 MINUTES
 // ============================================================
 
 async function timeLimitExit(data) {
@@ -731,7 +731,7 @@ async function timeLimitExit(data) {
   ) {
     await bot.telegram.sendMessage(
       CHAT_ID,
-      `⏰ LIMITE 45 MINUTES
+      `⏰ LIMITE 180 MINUTES
 
 Token :
 
@@ -790,7 +790,7 @@ La liquidité n'est pas suffisamment fiable.
 
   await bot.telegram.sendMessage(
     CHAT_ID,
-    `⏰ SORTIE LIMITE 45 MINUTES
+    `⏰ SORTIE LIMITE 180 MINUTES
 
 Token :
 
