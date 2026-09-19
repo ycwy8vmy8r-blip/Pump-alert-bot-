@@ -203,7 +203,7 @@ async function crashGuardRequest(
   const timeout =
     setTimeout(() => {
       controller.abort();
-    }, 5000);
+    }, 15000);
 
   try {
     const options = {
@@ -237,6 +237,15 @@ async function crashGuardRequest(
     }
 
     return await response.json();
+
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error(
+        "Délai dépassé lors de la communication avec le Crash Guard"
+      );
+    }
+
+    throw error;
 
   } finally {
     clearTimeout(timeout);
@@ -298,6 +307,12 @@ async function armCrashGuard(tokenMint) {
 async function disarmCrashGuard() {
   if (!isCrashGuardConfigured()) {
     crashGuardArmed = false;
+    crashGuardLevel = "NORMAL";
+    crashGuardBuyBlocked = false;
+    crashGuardLocked = false;
+    crashGuardEmergencyExitDone = false;
+    crashGuardEmergencyExitInProgress = false;
+    crashGuardLastEventId = null;
     return;
   }
 
@@ -371,8 +386,8 @@ async function emergencyExitFromCrashGuard(
 
   try {
     /*
-    Une seule sortie d'urgence
-    pour toute la session.
+    Verrouillage immédiat de la sortie.
+    Cela empêche toute seconde tentative.
     */
 
     crashGuardEmergencyExitDone =
@@ -424,7 +439,7 @@ ${mint}
 
     /*
     Aucun prix disponible :
-    on ne fabrique pas de prix.
+    aucun prix fictif.
     */
 
     if (
@@ -577,12 +592,6 @@ ${sessionProfit >= 0 ? "+" : ""}${formatUsd(sessionProfit)}
       error.message
     );
 
-    /*
-    Même en cas d'erreur, on ne permet
-    pas une seconde tentative automatique
-    qui pourrait créer une double sortie.
-    */
-
     await bot.telegram.sendMessage(
       CHAT_ID,
       `🔴 CRASH GUARD CRITICAL
@@ -623,7 +632,7 @@ async function applyCrashGuardSignal(
   }
 
   /*
-  Ignore les anciens événements.
+  Ignore les événements déjà traités.
   */
 
   if (
@@ -642,7 +651,8 @@ async function applyCrashGuardSignal(
   }
 
   /*
-  CRITICAL reste prioritaire.
+  Un verrou CRITICAL est définitif
+  jusqu'au prochain armement ou disarm.
   */
 
   if (
@@ -691,11 +701,6 @@ async function applyCrashGuardSignal(
     crashGuardLevel =
       "DANGER";
 
-    /*
-    DANGER bloque les nouveaux achats
-    pour le reste de la session.
-    */
-
     crashGuardBuyBlocked =
       true;
 
@@ -742,8 +747,9 @@ CRITICAL n'est reçu.`
     );
 
     /*
-    Après la sortie d'urgence,
+    Après CRITICAL :
     aucun nouveau cycle.
+    Le Guard reste armé et verrouillé.
     */
 
     if (active) {
@@ -754,7 +760,12 @@ CRITICAL n'est reçu.`
       stopRadar(
         false,
         true
-      );
+      ).catch(error => {
+        console.error(
+          "❌ Erreur arrêt après CRITICAL:",
+          error.message
+        );
+      });
     }
   }
 }
@@ -767,6 +778,7 @@ function parseRequestBody(req) {
   return new Promise(
     (resolve, reject) => {
       let body = "";
+      let settled = false;
 
       req.on(
         "data",
@@ -776,8 +788,11 @@ function parseRequestBody(req) {
 
           if (
             body.length >
-            100000
+            100000 &&
+            !settled
           ) {
+            settled = true;
+
             reject(
               new Error(
                 "Body trop volumineux"
@@ -792,6 +807,10 @@ function parseRequestBody(req) {
       req.on(
         "end",
         () => {
+          if (settled) {
+            return;
+          }
+
           try {
             resolve(
               body
@@ -810,7 +829,11 @@ function parseRequestBody(req) {
 
       req.on(
         "error",
-        reject
+        error => {
+          if (!settled) {
+            reject(error);
+          }
+        }
       );
     }
   );
@@ -911,19 +934,22 @@ const v51Server =
               req
             );
 
-          await applyCrashGuardSignal(
-            signal
-          );
+          /*
+          IMPORTANT :
+          on accuse réception immédiatement.
+          Le traitement du signal continue ensuite.
+          
+          Cela évite que Crash Guard attende
+          pendant les appels Telegram/DexScreener
+          et provoque un timeout HTTP.
+          */
 
           const body =
             JSON.stringify({
               ok: true,
+              received: true,
               level:
-                crashGuardLevel,
-              locked:
-                crashGuardLocked,
-              buyBlocked:
-                crashGuardBuyBlocked
+                signal?.level || null
             });
 
           res.writeHead(
@@ -938,27 +964,42 @@ const v51Server =
 
           res.end(body);
 
+          /*
+          Traitement asynchrone du signal.
+          */
+
+          applyCrashGuardSignal(
+            signal
+          ).catch(error => {
+            console.error(
+              "❌ Traitement Crash Guard:",
+              error.message
+            );
+          });
+
         } catch (error) {
           console.error(
             "❌ Crash Guard event:",
             error.message
           );
 
-          res.writeHead(
-            400,
-            {
-              "Content-Type":
-                "application/json"
-            }
-          );
+          if (!res.writableEnded) {
+            res.writeHead(
+              400,
+              {
+                "Content-Type":
+                  "application/json"
+              }
+            );
 
-          res.end(
-            JSON.stringify({
-              ok: false,
-              error:
-                error.message
-            })
-          );
+            res.end(
+              JSON.stringify({
+                ok: false,
+                error:
+                  error.message
+              })
+            );
+          }
         }
 
         return;
@@ -1468,10 +1509,6 @@ function canEnter(
     now() -
     sessionStartTime;
 
-  /*
-  CRASH GUARD
-  */
-
   if (
     crashGuardLocked
   ) {
@@ -1581,10 +1618,6 @@ function canEnter(
 // ============================================================
 
 async function simulateBuy(data) {
-  /*
-  Double sécurité juste avant achat.
-  */
-
   if (
     crashGuardLocked ||
     crashGuardBuyBlocked ||
@@ -1687,11 +1720,6 @@ async function simulateTargetSell(
   if (!position) {
     return;
   }
-
-  /*
-  Crash Guard :
-  aucune vente normale après CRITICAL.
-  */
 
   if (
     crashGuardLocked
@@ -1831,7 +1859,7 @@ async function timeLimitExit(
   ) {
     await bot.telegram.sendMessage(
       CHAT_ID,
-      `⏰ LIMITE 180 MINUTES
+      `⏰ LIMITE 45 MINUTES
 
 Token :
 
@@ -1913,7 +1941,7 @@ La liquidité n'est pas suffisamment fiable.
 
   await bot.telegram.sendMessage(
     CHAT_ID,
-    `⏰ SORTIE LIMITE 180 MINUTES
+    `⏰ SORTIE LIMITE 45 MINUTES
 
 Token :
 
@@ -2477,11 +2505,6 @@ async function tick() {
     return;
   }
 
-  /*
-  Si le Guard a déjà verrouillé V5.1,
-  on arrête immédiatement les actions.
-  */
-
   if (
     crashGuardLocked
   ) {
@@ -2513,10 +2536,6 @@ async function tick() {
     acceleration
   );
 
-  /*
-  Crash V5.1 existant.
-  */
-
   const crashReasons =
     detectCrash(
       data,
@@ -2537,10 +2556,6 @@ async function tick() {
     return;
   }
 
-  /*
-  Limite 45 minutes.
-  */
-
   const timeStopped =
     await handleTimeLimit(
       data
@@ -2552,20 +2567,11 @@ async function tick() {
     return;
   }
 
-  /*
-  Vérification supplémentaire juste
-  avant toute action de trading.
-  */
-
   if (
     crashGuardLocked
   ) {
     return;
   }
-
-  /*
-  POSITION OUVERTE
-  */
 
   if (
     position
@@ -2582,20 +2588,12 @@ async function tick() {
     return;
   }
 
-  /*
-  OBSERVATION
-  */
-
   if (
     observationUntil >
     now()
   ) {
     return;
   }
-
-  /*
-  FILTRE D'ENTRÉE
-  */
 
   const entry =
     canEnter(
@@ -2623,10 +2621,6 @@ async function tick() {
     healthyConfirmations >=
     REQUIRED_HEALTHY_CONFIRMATIONS
   ) {
-    /*
-    Dernière vérification.
-    */
-
     if (
       crashGuardLocked ||
       crashGuardBuyBlocked ||
@@ -2715,11 +2709,6 @@ Utilise /stoptrade avant d'en lancer un autre.`
 
     return;
   }
-
-  /*
-  ARMEMENT DU CRASH GUARD AVANT
-  DE DÉMARRER LA SESSION V5.1.
-  */
 
   try {
     await armCrashGuard(
