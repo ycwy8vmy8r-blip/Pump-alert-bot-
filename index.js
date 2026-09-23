@@ -56,7 +56,7 @@ const SOLANA_RPC_URL =
   "https://rpc.ankr.com/solana";
 
 const MIN_SOL_RESERVE =
-  Number(process.env.MIN_SOL_RESERVE || "0.01");
+  Number(process.env.MIN_SOL_RESERVE || "0.003");
 
 const MAX_DAILY_EUR =
   Number(process.env.MAX_DAILY_EUR || "1");
