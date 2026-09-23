@@ -1,14 +1,34 @@
-const { Telegraf } = require("telegraf");
+"use strict";
+
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
 
-// ============================================================
-// CONFIGURATION V5.1 TEST
-// ============================================================
+const bs58 = require("bs58");
+const BN = require("bn.js");
 
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const CHAT_ID = process.env.CHAT_ID;
+const {
+  Connection,
+  Keypair,
+  PublicKey,
+  Transaction,
+  ComputeBudgetProgram,
+  sendAndConfirmTransaction,
+} = require("@solana/web3.js");
+
+const { Telegraf } = require("telegraf");
+
+const {
+  OnlinePumpAmmSdk,
+  PUMP_AMM_SDK,
+} = require("@pump-fun/pump-swap-sdk");
+
+/* =========================================================
+   CONFIGURATION
+========================================================= */
+
+const BOT_TOKEN = process.env.BOT_TOKEN || "";
+const CHAT_ID = process.env.CHAT_ID || "";
 
 const CRASH_GUARD_URL =
   process.env.CRASH_GUARD_URL || "";
@@ -19,181 +39,1091 @@ const CRASH_GUARD_SECRET =
 const PORT =
   Number(process.env.PORT || 3000);
 
-if (!BOT_TOKEN || !CHAT_ID) {
-  console.error("❌ BOT_TOKEN ou CHAT_ID manquant.");
+const REAL_TRADING =
+  String(process.env.REAL_TRADING || "false").toLowerCase() === "true";
+
+const FIXED_CAPITAL_EUR =
+  Number(process.env.FIXED_CAPITAL_EUR || "0.10");
+
+const BUY_SLIPPAGE_PERCENT =
+  Number(process.env.BUY_SLIPPAGE_PERCENT || "1");
+
+const SELL_SLIPPAGE_PERCENT =
+  Number(process.env.SELL_SLIPPAGE_PERCENT || "2");
+
+const SOLANA_RPC_URL =
+  process.env.SOLANA_RPC_URL ||
+  "https://rpc.ankr.com/solana";
+
+const MIN_SOL_RESERVE =
+  Number(process.env.MIN_SOL_RESERVE || "0.01");
+
+const MAX_DAILY_EUR =
+  Number(process.env.MAX_DAILY_EUR || "1");
+
+const TRADING_PRIVATE_KEY =
+  process.env.TRADING_PRIVATE_KEY || "";
+
+const EXPECTED_WALLET =
+  "2vK4Th2R934xvwSrPnNu9c63W3QKq7KEF4zDQ3LQ2Gpy";
+
+if (!BOT_TOKEN) {
+  console.error("❌ BOT_TOKEN manquant");
   process.exit(1);
 }
 
+if (!CHAT_ID) {
+  console.error("❌ CHAT_ID manquant");
+  process.exit(1);
+}
+
+if (REAL_TRADING && !TRADING_PRIVATE_KEY) {
+  console.error("❌ TRADING_PRIVATE_KEY manquante alors que REAL_TRADING=true");
+  process.exit(1);
+}
+
+if (!Number.isFinite(FIXED_CAPITAL_EUR) || FIXED_CAPITAL_EUR <= 0) {
+  console.error("❌ FIXED_CAPITAL_EUR invalide");
+  process.exit(1);
+}
+
+if (
+  !Number.isFinite(BUY_SLIPPAGE_PERCENT) ||
+  BUY_SLIPPAGE_PERCENT < 0
+) {
+  console.error("❌ BUY_SLIPPAGE_PERCENT invalide");
+  process.exit(1);
+}
+
+if (
+  !Number.isFinite(SELL_SLIPPAGE_PERCENT) ||
+  SELL_SLIPPAGE_PERCENT < 0
+) {
+  console.error("❌ SELL_SLIPPAGE_PERCENT invalide");
+  process.exit(1);
+}
+
+/* =========================================================
+   SOLANA WALLET
+========================================================= */
+
+function loadTradingKeypair() {
+  if (!TRADING_PRIVATE_KEY) {
+    return null;
+  }
+
+  let keypair;
+
+  try {
+    if (TRADING_PRIVATE_KEY.trim().startsWith("[")) {
+      const arr = JSON.parse(TRADING_PRIVATE_KEY);
+
+      if (!Array.isArray(arr)) {
+        throw new Error("clé JSON invalide");
+      }
+
+      keypair = Keypair.fromSecretKey(
+        Uint8Array.from(arr)
+      );
+    } else {
+      const decoded = bs58.decode(
+        TRADING_PRIVATE_KEY.trim()
+      );
+
+      keypair = Keypair.fromSecretKey(
+        decoded
+      );
+    }
+  } catch (error) {
+    throw new Error(
+      `Impossible de décoder TRADING_PRIVATE_KEY: ${error.message}`
+    );
+  }
+
+  const derivedAddress =
+    keypair.publicKey.toBase58();
+
+  if (derivedAddress !== EXPECTED_WALLET) {
+    throw new Error(
+      `Le wallet dérivé de TRADING_PRIVATE_KEY est ${derivedAddress}, attendu ${EXPECTED_WALLET}`
+    );
+  }
+
+  return keypair;
+}
+
+let tradingWallet = null;
+
+try {
+  tradingWallet = loadTradingKeypair();
+} catch (error) {
+  console.error("❌", error.message);
+  process.exit(1);
+}
+
+const connection =
+  new Connection(
+    SOLANA_RPC_URL,
+    "confirmed"
+  );
+
+const onlineAmmSdk =
+  new OnlinePumpAmmSdk(connection);
+
+/* =========================================================
+   TELEGRAM
+========================================================= */
+
 const bot = new Telegraf(BOT_TOKEN);
 
-// ---------------- STRATÉGIE ----------------
+/* =========================================================
+   STRATEGIE V5.1
+========================================================= */
 
-const FIXED_CAPITAL_USD = 10;
 const TARGET_GAIN_PERCENT = 5;
-const POLL_INTERVAL_MS = 2000;
-const HISTORY_WINDOW_MS = 120000;
-const CRASH_REPORT_WINDOW_MS = 60000;
-const OBSERVATION_AFTER_SELL_MS = 30000;
-const MAX_TOKEN_SESSION_MS = 45 * 60 * 1000;
-const NO_NEW_BUY_AFTER_MS = 43 * 60 * 1000;
 
-// ---------------- LIQUIDITÉ ----------------
+const POLL_INTERVAL_MS = 2000;
+
+const HISTORY_WINDOW_MS = 120000;
+
+const CRASH_REPORT_WINDOW_MS = 60000;
+
+const OBSERVATION_AFTER_SELL_MS = 30000;
+
+const MAX_TOKEN_SESSION_MS =
+  45 * 60 * 1000;
+
+const NO_NEW_BUY_AFTER_MS =
+  43 * 60 * 1000;
 
 const MIN_LIQUIDITY_USD = 3000;
+
 const ENTRY_LIQUIDITY_DROP_10S = -10;
 const ENTRY_LIQUIDITY_DROP_30S = -15;
-const CRASH_LIQUIDITY_DROP_10S = -50;
 
-// ---------------- PRIX ----------------
+const CRASH_LIQUIDITY_DROP_10S = -50;
 
 const ENTRY_PRICE_DROP_10S = -4;
 const CRASH_PRICE_DROP_10S = -20;
 
-// ---------------- ACCÉLÉRATION ----------------
-
 const ACCEL_PRICE_5S_WARNING = 7;
 const ACCEL_PRICE_10S_WARNING = 10;
+
 const ACCEL_PRICE_5S_EXTREME = 10;
 const ACCEL_PRICE_10S_EXTREME = 15;
+
 const ACCEL_LIQUIDITY_DROP = -5;
 
-// ---------------- ENTRÉE ----------------
-
 const REQUIRED_HEALTHY_CONFIRMATIONS = 4;
+
 const MIN_HEALTH_SCORE_FOR_ENTRY = 80;
 
-// ============================================================
-// FICHIERS
-// ============================================================
-
-const DATA_DIR = fs.existsSync("/data")
-  ? "/data"
-  : path.join(__dirname, "data");
-
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-}
-
-const MARKET_FILE = path.join(DATA_DIR, "market_history.jsonl");
-const TRADES_FILE = path.join(DATA_DIR, "trade_history.json");
-const CRASH_FILE = path.join(DATA_DIR, "crash_reports.json");
-const SUMMARY_FILE = path.join(DATA_DIR, "v51_summary.json");
-
-// ============================================================
-// ÉTAT DU BOT
-// ============================================================
+/* =========================================================
+   ETAT V5.1
+========================================================= */
 
 let active = false;
 let mint = null;
+
 let pollTimer = null;
+
 let observationUntil = 0;
+
 let sessionStartTime = 0;
+
 let position = null;
+
 let cycleNumber = 0;
-let sessionCycles = 0;
+
+let sessionCycles = [];
+
 let sessionProfit = 0;
+
 let healthyConfirmations = 0;
+
 let marketHistory = [];
+
 let accelerationWarningActive = false;
+
 let accelerationAlertSent = false;
 
-// ============================================================
-// CRASH GUARD
-// ============================================================
+/* =========================================================
+   CRASH GUARD
+========================================================= */
 
 let crashGuardLevel = "NORMAL";
+
 let crashGuardBuyBlocked = false;
+
 let crashGuardLocked = false;
+
 let crashGuardEmergencyExitDone = false;
+
 let crashGuardEmergencyExitInProgress = false;
+
 let crashGuardLastEventId = null;
+
 let crashGuardArmed = false;
 
-// ============================================================
-// OUTILS
-// ============================================================
+/* =========================================================
+   REAL TRADING STATE
+========================================================= */
+
+let tradeInProgress = false;
+
+let dailySpentEur = 0;
+
+let dailySpentDate = "";
+
+let eurUsdCache = null;
+let eurUsdCacheAt = 0;
+
+let solUsdCache = null;
+let solUsdCacheAt = 0;
+
+/* =========================================================
+   DOSSIERS
+========================================================= */
+
+const DATA_DIR =
+  fs.existsSync("/data")
+    ? "/data"
+    : path.join(__dirname, "data");
+
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, {
+    recursive: true,
+  });
+}
+
+const MARKET_HISTORY_FILE =
+  path.join(
+    DATA_DIR,
+    "market_history.jsonl"
+  );
+
+const TRADE_HISTORY_FILE =
+  path.join(
+    DATA_DIR,
+    "trade_history.json"
+  );
+
+const CRASH_REPORTS_FILE =
+  path.join(
+    DATA_DIR,
+    "crash_reports.json"
+  );
+
+const SUMMARY_FILE =
+  path.join(
+    DATA_DIR,
+    "v51_summary.json"
+  );
+
+/* =========================================================
+   UTILITAIRES
+========================================================= */
 
 function now() {
   return Date.now();
 }
 
-function shortMint(value) {
-  if (!value) return "inconnu";
-  return `${value.slice(0, 6)}...${value.slice(-6)}`;
+function round(value, decimals = 8) {
+  const factor = 10 ** decimals;
+  return Math.round(value * factor) / factor;
 }
 
-function round(value, decimals = 4) {
-  if (!Number.isFinite(value)) return null;
-  return Number(value.toFixed(decimals));
+function sleep(ms) {
+  return new Promise(resolve =>
+    setTimeout(resolve, ms)
+  );
 }
-
-function formatUsd(value) {
-  return `$${Number(value || 0).toFixed(4)}`;
-}
-
-function formatPercent(value) {
-  if (!Number.isFinite(value)) return "N/A";
-  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
-}
-
-// ============================================================
-// SAUVEGARDE
-// ============================================================
 
 function saveJson(file, data) {
   try {
-    fs.writeFileSync(file, JSON.stringify(data, null, 2));
+    fs.writeFileSync(
+      file,
+      JSON.stringify(data, null, 2),
+      "utf8"
+    );
   } catch (error) {
-    console.error(`❌ Erreur sauvegarde ${file}:`, error.message);
+    console.error(
+      "Erreur écriture JSON:",
+      error.message
+    );
   }
 }
 
 function appendJsonLine(file, data) {
   try {
-    fs.appendFileSync(file, JSON.stringify(data) + "\n");
+    fs.appendFileSync(
+      file,
+      JSON.stringify(data) + "\n",
+      "utf8"
+    );
   } catch (error) {
-    console.error(`❌ Erreur écriture ${file}:`, error.message);
+    console.error(
+      "Erreur écriture JSONL:",
+      error.message
+    );
   }
 }
 
 function loadTrades() {
   try {
-    if (!fs.existsSync(TRADES_FILE)) return [];
+    if (!fs.existsSync(TRADE_HISTORY_FILE)) {
+      return [];
+    }
 
-    const content = fs.readFileSync(TRADES_FILE, "utf8");
+    const content =
+      fs.readFileSync(
+        TRADE_HISTORY_FILE,
+        "utf8"
+      );
 
-    if (!content.trim()) return [];
+    if (!content.trim()) {
+      return [];
+    }
 
-    const data = JSON.parse(content);
-
-    return Array.isArray(data) ? data : [];
+    return JSON.parse(content);
   } catch (error) {
-    console.error("❌ Impossible de charger trade_history.json");
+    console.error(
+      "Erreur lecture trade_history:",
+      error.message
+    );
+
     return [];
   }
 }
 
-let tradeHistory = loadTrades();
-
-// ============================================================
-// CRASH GUARD HTTP
-// ============================================================
-
-function isCrashGuardConfigured() {
-  return Boolean(
-    CRASH_GUARD_URL &&
-    CRASH_GUARD_SECRET
+function saveTrades(trades) {
+  saveJson(
+    TRADE_HISTORY_FILE,
+    trades
   );
 }
 
+function addTrade(trade) {
+  const trades = loadTrades();
+
+  trades.push({
+    ...trade,
+    timestamp:
+      trade.timestamp || new Date().toISOString(),
+  });
+
+  saveTrades(trades);
+}
+
+/* =========================================================
+   TELEGRAM
+========================================================= */
+
+async function sendTelegram(message) {
+  try {
+    const response =
+      await fetch(
+        `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+        {
+          method: "POST",
+          headers: {
+            "content-type":
+              "application/json",
+          },
+          body: JSON.stringify({
+            chat_id: CHAT_ID,
+            text: message,
+            disable_web_page_preview: true,
+          }),
+        }
+      );
+
+    if (!response.ok) {
+      const text =
+        await response.text();
+
+      console.error(
+        "Telegram HTTP",
+        response.status,
+        text
+      );
+    }
+  } catch (error) {
+    console.error(
+      "Erreur Telegram:",
+      error.message
+    );
+  }
+}
+
+/* =========================================================
+   DAILY LIMIT
+========================================================= */
+
+function resetDailyIfNeeded() {
+  const today =
+    new Date()
+      .toISOString()
+      .slice(0, 10);
+
+  if (dailySpentDate !== today) {
+    dailySpentDate = today;
+    dailySpentEur = 0;
+  }
+}
+
+function canSpendDaily(amountEur) {
+  resetDailyIfNeeded();
+
+  return (
+    dailySpentEur + amountEur <=
+    MAX_DAILY_EUR + 1e-9
+  );
+}
+
+function registerDailySpend(amountEur) {
+  resetDailyIfNeeded();
+
+  dailySpentEur += amountEur;
+
+  dailySpentEur =
+    round(dailySpentEur, 6);
+}
+
+/* =========================================================
+   PRIX SOL / EUR
+========================================================= */
+
+async function getSolUsdPrice() {
+  if (
+    solUsdCache &&
+    now() - solUsdCacheAt < 30000
+  ) {
+    return solUsdCache;
+  }
+
+  const SOL_MINT =
+    "So11111111111111111111111111111111111111112";
+
+  const url =
+    `https://api.dexscreener.com/tokens/v1/solana/${SOL_MINT}`;
+
+  const response =
+    await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(
+      `DexScreener SOL HTTP ${response.status}`
+    );
+  }
+
+  const pairs =
+    await response.json();
+
+  if (!Array.isArray(pairs)) {
+    throw new Error(
+      "Réponse DexScreener SOL invalide"
+    );
+  }
+
+  const validPairs =
+    pairs
+      .filter(pair => {
+        if (!pair) return false;
+
+        const chain =
+          String(pair.chainId || "")
+            .toLowerCase();
+
+        if (chain !== "solana") {
+          return false;
+        }
+
+        const base =
+          pair.baseToken?.address;
+
+        const quote =
+          pair.quoteToken?.address;
+
+        return (
+          base === SOL_MINT ||
+          quote === SOL_MINT
+        );
+      })
+      .filter(pair => {
+        const liquidity =
+          Number(
+            pair.liquidity?.usd || 0
+          );
+
+        const price =
+          Number(
+            pair.priceUsd || 0
+          );
+
+        return (
+          liquidity > 0 &&
+          price > 0
+        );
+      })
+      .sort(
+        (a, b) =>
+          Number(
+            b.liquidity?.usd || 0
+          ) -
+          Number(
+            a.liquidity?.usd || 0
+          )
+      );
+
+  if (!validPairs.length) {
+    throw new Error(
+      "Aucune paire SOL/USD valide trouvée"
+    );
+  }
+
+  const price =
+    Number(
+      validPairs[0].priceUsd
+    );
+
+  solUsdCache = price;
+  solUsdCacheAt = now();
+
+  return price;
+}
+
+async function getEurUsdPrice() {
+  if (
+    eurUsdCache &&
+    now() - eurUsdCacheAt < 300000
+  ) {
+    return eurUsdCache;
+  }
+
+  const response =
+    await fetch(
+      "https://api.frankfurter.app/latest?from=EUR&to=USD"
+    );
+
+  if (!response.ok) {
+    throw new Error(
+      `Frankfurter HTTP ${response.status}`
+    );
+  }
+
+  const data =
+    await response.json();
+
+  const rate =
+    Number(
+      data?.rates?.USD
+    );
+
+  if (
+    !Number.isFinite(rate) ||
+    rate <= 0
+  ) {
+    throw new Error(
+      "Taux EUR/USD invalide"
+    );
+  }
+
+  eurUsdCache = rate;
+  eurUsdCacheAt = now();
+
+  return rate;
+}
+
+async function getEurSolQuote() {
+  const eurUsd =
+    await getEurUsdPrice();
+
+  const solUsd =
+    await getSolUsdPrice();
+
+  const eurUsdValue =
+    FIXED_CAPITAL_EUR *
+    eurUsd;
+
+  const solAmount =
+    eurUsdValue /
+    solUsd;
+
+  return {
+    eur: FIXED_CAPITAL_EUR,
+    usd: eurUsdValue,
+    sol: solAmount,
+    eurUsd,
+    solUsd,
+  };
+}
+
+/* =========================================================
+   WALLET BALANCE
+========================================================= */
+
+async function getWalletSolBalance() {
+  if (!tradingWallet) {
+    throw new Error(
+      "Wallet de trading non disponible"
+    );
+  }
+
+  const lamports =
+    await connection.getBalance(
+      tradingWallet.publicKey,
+      "confirmed"
+    );
+
+  return lamports / 1e9;
+}
+
+/* =========================================================
+   TOKEN BALANCE
+========================================================= */
+
+async function getTokenBalanceRaw(tokenMint) {
+  if (!tradingWallet) {
+    throw new Error(
+      "Wallet de trading non disponible"
+    );
+  }
+
+  const mintPk =
+    new PublicKey(tokenMint);
+
+  const response =
+    await connection.getParsedTokenAccountsByOwner(
+      tradingWallet.publicKey,
+      {
+        mint: mintPk,
+      },
+      "confirmed"
+    );
+
+  let totalRaw = new BN(0);
+
+  let decimals = null;
+
+  for (
+    const account of response.value
+  ) {
+    const info =
+      account.account?.data?.parsed?.info;
+
+    const tokenAmount =
+      info?.tokenAmount;
+
+    if (!tokenAmount) {
+      continue;
+    }
+
+    const raw =
+      new BN(
+        String(
+          tokenAmount.amount
+        )
+      );
+
+    totalRaw =
+      totalRaw.add(raw);
+
+    if (
+      decimals === null
+    ) {
+      decimals =
+        Number(
+          tokenAmount.decimals
+        );
+    }
+  }
+
+  return {
+    raw: totalRaw,
+    decimals:
+      decimals === null
+        ? 0
+        : decimals,
+  };
+}
+
+/* =========================================================
+   MARKET DATA V5.1
+========================================================= */
+
+async function getMarketData(tokenMint) {
+  const url =
+    `https://api.dexscreener.com/token-pairs/v1/solana/${tokenMint}`;
+
+  const response =
+    await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(
+      `DexScreener HTTP ${response.status}`
+    );
+  }
+
+  const pairs =
+    await response.json();
+
+  if (!Array.isArray(pairs)) {
+    throw new Error(
+      "DexScreener réponse invalide"
+    );
+  }
+
+  const pumpSwapPairs =
+    pairs
+      .filter(pair =>
+        String(pair?.dexId || "")
+          .toLowerCase() ===
+        "pumpswap"
+      )
+      .filter(pair =>
+        Number(
+          pair?.priceUsd || 0
+        ) > 0
+      )
+      .sort(
+        (a, b) =>
+          Number(
+            b?.liquidity?.usd || 0
+          ) -
+          Number(
+            a?.liquidity?.usd || 0
+          )
+      );
+
+  if (!pumpSwapPairs.length) {
+    return null;
+  }
+
+  const pair =
+    pumpSwapPairs[0];
+
+  return {
+    timestamp: now(),
+
+    price:
+      Number(pair.priceUsd || 0),
+
+    liquidity:
+      Number(
+        pair.liquidity?.usd || 0
+      ),
+
+    pairAddress:
+      pair.pairAddress || null,
+
+    volume24h:
+      Number(
+        pair.volume?.h24 || 0
+      ),
+
+    buys5m:
+      Number(
+        pair.txns?.m5?.buys || 0
+      ),
+
+    sells5m:
+      Number(
+        pair.txns?.m5?.sells || 0
+      ),
+
+    baseToken:
+      pair.baseToken?.address || null,
+
+    quoteToken:
+      pair.quoteToken?.address || null,
+
+    pair,
+  };
+}
+
+/* =========================================================
+   MARKET HISTORY
+========================================================= */
+
+function addMarketHistory(data) {
+  if (!data) {
+    return;
+  }
+
+  marketHistory.push({
+    timestamp: data.timestamp,
+    price: data.price,
+    liquidity: data.liquidity,
+    volume24h: data.volume24h,
+    buys5m: data.buys5m,
+    sells5m: data.sells5m,
+  });
+
+  const cutoff =
+    now() - HISTORY_WINDOW_MS;
+
+  marketHistory =
+    marketHistory.filter(
+      item =>
+        item.timestamp >= cutoff
+    );
+
+  appendJsonLine(
+    MARKET_HISTORY_FILE,
+    {
+      mint,
+      ...marketHistory[
+        marketHistory.length - 1
+      ],
+    }
+  );
+}
+
+function getHistoryAgo(ms) {
+  const target =
+    now() - ms;
+
+  let selected = null;
+
+  for (
+    const item of marketHistory
+  ) {
+    if (
+      item.timestamp <= target
+    ) {
+      selected = item;
+    }
+  }
+
+  return selected;
+}
+
+function percentChange(current, old) {
+  if (
+    !Number.isFinite(current) ||
+    !Number.isFinite(old) ||
+    old === 0
+  ) {
+    return null;
+  }
+
+  return (
+    ((current - old) / old) *
+    100
+  );
+}
+
+/* =========================================================
+   ACCELERATION
+========================================================= */
+
+function analyzeAcceleration(data) {
+  const five =
+    getHistoryAgo(5000);
+
+  const ten =
+    getHistoryAgo(10000);
+
+  if (!five || !ten) {
+    return {
+      price5s: null,
+      price10s: null,
+      liquidity10s: null,
+      warning: false,
+      extreme: false,
+    };
+  }
+
+  const price5s =
+    percentChange(
+      data.price,
+      five.price
+    );
+
+  const price10s =
+    percentChange(
+      data.price,
+      ten.price
+    );
+
+  const liquidity10s =
+    percentChange(
+      data.liquidity,
+      ten.liquidity
+    );
+
+  const warning =
+    (
+      price5s !== null &&
+      price5s <=
+        -ACCEL_PRICE_5S_WARNING
+    ) ||
+    (
+      price10s !== null &&
+      price10s <=
+        -ACCEL_PRICE_10S_WARNING
+    ) ||
+    (
+      liquidity10s !== null &&
+      liquidity10s <=
+        ACCEL_LIQUIDITY_DROP
+    );
+
+  const extreme =
+    (
+      price5s !== null &&
+      price5s <=
+        -ACCEL_PRICE_5S_EXTREME
+    ) ||
+    (
+      price10s !== null &&
+      price10s <=
+        -ACCEL_PRICE_10S_EXTREME
+    );
+
+  return {
+    price5s,
+    price10s,
+    liquidity10s,
+    warning,
+    extreme,
+  };
+}
+
+/* =========================================================
+   HEALTH
+========================================================= */
+
+function calculateHealth(data) {
+  const ten =
+    getHistoryAgo(10000);
+
+  const thirty =
+    getHistoryAgo(30000);
+
+  let score = 100;
+
+  if (!ten || !thirty) {
+    return {
+      score,
+      healthy: false,
+      liquidityChange10s: null,
+      liquidityChange30s: null,
+      priceChange10s: null,
+    };
+  }
+
+  const liquidityChange10s =
+    percentChange(
+      data.liquidity,
+      ten.liquidity
+    );
+
+  const liquidityChange30s =
+    percentChange(
+      data.liquidity,
+      thirty.liquidity
+    );
+
+  const priceChange10s =
+    percentChange(
+      data.price,
+      ten.price
+    );
+
+  if (
+    liquidityChange10s !== null &&
+    liquidityChange10s <
+      ENTRY_LIQUIDITY_DROP_10S
+  ) {
+    score -= 25;
+  }
+
+  if (
+    liquidityChange30s !== null &&
+    liquidityChange30s <
+      ENTRY_LIQUIDITY_DROP_30S
+  ) {
+    score -= 30;
+  }
+
+  if (
+    priceChange10s !== null &&
+    priceChange10s <
+      ENTRY_PRICE_DROP_10S
+  ) {
+    score -= 25;
+  }
+
+  if (
+    data.liquidity <
+    MIN_LIQUIDITY_USD
+  ) {
+    score -= 30;
+  }
+
+  score =
+    Math.max(
+      0,
+      Math.min(100, score)
+    );
+
+  return {
+    score,
+    healthy:
+      score >=
+      MIN_HEALTH_SCORE_FOR_ENTRY,
+
+    liquidityChange10s,
+    liquidityChange30s,
+    priceChange10s,
+  };
+}
+
+/* =========================================================
+   LATEST VALID PRICE
+========================================================= */
+
+function getLatestValidMarketPrice() {
+  for (
+    let i =
+      marketHistory.length - 1;
+    i >= 0;
+    i--
+  ) {
+    const price =
+      Number(
+        marketHistory[i]?.price
+      );
+
+    if (
+      Number.isFinite(price) &&
+      price > 0
+    ) {
+      return price;
+    }
+  }
+
+  return null;
+}
+
+/* =========================================================
+   CRASH GUARD HTTP
+========================================================= */
+
 async function crashGuardRequest(
+  method,
   endpoint,
-  method = "GET",
   body = null
 ) {
-  if (!isCrashGuardConfigured()) {
+  if (!CRASH_GUARD_URL) {
+    return null;
+  }
+
+  if (!CRASH_GUARD_SECRET) {
     throw new Error(
-      "Crash Guard non configuré"
+      "CRASH_GUARD_SECRET manquant"
     );
   }
 
@@ -201,183 +1131,803 @@ async function crashGuardRequest(
     new AbortController();
 
   const timeout =
-    setTimeout(() => {
-      controller.abort();
-    }, 15000);
+    setTimeout(
+      () =>
+        controller.abort(),
+      15000
+    );
 
   try {
-    const options = {
-      method,
-      headers: {
-        "x-crash-guard-secret":
-          CRASH_GUARD_SECRET
-      },
-      signal: controller.signal
-    };
-
-    if (body !== null) {
-      options.headers[
-        "Content-Type"
-      ] = "application/json";
-
-      options.body =
-        JSON.stringify(body);
-    }
-
     const response =
       await fetch(
-        `${CRASH_GUARD_URL.replace(/\/$/, "")}${endpoint}`,
-        options
+        `${CRASH_GUARD_URL}${endpoint}`,
+        {
+          method,
+          headers: {
+            "content-type":
+              "application/json",
+            "x-crash-guard-secret":
+              CRASH_GUARD_SECRET,
+          },
+          body:
+            body === null
+              ? undefined
+              : JSON.stringify(body),
+          signal:
+            controller.signal,
+        }
       );
+
+    const text =
+      await response.text();
 
     if (!response.ok) {
       throw new Error(
-        `Crash Guard HTTP ${response.status}`
+        `Crash Guard HTTP ${response.status}: ${text}`
       );
     }
 
-    return await response.json();
-
-  } catch (error) {
-    if (error.name === "AbortError") {
-      throw new Error(
-        "Délai dépassé lors de la communication avec le Crash Guard"
-      );
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
     }
-
-    throw error;
-
   } finally {
     clearTimeout(timeout);
   }
 }
 
-// ============================================================
-// ARM CRASH GUARD
-// ============================================================
-
 async function armCrashGuard(tokenMint) {
-  if (!isCrashGuardConfigured()) {
-    throw new Error(
-      "CRASH_GUARD_URL ou CRASH_GUARD_SECRET manquant"
-    );
+  if (!CRASH_GUARD_URL) {
+    crashGuardArmed = false;
+    return;
   }
 
-  console.log(
-    `🛡️ Armement Crash Guard pour ${shortMint(tokenMint)}...`
+  await crashGuardRequest(
+    "POST",
+    "/arm",
+    {
+      mint: tokenMint,
+    }
   );
-
-  const result =
-    await crashGuardRequest(
-      "/arm",
-      "POST",
-      {
-        mint: tokenMint
-      }
-    );
-
-  if (
-    !result ||
-    result.ok !== true
-  ) {
-    throw new Error(
-      "Le Crash Guard n'a pas confirmé son armement"
-    );
-  }
 
   crashGuardArmed = true;
-  crashGuardLevel = "NORMAL";
-  crashGuardBuyBlocked = false;
-  crashGuardLocked = false;
-  crashGuardEmergencyExitDone = false;
-  crashGuardEmergencyExitInProgress = false;
-  crashGuardLastEventId = null;
 
   console.log(
-    `🟢 Crash Guard armé pour ${shortMint(tokenMint)}`
+    "🛡️ Crash Guard armé pour",
+    tokenMint
   );
-
-  return result;
 }
 
-// ============================================================
-// DISARM CRASH GUARD
-// ============================================================
-
 async function disarmCrashGuard() {
-  if (!isCrashGuardConfigured()) {
+  if (!CRASH_GUARD_URL) {
     crashGuardArmed = false;
-    crashGuardLevel = "NORMAL";
-    crashGuardBuyBlocked = false;
-    crashGuardLocked = false;
-    crashGuardEmergencyExitDone = false;
-    crashGuardEmergencyExitInProgress = false;
-    crashGuardLastEventId = null;
     return;
   }
 
   try {
     await crashGuardRequest(
-      "/disarm",
-      "POST"
+      "POST",
+      "/disarm"
     );
-
-    console.log(
-      "🛡️ Crash Guard désarmé."
-    );
-
   } catch (error) {
     console.error(
-      "⚠️ Impossible de désarmer le Crash Guard:",
+      "Erreur désarmement Crash Guard:",
       error.message
     );
   }
 
   crashGuardArmed = false;
-  crashGuardLevel = "NORMAL";
-  crashGuardBuyBlocked = false;
-  crashGuardLocked = false;
-  crashGuardEmergencyExitDone = false;
-  crashGuardEmergencyExitInProgress = false;
-  crashGuardLastEventId = null;
 }
 
-// ============================================================
-// PRIX DE SORTIE D'URGENCE
-// ============================================================
+/* =========================================================
+   PUMPSWAP REAL SWAP
+========================================================= */
 
-function getLatestValidMarketPrice() {
-  for (
-    let i = marketHistory.length - 1;
-    i >= 0;
-    i--
-  ) {
-    const point =
-      marketHistory[i];
-
-    if (
-      point &&
-      Number.isFinite(point.price) &&
-      point.price > 0
-    ) {
-      return point.price;
-    }
+async function sendRealSwap(
+  poolAddress,
+  mode,
+  amountBn,
+  slippagePercent
+) {
+  if (!REAL_TRADING) {
+    throw new Error(
+      "REAL_TRADING=false"
+    );
   }
 
-  return null;
+  if (!tradingWallet) {
+    throw new Error(
+      "Wallet trading absent"
+    );
+  }
+
+  if (!poolAddress) {
+    throw new Error(
+      "Pool PumpSwap manquant"
+    );
+  }
+
+  if (!BN.isBN(amountBn)) {
+    amountBn =
+      new BN(String(amountBn));
+  }
+
+  if (
+    amountBn.lte(new BN(0))
+  ) {
+    throw new Error(
+      "Montant swap invalide"
+    );
+  }
+
+  const poolPk =
+    new PublicKey(poolAddress);
+
+  console.log(
+    `🔄 Swap ${mode} | pool=${poolAddress} | amount=${amountBn.toString()} | slippage=${slippagePercent}%`
+  );
+
+  const swapState =
+    await onlineAmmSdk.swapSolanaState(
+      poolPk,
+      tradingWallet.publicKey
+    );
+
+  let instructions;
+
+  if (mode === "BUY") {
+    instructions =
+      await PUMP_AMM_SDK.buyQuoteInput(
+        swapState,
+        amountBn,
+        slippagePercent
+      );
+  } else if (mode === "SELL") {
+    instructions =
+      await PUMP_AMM_SDK.sellBaseInput(
+        swapState,
+        amountBn,
+        slippagePercent
+      );
+  } else {
+    throw new Error(
+      `Mode swap inconnu: ${mode}`
+    );
+  }
+
+  if (
+    !Array.isArray(instructions) ||
+    instructions.length === 0
+  ) {
+    throw new Error(
+      "PumpSwap n'a produit aucune instruction"
+    );
+  }
+
+  const transaction =
+    new Transaction();
+
+  transaction.add(
+    ComputeBudgetProgram.setComputeUnitLimit(
+      {
+        units: 200000,
+      }
+    )
+  );
+
+  for (
+    const instruction of instructions
+  ) {
+    transaction.add(instruction);
+  }
+
+  /*
+   * Pré-simulation obligatoire.
+   * Si elle échoue, aucune transaction n'est envoyée.
+   */
+  const simulation =
+    await connection.simulateTransaction(
+      transaction,
+      [tradingWallet]
+    );
+
+  if (simulation.value.err) {
+    console.error(
+      "❌ Simulation PumpSwap échouée:",
+      JSON.stringify(
+        simulation.value.err
+      )
+    );
+
+    if (
+      simulation.value.logs
+    ) {
+      console.error(
+        simulation.value.logs.join("\n")
+      );
+    }
+
+    throw new Error(
+      `Simulation PumpSwap échouée: ${JSON.stringify(
+        simulation.value.err
+      )}`
+    );
+  }
+
+  console.log(
+    "✅ Simulation PumpSwap OK"
+  );
+
+  /*
+   * Une seule tentative d'envoi.
+   *
+   * Si cette opération devient ambiguë après envoi,
+   * on ne relance PAS automatiquement un deuxième swap.
+   */
+  const signature =
+    await sendAndConfirmTransaction(
+      connection,
+      transaction,
+      [tradingWallet],
+      {
+        commitment: "confirmed",
+        preflightCommitment:
+          "confirmed",
+        skipPreflight: false,
+      }
+    );
+
+  console.log(
+    `✅ Transaction confirmée: ${signature}`
+  );
+
+  return signature;
 }
 
-// ============================================================
-// SORTIE D'URGENCE CRASH GUARD
-// ============================================================
+/* =========================================================
+   REAL BUY
+========================================================= */
+
+async function realBuy(data) {
+  if (!REAL_TRADING) {
+    throw new Error(
+      "Le bot n'est pas en mode réel"
+    );
+  }
+
+  if (tradeInProgress) {
+    console.log(
+      "⏳ Transaction déjà en cours"
+    );
+    return false;
+  }
+
+  if (!data?.pairAddress) {
+    throw new Error(
+      "Pair PumpSwap absente"
+    );
+  }
+
+  resetDailyIfNeeded();
+
+  if (
+    !canSpendDaily(
+      FIXED_CAPITAL_EUR
+    )
+  ) {
+    await sendTelegram(
+      `⛔ ACHAT BLOQUÉ\n\n` +
+      `Plafond quotidien atteint.\n` +
+      `Dépensé aujourd'hui : ${dailySpentEur.toFixed(2)} €\n` +
+      `Plafond : ${MAX_DAILY_EUR.toFixed(2)} €`
+    );
+
+    return false;
+  }
+
+  tradeInProgress = true;
+
+  try {
+    const quote =
+      await getEurSolQuote();
+
+    const solBalance =
+      await getWalletSolBalance();
+
+    if (
+      solBalance <
+      quote.sol + MIN_SOL_RESERVE
+    ) {
+      await sendTelegram(
+        `⛔ ACHAT BLOQUÉ\n\n` +
+        `Solde SOL insuffisant.\n` +
+        `Disponible : ${solBalance.toFixed(6)} SOL\n` +
+        `Nécessaire achat : ${quote.sol.toFixed(6)} SOL\n` +
+        `Réserve : ${MIN_SOL_RESERVE} SOL`
+      );
+
+      return false;
+    }
+
+    const tokenBefore =
+      await getTokenBalanceRaw(
+        mint
+      );
+
+    const lamports =
+      Math.ceil(
+        quote.sol * 1e9
+      );
+
+    const quoteBn =
+      new BN(
+        String(lamports)
+      );
+
+    console.log(
+      `🟢 ACHAT RÉEL ${FIXED_CAPITAL_EUR.toFixed(2)} €`
+    );
+
+    console.log(
+      `USD: ${quote.usd.toFixed(6)}`
+    );
+
+    console.log(
+      `SOL: ${quote.sol.toFixed(9)}`
+    );
+
+    console.log(
+      `Lamports: ${quoteBn.toString()}`
+    );
+
+    const signature =
+      await sendRealSwap(
+        data.pairAddress,
+        "BUY",
+        quoteBn,
+        BUY_SLIPPAGE_PERCENT
+      );
+
+    /*
+     * Lecture du solde après confirmation.
+     * On utilise la différence pour connaître exactement
+     * combien de tokens CET achat a reçu.
+     */
+    await sleep(1000);
+
+    const tokenAfter =
+      await getTokenBalanceRaw(
+        mint
+      );
+
+    const receivedRaw =
+      tokenAfter.raw.sub(
+        tokenBefore.raw
+      );
+
+    if (
+      receivedRaw.lte(new BN(0))
+    ) {
+      throw new Error(
+        "Aucun token détecté après l'achat confirmé"
+      );
+    }
+
+    const decimals =
+      tokenAfter.decimals;
+
+    const receivedTokens =
+      Number(
+        receivedRaw.toString()
+      ) /
+      10 ** decimals;
+
+    if (
+      !Number.isFinite(receivedTokens) ||
+      receivedTokens <= 0
+    ) {
+      throw new Error(
+        "Quantité de tokens reçue invalide"
+      );
+    }
+
+    const actualEntryPrice =
+      quote.usd /
+      receivedTokens;
+
+    const targetPrice =
+      actualEntryPrice *
+      (1 +
+        TARGET_GAIN_PERCENT / 100);
+
+    const newPosition = {
+      mint,
+
+      poolAddress:
+        data.pairAddress,
+
+      tokenAmountRaw:
+        receivedRaw.toString(),
+
+      tokenAmount:
+        receivedTokens,
+
+      tokenDecimals:
+        decimals,
+
+      capitalEur:
+        FIXED_CAPITAL_EUR,
+
+      capitalUsd:
+        quote.usd,
+
+      solSpent:
+        quote.sol,
+
+      solSpentLamports:
+        lamports,
+
+      eurUsd:
+        quote.eurUsd,
+
+      solUsd:
+        quote.solUsd,
+
+      entryPrice:
+        actualEntryPrice,
+
+      targetPrice,
+
+      entryMarketPrice:
+        data.price,
+
+      entryLiquidity:
+        data.liquidity,
+
+      buySignature:
+        signature,
+
+      entryTimestamp:
+        now(),
+
+      cycle:
+        cycleNumber + 1,
+    };
+
+    /*
+     * On vérifie immédiatement si un CRITICAL est arrivé
+     * pendant la transaction.
+     */
+    position =
+      newPosition;
+
+    registerDailySpend(
+      FIXED_CAPITAL_EUR
+    );
+
+    cycleNumber += 1;
+
+    /*
+     * Si Crash Guard a verrouillé pendant l'achat,
+     * on vend immédiatement la quantité réellement reçue.
+     */
+    if (crashGuardLocked) {
+      console.log(
+        "🚨 CRITICAL arrivé pendant l'achat. Vente d'urgence immédiate."
+      );
+
+      await emergencyExitFromCrashGuard(
+        {
+          level: "CRITICAL",
+          pool:
+            data.pairAddress,
+          mint,
+          reason:
+            "CRITICAL pendant achat",
+        }
+      );
+
+      return false;
+    }
+
+    healthyConfirmations = 0;
+
+    sessionCycles.push({
+      cycle:
+        cycleNumber,
+
+      type:
+        "BUY_REAL",
+
+      capitalEur:
+        FIXED_CAPITAL_EUR,
+
+      capitalUsd:
+        quote.usd,
+
+      solSpent:
+        quote.sol,
+
+      tokens:
+        receivedTokens,
+
+      entryPrice:
+        actualEntryPrice,
+
+      targetPrice,
+
+      buySignature:
+        signature,
+
+      timestamp:
+        new Date().toISOString(),
+    });
+
+    addTrade({
+      type:
+        "BUY_REAL",
+
+      mint,
+
+      poolAddress:
+        data.pairAddress,
+
+      cycle:
+        cycleNumber,
+
+      capitalEur:
+        FIXED_CAPITAL_EUR,
+
+      capitalUsd:
+        quote.usd,
+
+      solSpent:
+        quote.sol,
+
+      tokenAmount:
+        receivedTokens,
+
+      tokenAmountRaw:
+        receivedRaw.toString(),
+
+      tokenDecimals:
+        decimals,
+
+      entryPrice:
+        actualEntryPrice,
+
+      targetPrice,
+
+      signature,
+    });
+
+    await sendTelegram(
+      `🟢 ACHAT RÉEL\n\n` +
+      `Cycle : ${cycleNumber}\n` +
+      `Montant : ${FIXED_CAPITAL_EUR.toFixed(2)} €\n` +
+      `≈ ${quote.usd.toFixed(4)} USD\n` +
+      `≈ ${quote.sol.toFixed(6)} SOL\n` +
+      `Tokens : ${receivedTokens}\n` +
+      `Prix entrée réel : ${actualEntryPrice}\n` +
+      `Objectif +${TARGET_GAIN_PERCENT}% : ${targetPrice}\n` +
+      `Slippage achat : ${BUY_SLIPPAGE_PERCENT}%\n\n` +
+      `TX : ${signature}`
+    );
+
+    return true;
+  } finally {
+    tradeInProgress = false;
+  }
+}
+
+/* =========================================================
+   REAL SELL
+========================================================= */
+
+async function realSellPosition(
+  reason,
+  forcedPoolAddress = null
+) {
+  if (!position) {
+    return null;
+  }
+
+  if (tradeInProgress) {
+    console.log(
+      "⏳ Une autre transaction est déjà en cours"
+    );
+
+    return null;
+  }
+
+  const currentPosition =
+    position;
+
+  const poolAddress =
+    forcedPoolAddress ||
+    currentPosition.poolAddress;
+
+  const amountRaw =
+    new BN(
+      String(
+        currentPosition.tokenAmountRaw
+      )
+    );
+
+  if (
+    amountRaw.lte(new BN(0))
+  ) {
+    throw new Error(
+      "Montant de vente invalide"
+    );
+  }
+
+  tradeInProgress = true;
+
+  try {
+    const beforeSol =
+      await getWalletSolBalance();
+
+    const signature =
+      await sendRealSwap(
+        poolAddress,
+        "SELL",
+        amountRaw,
+        SELL_SLIPPAGE_PERCENT
+      );
+
+    await sleep(1000);
+
+    const afterSol =
+      await getWalletSolBalance();
+
+    const solDelta =
+      afterSol - beforeSol;
+
+    /*
+     * Le delta SOL inclut aussi potentiellement les frais.
+     * On l'utilise uniquement comme information.
+     */
+    const exitPrice =
+      currentPosition.capitalUsd > 0 &&
+      currentPosition.tokenAmount > 0
+        ? currentPosition.capitalUsd /
+          currentPosition.tokenAmount
+        : null;
+
+    let profitPercent = null;
+
+    if (
+      exitPrice !== null &&
+      currentPosition.entryPrice > 0
+    ) {
+      profitPercent =
+        (
+          (
+            exitPrice -
+            currentPosition.entryPrice
+          ) /
+          currentPosition.entryPrice
+        ) * 100;
+    }
+
+    const cycleResult = {
+      cycle:
+        currentPosition.cycle,
+
+      reason,
+
+      entryPrice:
+        currentPosition.entryPrice,
+
+      exitPrice,
+
+      profitPercent,
+
+      capitalEur:
+        currentPosition.capitalEur,
+
+      tokenAmount:
+        currentPosition.tokenAmount,
+
+      solDelta,
+
+      buySignature:
+        currentPosition.buySignature,
+
+      sellSignature:
+        signature,
+
+      timestamp:
+        new Date().toISOString(),
+    };
+
+    sessionCycles.push({
+      type:
+        "SELL_REAL",
+
+      ...cycleResult,
+    });
+
+    if (
+      Number.isFinite(profitPercent)
+    ) {
+      sessionProfit +=
+        profitPercent;
+    }
+
+    addTrade({
+      type:
+        "SELL_REAL",
+
+      mint,
+
+      poolAddress,
+
+      ...cycleResult,
+
+      signature,
+    });
+
+    position = null;
+
+    healthyConfirmations = 0;
+
+    observationUntil =
+      now() +
+      OBSERVATION_AFTER_SELL_MS;
+
+    await sendTelegram(
+      `🔴 VENTE RÉELLE\n\n` +
+      `Cycle : ${currentPosition.cycle}\n` +
+      `Raison : ${reason}\n` +
+      `Tokens vendus : ${currentPosition.tokenAmount}\n` +
+      `Prix entrée : ${currentPosition.entryPrice}\n` +
+      `Prix sortie estimé : ${exitPrice ?? "N/A"}\n` +
+      `Résultat estimé : ${
+        profitPercent === null
+          ? "N/A"
+          : `${profitPercent.toFixed(2)}%`
+      }\n` +
+      `Slippage vente : ${SELL_SLIPPAGE_PERCENT}%\n\n` +
+      `TX : ${signature}`
+    );
+
+    return signature;
+  } finally {
+    tradeInProgress = false;
+  }
+}
+
+/* =========================================================
+   CRASH GUARD EMERGENCY EXIT
+========================================================= */
 
 async function emergencyExitFromCrashGuard(
   signal
 ) {
   if (
-    crashGuardEmergencyExitDone ||
+    crashGuardEmergencyExitDone
+  ) {
+    return;
+  }
+
+  if (
     crashGuardEmergencyExitInProgress
   ) {
+    return;
+  }
+
+  if (!position) {
+    crashGuardEmergencyExitDone = true;
+
+    await sendTelegram(
+      `🚨 CRASH GUARD CRITICAL\n\n` +
+      `Aucune position ouverte à vendre.\n` +
+      `Trading verrouillé.`
+    );
+
     return;
   }
 
@@ -385,350 +1935,123 @@ async function emergencyExitFromCrashGuard(
     true;
 
   try {
-    /*
-    Verrouillage immédiat de la sortie.
-    Cela empêche toute seconde tentative.
-    */
+    const poolAddress =
+      signal?.pool ||
+      position.poolAddress ||
+      null;
 
-    crashGuardEmergencyExitDone =
-      true;
+    if (!poolAddress) {
+      throw new Error(
+        "Aucune pool disponible pour la vente d'urgence"
+      );
+    }
 
-    if (!position) {
-      await bot.telegram.sendMessage(
-        CHAT_ID,
-        `🔴 CRASH GUARD CRITICAL
+    await sendTelegram(
+      `🚨 CRASH GUARD CRITICAL\n\n` +
+      `VENTE D'URGENCE RÉELLE EN COURS.\n` +
+      `Pool : ${poolAddress}`
+    );
 
-Token :
-
-${mint}
-
-🚨 Signal critique reçu.
-
-ℹ️ Aucune position ouverte.
-
-⛔ Trading verrouillé.`
+    const signature =
+      await realSellPosition(
+        "CRASH_GUARD_CRITICAL",
+        poolAddress
       );
 
-      return;
-    }
+    if (signature) {
+      crashGuardEmergencyExitDone =
+        true;
 
-    /*
-    On tente d'abord une nouvelle lecture
-    DexScreener.
-    */
-
-    let data =
-      await getMarketData(mint);
-
-    let exitPrice =
-      data?.price || null;
-
-    /*
-    Si DexScreener ne répond plus,
-    on utilise le dernier prix valide
-    réellement observé par V5.1.
-    */
-
-    if (
-      !Number.isFinite(exitPrice) ||
-      exitPrice <= 0
-    ) {
-      exitPrice =
-        getLatestValidMarketPrice();
-    }
-
-    /*
-    Aucun prix disponible :
-    aucun prix fictif.
-    */
-
-    if (
-      !Number.isFinite(exitPrice) ||
-      exitPrice <= 0
-    ) {
-      await bot.telegram.sendMessage(
-        CHAT_ID,
-        `🔴 CRASH GUARD CRITICAL
-
-Token :
-
-${mint}
-
-🚨 Signal critique confirmé.
-
-⚠️ Aucun prix DEX fiable disponible
-pour calculer une sortie simulée.
-
-⛔ Aucun bénéfice fictif ajouté.
-
-⛔ Trading verrouillé.`
+      await sendTelegram(
+        `🛡️ CRASH GUARD\n\n` +
+        `Position liquidée par CRITICAL.\n\n` +
+        `TX : ${signature}`
       );
-
-      position = null;
-
-      return;
     }
-
-    const entryPrice =
-      position.entryPrice;
-
-    const amount =
-      position.tokens *
-      exitPrice;
-
-    const profit =
-      amount -
-      position.capital;
-
-    const profitPercent =
-      (profit /
-        position.capital) *
-      100;
-
-    sessionProfit +=
-      profit;
-
-    const trade = {
-      type:
-        "CRASH_GUARD_EMERGENCY",
-      sessionStart:
-        sessionStartTime,
-      timestamp:
-        now(),
-      mint,
-      cycle:
-        position.cycle,
-      entryPrice,
-      exitPrice,
-      capital:
-        position.capital,
-      tokens:
-        position.tokens,
-      amount,
-      profit,
-      profitPercent,
-      guardLevel:
-        signal?.level || "CRITICAL",
-      guardEventId:
-        signal?.id || null,
-      guardTimestamp:
-        signal?.timestamp || null,
-      priceSource:
-        data?.price
-          ? "fresh_dexscreener"
-          : "latest_valid_v51_observation"
-    };
-
-    tradeHistory.push(
-      trade
-    );
-
-    saveJson(
-      TRADES_FILE,
-      tradeHistory
-    );
-
-    const cycle =
-      position.cycle;
-
-    position = null;
-
-    observationUntil = 0;
-    healthyConfirmations = 0;
-
-    await bot.telegram.sendMessage(
-      CHAT_ID,
-      `🚨 SORTIE D'URGENCE CRASH GUARD
-
-Token :
-
-${mint}
-
-Cycle :
-
-#${cycle}
-
-🔴 Niveau :
-
-CRITICAL
-
-🚨 Signal critique reçu.
-
-💵 Prix d'entrée :
-
-$${entryPrice.toFixed(8)}
-
-🛑 Prix de sortie simulé :
-
-$${exitPrice.toFixed(8)}
-
-💰 Montant simulé :
-
-${formatUsd(amount)}
-
-📊 Résultat :
-
-${profit >= 0 ? "+" : ""}${formatUsd(profit)}
-
-📈 Variation :
-
-${formatPercent(profitPercent)}
-
-💰 Bénéfice session :
-
-${sessionProfit >= 0 ? "+" : ""}${formatUsd(sessionProfit)}
-
-⛔ ACHATS BLOQUÉS
-
-⛔ VENTES NORMALES BLOQUÉES
-
-⛔ SESSION VERROUILLÉE`
-    );
-
   } catch (error) {
+    /*
+     * On NE marque PAS l'exit comme effectué si la vente échoue.
+     * Cela permet à l'état de rester visible comme non liquidé.
+     */
+    await sendTelegram(
+      `❌ ERREUR VENTE D'URGENCE\n\n` +
+      `${error.message}\n\n` +
+      `La position réelle n'est PAS considérée comme liquidée.`
+    );
 
     console.error(
-      "❌ Erreur sortie urgence Crash Guard:",
-      error.message
+      "Erreur emergency exit:",
+      error
     );
-
-    await bot.telegram.sendMessage(
-      CHAT_ID,
-      `🔴 CRASH GUARD CRITICAL
-
-Token :
-
-${mint}
-
-🚨 Signal critique reçu.
-
-⚠️ Erreur pendant la sortie simulée :
-
-${error.message}
-
-⛔ Trading verrouillé.
-
-❗ Aucune seconde vente automatique.`
-    );
-
   } finally {
     crashGuardEmergencyExitInProgress =
       false;
   }
 }
 
-// ============================================================
-// SIGNAL CRASH GUARD
-// ============================================================
+/* =========================================================
+   CRASH GUARD SIGNAL
+========================================================= */
 
 async function applyCrashGuardSignal(
   signal
 ) {
+  if (!signal) {
+    return;
+  }
+
+  const eventId =
+    signal.id ||
+    `${signal.level}-${signal.timestamp}`;
+
   if (
-    !signal ||
-    !signal.level
+    eventId ===
+    crashGuardLastEventId
   ) {
     return;
   }
 
-  /*
-  Ignore les événements déjà traités.
-  */
-
-  if (
-    signal.id !== undefined &&
-    signal.id !== null
-  ) {
-    if (
-      crashGuardLastEventId ===
-      signal.id
-    ) {
-      return;
-    }
-
-    crashGuardLastEventId =
-      signal.id;
-  }
-
-  /*
-  Un verrou CRITICAL est définitif
-  jusqu'au prochain armement ou disarm.
-  */
-
-  if (
-    crashGuardLocked
-  ) {
-    return;
-  }
-
-  const level =
-    String(
-      signal.level
-    ).toUpperCase();
-
-  /*
-  Vérification du token.
-  */
+  crashGuardLastEventId =
+    eventId;
 
   if (
     signal.mint &&
     mint &&
     signal.mint !== mint
   ) {
-    console.error(
-      `⚠️ Signal Crash Guard ignoré : mauvais mint ${signal.mint}`
-    );
-
     return;
   }
 
-  if (
-    level === "WATCH"
-  ) {
+  const level =
+    String(
+      signal.level || "NORMAL"
+    ).toUpperCase();
+
+  if (level === "WATCH") {
     crashGuardLevel =
       "WATCH";
 
-    console.log(
-      "🟡 Crash Guard WATCH"
-    );
-
     return;
   }
 
-  if (
-    level === "DANGER"
-  ) {
+  if (level === "DANGER") {
     crashGuardLevel =
       "DANGER";
 
     crashGuardBuyBlocked =
       true;
 
-    console.log(
-      "🟠 Crash Guard DANGER : nouveaux achats bloqués."
-    );
-
-    await bot.telegram.sendMessage(
-      CHAT_ID,
-      `🟠 CRASH GUARD DANGER
-
-Token :
-
-${mint}
-
-⛔ Nouveaux achats bloqués.
-
-📌 La position ouverte éventuelle
-reste gérée normalement tant qu'aucun
-CRITICAL n'est reçu.`
+    await sendTelegram(
+      `⚠️ CRASH GUARD DANGER\n\n` +
+      `Nouveaux achats bloqués.\n` +
+      `Position actuelle conservée.\n` +
+      `Aucune vente automatique sur DANGER.`
     );
 
     return;
   }
 
-  if (
-    level === "CRITICAL"
-  ) {
+  if (level === "CRITICAL") {
     crashGuardLevel =
       "CRITICAL";
 
@@ -738,116 +2061,38 @@ CRITICAL n'est reçu.`
     crashGuardLocked =
       true;
 
-    console.log(
-      "🔴 Crash Guard CRITICAL : VERROUILLAGE TOTAL."
+    await sendTelegram(
+      `🚨 CRASH GUARD CRITICAL\n\n` +
+      `Nouveaux achats BLOQUÉS.\n` +
+      `Trading verrouillé.\n` +
+      `Vente d'urgence de la position si nécessaire.`
     );
 
     await emergencyExitFromCrashGuard(
       signal
     );
 
-    /*
-    Après CRITICAL :
-    aucun nouveau cycle.
-    Le Guard reste armé et verrouillé.
-    */
+    saveSummary();
 
     if (active) {
-      await saveSummary(
-        "CRASH_GUARD_CRITICAL"
-      );
-
       stopRadar(
         false,
         true
-      ).catch(error => {
+      ).catch(error =>
         console.error(
-          "❌ Erreur arrêt après CRITICAL:",
+          "Erreur stop après CRITICAL:",
           error.message
-        );
-      });
+        )
+      );
     }
   }
 }
 
-// ============================================================
-// SERVEUR HTTP V5.1
-// ============================================================
+/* =========================================================
+   HTTP SERVER POUR CRASH GUARD
+========================================================= */
 
-function parseRequestBody(req) {
-  return new Promise(
-    (resolve, reject) => {
-      let body = "";
-      let settled = false;
-
-      req.on(
-        "data",
-        chunk => {
-          body +=
-            chunk.toString();
-
-          if (
-            body.length >
-            100000 &&
-            !settled
-          ) {
-            settled = true;
-
-            reject(
-              new Error(
-                "Body trop volumineux"
-              )
-            );
-
-            req.destroy();
-          }
-        }
-      );
-
-      req.on(
-        "end",
-        () => {
-          if (settled) {
-            return;
-          }
-
-          try {
-            resolve(
-              body
-                ? JSON.parse(body)
-                : {}
-            );
-          } catch (error) {
-            reject(
-              new Error(
-                "JSON invalide"
-              )
-            );
-          }
-        }
-      );
-
-      req.on(
-        "error",
-        error => {
-          if (!settled) {
-            reject(error);
-          }
-        }
-      );
-    }
-  );
-}
-
-function authorizeCrashGuardRequest(
-  req
-) {
-  if (
-    !CRASH_GUARD_SECRET
-  ) {
-    return false;
-  }
-
+function isAuthorizedCrashGuard(req) {
   return (
     req.headers[
       "x-crash-guard-secret"
@@ -856,64 +2101,57 @@ function authorizeCrashGuardRequest(
   );
 }
 
-const v51Server =
+const httpServer =
   http.createServer(
     async (req, res) => {
-
-      /*
-      HEALTH
-      */
-
       if (
         req.method === "GET" &&
         req.url === "/health"
       ) {
-        const body =
-          JSON.stringify({
-            ok: true,
-            service:
-              "pump-alert-bot-v5.1",
-            active,
-            mint,
-            timestamp:
-              new Date().toISOString()
-          });
-
         res.writeHead(
           200,
           {
-            "Content-Type":
+            "content-type":
               "application/json",
-            "Content-Length":
-              Buffer.byteLength(body)
           }
         );
 
-        res.end(body);
+        res.end(
+          JSON.stringify({
+            ok: true,
+            service:
+              "v51-real-trading",
+            realTrading:
+              REAL_TRADING,
+            wallet:
+              tradingWallet
+                ? tradingWallet.publicKey.toBase58()
+                : null,
+            active,
+            mint,
+            crashGuardLevel,
+            crashGuardLocked,
+            position:
+              !!position,
+          })
+        );
 
         return;
       }
-
-      /*
-      CRASH GUARD EVENT
-      */
 
       if (
         req.method === "POST" &&
         req.url ===
           "/crash-guard/event"
       ) {
-
         if (
-          !authorizeCrashGuardRequest(
-            req
-          )
+          !isAuthorizedCrashGuard(req)
         ) {
           res.writeHead(
             401,
             {
-              "Content-Type":
-                "application/json"
+              "content-type":
+                "application/json",
             }
           );
 
@@ -921,99 +2159,83 @@ const v51Server =
             JSON.stringify({
               ok: false,
               error:
-                "Unauthorized"
+                "unauthorized",
             })
           );
 
           return;
         }
 
-        try {
-          const signal =
-            await parseRequestBody(
-              req
-            );
+        let body = "";
 
-          /*
-          IMPORTANT :
-          on accuse réception immédiatement.
-          Le traitement du signal continue ensuite.
-          
-          Cela évite que Crash Guard attende
-          pendant les appels Telegram/DexScreener
-          et provoque un timeout HTTP.
-          */
+        req.on(
+          "data",
+          chunk => {
+            body += chunk;
+          }
+        );
 
-          const body =
-            JSON.stringify({
-              ok: true,
-              received: true,
-              level:
-                signal?.level || null
-            });
+        req.on(
+          "end",
+          () => {
+            let signal;
 
-          res.writeHead(
-            200,
-            {
-              "Content-Type":
-                "application/json",
-              "Content-Length":
-                Buffer.byteLength(body)
+            try {
+              signal =
+                JSON.parse(body);
+            } catch {
+              res.writeHead(
+                400,
+                {
+                  "content-type":
+                    "application/json",
+                }
+              );
+
+              res.end(
+                JSON.stringify({
+                  ok: false,
+                  error:
+                    "invalid json",
+                })
+              );
+
+              return;
             }
-          );
 
-          res.end(body);
-
-          /*
-          Traitement asynchrone du signal.
-          */
-
-          applyCrashGuardSignal(
-            signal
-          ).catch(error => {
-            console.error(
-              "❌ Traitement Crash Guard:",
-              error.message
-            );
-          });
-
-        } catch (error) {
-          console.error(
-            "❌ Crash Guard event:",
-            error.message
-          );
-
-          if (!res.writableEnded) {
             res.writeHead(
-              400,
+              200,
               {
-                "Content-Type":
-                  "application/json"
+                "content-type":
+                  "application/json",
               }
             );
 
             res.end(
               JSON.stringify({
-                ok: false,
-                error:
-                  error.message
+                ok: true,
               })
             );
+
+            applyCrashGuardSignal(
+              signal
+            ).catch(error =>
+              console.error(
+                "Erreur traitement Crash Guard:",
+                error
+              )
+            );
           }
-        }
+        );
 
         return;
       }
 
-      /*
-      404
-      */
-
       res.writeHead(
         404,
         {
-          "Content-Type":
-            "application/json"
+          "content-type":
+            "application/json",
         }
       );
 
@@ -1021,1481 +2243,476 @@ const v51Server =
         JSON.stringify({
           ok: false,
           error:
-            "Not found"
+            "not found",
         })
       );
     }
   );
 
-v51Server.listen(
+httpServer.listen(
   PORT,
   "0.0.0.0",
   () => {
     console.log(
-      `🌐 Serveur V5.1 écoute sur le port ${PORT}.`
+      `🌐 Serveur V5.1 listening on ${PORT}`
     );
+
+    console.log(
+      `🌐 Host: 0.0.0.0`
+    );
+
+    console.log(
+      `💰 Mode réel: ${REAL_TRADING}`
+    );
+
+    if (tradingWallet) {
+      console.log(
+        `👛 Wallet: ${tradingWallet.publicKey.toBase58()}`
+      );
+    }
   }
 );
 
-// ============================================================
-// DEXSCREENER
-// ============================================================
+/* =========================================================
+   ENTRY CONDITIONS
+========================================================= */
 
-async function getMarketData(tokenMint) {
-  const url =
-    `https://api.dexscreener.com/token-pairs/v1/solana/${tokenMint}`;
-
-  try {
-    const response =
-      await fetch(url);
-
-    if (!response.ok) {
-      throw new Error(
-        `HTTP ${response.status}`
-      );
-    }
-
-    const pairs =
-      await response.json();
-
-    if (
-      !Array.isArray(pairs) ||
-      pairs.length === 0
-    ) {
-      return null;
-    }
-
-    const pumpPair =
-      pairs.find((pair) => {
-        return (
-          pair &&
-          pair.dexId &&
-          pair.dexId.toLowerCase() ===
-            "pumpswap"
-        );
-      });
-
-    if (!pumpPair) {
-      return null;
-    }
-
-    const price =
-      Number(
-        pumpPair.priceUsd || 0
-      );
-
-    const liquidity =
-      Number(
-        pumpPair.liquidity?.usd ||
-          0
-      );
-
-    if (
-      !price ||
-      price <= 0
-    ) {
-      return null;
-    }
-
-    return {
-      timestamp: now(),
-      price,
-      liquidity,
-      pairAddress:
-        pumpPair.pairAddress ||
-        null,
-      volume24h:
-        Number(
-          pumpPair.volume?.h24 ||
-            0
-        ),
-      buys5m:
-        Number(
-          pumpPair.txns?.m5?.buys ||
-            0
-        ),
-      sells5m:
-        Number(
-          pumpPair.txns?.m5?.sells ||
-            0
-        )
-    };
-
-  } catch (error) {
-    console.error(
-      "⚠️ Erreur DEX Screener:",
-      error.message
-    );
-
-    return null;
+function canEnter(data) {
+  if (!active) {
+    return false;
   }
-}
 
-// ============================================================
-// HISTORIQUE
-// ============================================================
+  if (position) {
+    return false;
+  }
 
-function addMarketPoint(data) {
-  marketHistory.push(data);
+  if (tradeInProgress) {
+    return false;
+  }
 
-  const cutoff =
-    now() -
-    HISTORY_WINDOW_MS;
+  if (crashGuardLocked) {
+    return false;
+  }
 
-  marketHistory =
-    marketHistory.filter(
-      (point) =>
-        point.timestamp >=
-        cutoff
-    );
-
-  appendJsonLine(
-    MARKET_FILE,
-    {
-      sessionStart:
-        sessionStartTime,
-      mint,
-      ...data
-    }
-  );
-}
-
-function getPointAgo(seconds) {
-  const target =
-    now() -
-    seconds * 1000;
-
-  let closest = null;
-  let distance = Infinity;
-
-  for (
-    const point of
-    marketHistory
-  ) {
-    const currentDistance =
-      Math.abs(
-        point.timestamp -
-          target
-      );
-
-    if (
-      currentDistance <
-      distance
-    ) {
-      distance =
-        currentDistance;
-
-      closest =
-        point;
-    }
+  if (crashGuardBuyBlocked) {
+    return false;
   }
 
   if (
-    !closest ||
-    distance > 5000
+    CRASH_GUARD_URL &&
+    !crashGuardArmed
   ) {
-    return null;
+    return false;
   }
 
-  return closest;
-}
-
-function calculateChange(
-  seconds,
-  field
-) {
-  const current =
-    marketHistory[
-      marketHistory.length - 1
-    ];
-
-  if (!current) {
-    return null;
-  }
-
-  const old =
-    getPointAgo(seconds);
-
-  if (
-    !old ||
-    !old[field]
-  ) {
-    return null;
-  }
-
-  return (
-    ((current[field] -
-      old[field]) /
-      old[field]) *
-    100
-  );
-}
-
-// ============================================================
-// ACCÉLÉRATION
-// ============================================================
-
-function calculateAcceleration() {
-  const price5s =
-    calculateChange(
-      5,
-      "price"
-    );
-
-  const price10s =
-    calculateChange(
-      10,
-      "price"
-    );
-
-  const liquidity10s =
-    calculateChange(
-      10,
-      "liquidity"
-    );
-
-  let level =
-    "NORMAL";
-
-  const reasons = [];
-
-  if (
-    Number.isFinite(
-      price5s
-    ) &&
-    Number.isFinite(
-      price10s
-    )
-  ) {
-    if (
-      price5s >=
-        ACCEL_PRICE_5S_EXTREME ||
-      price10s >=
-        ACCEL_PRICE_10S_EXTREME
-    ) {
-      level =
-        "EXTREME";
-
-      reasons.push(
-        `hausse prix très rapide (${formatPercent(price5s)} / 5s)`
-      );
-
-    } else if (
-      price5s >=
-        ACCEL_PRICE_5S_WARNING ||
-      price10s >=
-        ACCEL_PRICE_10S_WARNING
-    ) {
-      level =
-        "WARNING";
-
-      reasons.push(
-        `accélération prix (${formatPercent(price5s)} / 5s)`
-      );
-    }
-  }
-
-  if (
-    Number.isFinite(
-      liquidity10s
-    ) &&
-    liquidity10s <=
-      ACCEL_LIQUIDITY_DROP &&
-    (
-      (
-        Number.isFinite(
-          price5s
-        ) &&
-        price5s >= 5
-      ) ||
-      (
-        Number.isFinite(
-          price10s
-        ) &&
-        price10s >= 8
-      )
-    )
-  ) {
-    level =
-      "EXTREME";
-
-    reasons.push(
-      `prix en accélération + liquidité ${formatPercent(liquidity10s)} / 10s`
-    );
-  }
-
-  return {
-    level,
-    price5s,
-    price10s,
-    liquidity10s,
-    reasons
-  };
-}
-
-// ============================================================
-// SANTÉ DU MARCHÉ
-// ============================================================
-
-function calculateHealth(data) {
-  let score = 100;
-
-  const signals = [];
-
-  const liquidity10s =
-    calculateChange(
-      10,
-      "liquidity"
-    );
-
-  const liquidity30s =
-    calculateChange(
-      30,
-      "liquidity"
-    );
-
-  const price10s =
-    calculateChange(
-      10,
-      "price"
-    );
-
-  if (
-    data.liquidity <
-    MIN_LIQUIDITY_USD
-  ) {
-    score -= 20;
-
-    signals.push(
-      `liquidité sous ${formatUsd(MIN_LIQUIDITY_USD)}`
-    );
-  }
-
-  if (
-    Number.isFinite(
-      liquidity10s
-    ) &&
-    liquidity10s <=
-      ENTRY_LIQUIDITY_DROP_10S
-  ) {
-    score -= 20;
-
-    signals.push(
-      `liquidité ${formatPercent(liquidity10s)} / 10s`
-    );
-  }
-
-  if (
-    Number.isFinite(
-      liquidity30s
-    ) &&
-    liquidity30s <=
-      ENTRY_LIQUIDITY_DROP_30S
-  ) {
-    score -= 20;
-
-    signals.push(
-      `liquidité ${formatPercent(liquidity30s)} / 30s`
-    );
-  }
-
-  if (
-    Number.isFinite(
-      price10s
-    ) &&
-    price10s <=
-      ENTRY_PRICE_DROP_10S
-  ) {
-    score -= 20;
-
-    signals.push(
-      `prix ${formatPercent(price10s)} / 10s`
-    );
-  }
-
-  const totalActivity =
-    data.buys5m +
-    data.sells5m;
-
-  if (
-    totalActivity === 0
-  ) {
-    score -= 10;
-
-    signals.push(
-      "activité faible"
-    );
-  }
-
-  score =
-    Math.max(
-      0,
-      Math.min(
-        100,
-        score
-      )
-    );
-
-  return {
-    score,
-    liquidity10s,
-    liquidity30s,
-    price10s,
-    signals
-  };
-}
-
-// ============================================================
-// CRASH
-// ============================================================
-
-function detectCrash(
-  data,
-  health
-) {
-  const price10s =
-    health.price10s;
-
-  const liquidity10s =
-    health.liquidity10s;
-
-  const reasons = [];
-
-  if (
-    data.liquidity <= 1
-  ) {
-    reasons.push(
-      "liquidité quasi nulle"
-    );
-  }
-
-  if (
-    Number.isFinite(
-      liquidity10s
-    ) &&
-    liquidity10s <=
-      CRASH_LIQUIDITY_DROP_10S
-  ) {
-    reasons.push(
-      `liquidité ${formatPercent(liquidity10s)} / 10s`
-    );
-  }
-
-  if (
-    Number.isFinite(
-      price10s
-    ) &&
-    price10s <=
-      CRASH_PRICE_DROP_10S
-  ) {
-    reasons.push(
-      `prix ${formatPercent(price10s)} / 10s`
-    );
-  }
-
-  return reasons;
-}
-
-// ============================================================
-// ENTRÉE
-// ============================================================
-
-function canEnter(
-  data,
-  health,
-  acceleration
-) {
   const elapsed =
     now() -
     sessionStartTime;
-
-  if (
-    crashGuardLocked
-  ) {
-    return {
-      ok: false,
-      reason:
-        "Crash Guard verrouillé"
-    };
-  }
-
-  if (
-    crashGuardBuyBlocked
-  ) {
-    return {
-      ok: false,
-      reason:
-        `Crash Guard ${crashGuardLevel} : achats bloqués`
-    };
-  }
-
-  if (
-    !crashGuardArmed
-  ) {
-    return {
-      ok: false,
-      reason:
-        "Crash Guard non armé"
-    };
-  }
 
   if (
     elapsed >=
     NO_NEW_BUY_AFTER_MS
   ) {
-    return {
-      ok: false,
-      reason:
-        "limite de 43 minutes atteinte"
-    };
+    return false;
   }
 
   if (
-    observationUntil > now()
+    observationUntil >
+    now()
   ) {
-    return {
-      ok: false,
-      reason:
-        "phase d'observation"
-    };
+    return false;
   }
 
   if (
+    !data ||
     data.liquidity <
-    MIN_LIQUIDITY_USD
+      MIN_LIQUIDITY_USD
   ) {
-    return {
-      ok: false,
-      reason:
-        "liquidité insuffisante"
-    };
+    return false;
   }
+
+  const health =
+    calculateHealth(data);
 
   if (
     health.score <
     MIN_HEALTH_SCORE_FOR_ENTRY
   ) {
+    return false;
+  }
+
+  const acceleration =
+    analyzeAcceleration(data);
+
+  if (
+    acceleration.extreme
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+/* =========================================================
+   CRASH DETECTION V5.1
+========================================================= */
+
+function detectCrash(data) {
+  const ten =
+    getHistoryAgo(10000);
+
+  if (!ten) {
     return {
-      ok: false,
-      reason:
-        `score santé ${health.score}/100`
+      crash: false,
+      reasons: [],
     };
   }
 
+  const priceChange10s =
+    percentChange(
+      data.price,
+      ten.price
+    );
+
+  const liquidityChange10s =
+    percentChange(
+      data.liquidity,
+      ten.liquidity
+    );
+
+  const reasons = [];
+
   if (
-    acceleration.level ===
-      "WARNING" ||
-    acceleration.level ===
-      "EXTREME"
+    liquidityChange10s !== null &&
+    liquidityChange10s <=
+      CRASH_LIQUIDITY_DROP_10S
   ) {
-    return {
-      ok: false,
-      reason:
-        `accélération ${acceleration.level}`
-    };
+    reasons.push(
+      `liquidité ${liquidityChange10s.toFixed(2)}%`
+    );
   }
 
   if (
-    marketHistory.length <
-    REQUIRED_HEALTHY_CONFIRMATIONS
+    priceChange10s !== null &&
+    priceChange10s <=
+      CRASH_PRICE_DROP_10S
   ) {
-    return {
-      ok: false,
-      reason:
-        "historique insuffisant"
-    };
+    reasons.push(
+      `prix ${priceChange10s.toFixed(2)}%`
+    );
   }
 
   return {
-    ok: true,
-    reason:
-      "conditions favorables"
+    crash:
+      reasons.length > 0,
+
+    reasons,
+
+    priceChange10s,
+
+    liquidityChange10s,
   };
 }
 
-// ============================================================
-// ACHAT SIMULÉ
-// ============================================================
+/* =========================================================
+   CRASH REPORT
+========================================================= */
 
-async function simulateBuy(data) {
-  if (
-    crashGuardLocked ||
-    crashGuardBuyBlocked ||
-    !crashGuardArmed
-  ) {
-    console.log(
-      "🛡️ Achat ignoré : Crash Guard actif."
-    );
-
-    return;
-  }
-
-  cycleNumber++;
-  sessionCycles++;
-
-  const tokens =
-    FIXED_CAPITAL_USD /
-    data.price;
-
-  position = {
-    cycle:
-      cycleNumber,
-    entryTime:
-      now(),
-    entryPrice:
-      data.price,
-    capital:
-      FIXED_CAPITAL_USD,
-    tokens,
-    targetPrice:
-      data.price *
-      (
-        1 +
-        TARGET_GAIN_PERCENT /
-          100
+function loadCrashReports() {
+  try {
+    if (
+      !fs.existsSync(
+        CRASH_REPORTS_FILE
       )
+    ) {
+      return [];
+    }
+
+    const content =
+      fs.readFileSync(
+        CRASH_REPORTS_FILE,
+        "utf8"
+      );
+
+    if (!content.trim()) {
+      return [];
+    }
+
+    return JSON.parse(content);
+  } catch {
+    return [];
+  }
+}
+
+function saveCrashReport(report) {
+  const reports =
+    loadCrashReports();
+
+  reports.push(report);
+
+  saveJson(
+    CRASH_REPORTS_FILE,
+    reports
+  );
+}
+
+/* =========================================================
+   GENERIC CRASH HANDLER
+========================================================= */
+
+async function handleCrash(
+  data,
+  crash
+) {
+  const report = {
+    timestamp:
+      new Date().toISOString(),
+
+    mint,
+
+    sessionStartTime:
+      sessionStartTime
+        ? new Date(
+            sessionStartTime
+          ).toISOString()
+        : null,
+
+    cycles:
+      sessionCycles.length,
+
+    sessionProfit,
+
+    crashPrice:
+      data.price,
+
+    crashLiquidity:
+      data.liquidity,
+
+    priceChange10s:
+      crash.priceChange10s,
+
+    liquidityChange10s:
+      crash.liquidityChange10s,
+
+    reasons:
+      crash.reasons,
+
+    position:
+      position
+        ? {
+            entryPrice:
+              position.entryPrice,
+
+            tokenAmount:
+              position.tokenAmount,
+
+            cycle:
+              position.cycle,
+          }
+        : null,
+
+    history:
+      marketHistory.slice(
+        -Math.floor(
+          CRASH_REPORT_WINDOW_MS /
+            POLL_INTERVAL_MS
+        )
+      ),
   };
 
-  const health =
-    calculateHealth(
-      data
+  saveCrashReport(
+    report
+  );
+
+  await sendTelegram(
+    `💥 CRASH V5.1\n\n` +
+    `Prix : ${data.price}\n` +
+    `Liquidité : $${data.liquidity.toFixed(2)}\n` +
+    `Prix 10s : ${
+      crash.priceChange10s === null
+        ? "N/A"
+        : crash.priceChange10s.toFixed(2) + "%"
+    }\n` +
+    `Liquidité 10s : ${
+      crash.liquidityChange10s === null
+        ? "N/A"
+        : crash.liquidityChange10s.toFixed(2) + "%"
+    }\n` +
+    `Raisons : ${crash.reasons.join(", ")}`
+  );
+
+  /*
+   * En réel, on ne laisse pas une position ouverte
+   * uniquement parce que le détecteur V5.1 classique
+   * a déclenché.
+   *
+   * On tente une vente réelle si Crash Guard n'a pas
+   * déjà pris en charge la position.
+   */
+  if (
+    position &&
+    !crashGuardEmergencyExitDone
+  ) {
+    try {
+      await realSellPosition(
+        "V5.1_CRASH"
+      );
+    } catch (error) {
+      await sendTelegram(
+        `❌ V5.1 CRASH\n\n` +
+        `La vente réelle a échoué.\n` +
+        `${error.message}`
+      );
+    }
+  }
+
+  await disarmCrashGuard();
+
+  stopRadar(
+    false,
+    true
+  ).catch(error =>
+    console.error(
+      "Erreur stopRadar crash:",
+      error.message
+    )
+  );
+}
+
+/* =========================================================
+   TIME LIMIT EXIT
+========================================================= */
+
+async function timeLimitExit(data) {
+  if (!position) {
+    return;
+  }
+
+  try {
+    await realSellPosition(
+      "TIME_LIMIT_45_MIN",
+      position.poolAddress
+    );
+  } catch (error) {
+    await sendTelegram(
+      `❌ LIMITE 45 MIN\n\n` +
+      `La vente réelle a échoué.\n` +
+      `${error.message}\n\n` +
+      `La position n'est PAS considérée comme liquidée.`
     );
 
+    console.error(
+      "Erreur time limit sell:",
+      error
+    );
+
+    return;
+  }
+
+  await disarmCrashGuard();
+
+  await stopRadar(
+    false,
+    true
+  );
+}
+
+/* =========================================================
+   TARGET SELL
+========================================================= */
+
+async function checkTargetSell(data) {
+  if (!position) {
+    return false;
+  }
+
+  if (
+    data.price >=
+    position.targetPrice
+  ) {
+    try {
+      await realSellPosition(
+        "TARGET_PLUS_5",
+        position.poolAddress
+      );
+
+      return true;
+    } catch (error) {
+      await sendTelegram(
+        `❌ VENTE OBJECTIF\n\n` +
+        `L'objectif a été atteint mais la transaction a échoué.\n` +
+        `${error.message}\n\n` +
+        `La position reste ouverte.`
+      );
+
+      console.error(
+        "Erreur target sell:",
+        error
+      );
+
+      return false;
+    }
+  }
+
+  return false;
+}
+
+/* =========================================================
+   ACCELERATION ALERT
+========================================================= */
+
+async function handleAcceleration(
+  data
+) {
   const acceleration =
-    calculateAcceleration();
+    analyzeAcceleration(data);
 
-  await bot.telegram.sendMessage(
-    CHAT_ID,
-    `🟢 ACHAT TEST #${cycleNumber}
+  if (
+    acceleration.warning &&
+    !accelerationAlertSent
+  ) {
+    accelerationWarningActive =
+      true;
 
-Token :
+    accelerationAlertSent =
+      true;
 
-${mint}
-
-Mise fixe :
-
-${formatUsd(FIXED_CAPITAL_USD)}
-
-Prix :
-
-$${data.price.toFixed(8)}
-
-Tokens :
-
-${tokens.toFixed(8)}
-
-🎯 Objectif :
-
-+${TARGET_GAIN_PERCENT.toFixed(2)}%
-
-Prix cible :
-
-$${position.targetPrice.toFixed(8)}
-
-💧 Liquidité :
-
-${formatUsd(data.liquidity)}
-
-🧠 SCORE DE SANTÉ :
-
-${health.score}/100
-
-⚡ Accélération :
-
-${acceleration.level}
-
-🛡️ Entrée confirmée :
-
-${healthyConfirmations}/${REQUIRED_HEALTHY_CONFIRMATIONS}`
-  );
-}
-
-// ============================================================
-// VENTE CIBLE
-// ============================================================
-
-async function simulateTargetSell(
-  data
-) {
-  if (!position) {
-    return;
+    await sendTelegram(
+      `⚠️ ACCÉLÉRATION V5.1\n\n` +
+      `Prix 5s : ${
+        acceleration.price5s === null
+          ? "N/A"
+          : acceleration.price5s.toFixed(2) + "%"
+      }\n` +
+      `Prix 10s : ${
+        acceleration.price10s === null
+          ? "N/A"
+          : acceleration.price10s.toFixed(2) + "%"
+      }\n` +
+      `Liquidité 10s : ${
+        acceleration.liquidity10s === null
+          ? "N/A"
+          : acceleration.liquidity10s.toFixed(2) + "%"
+      }`
+    );
   }
 
   if (
-    crashGuardLocked
+    !acceleration.warning
   ) {
-    console.log(
-      "🛡️ Vente cible annulée : Crash Guard verrouillé."
-    );
-
-    return;
-  }
-
-  const entryPrice =
-    position.entryPrice;
-
-  const targetPrice =
-    position.targetPrice;
-
-  const simulatedAmount =
-    FIXED_CAPITAL_USD *
-    (
-      targetPrice /
-      entryPrice
-    );
-
-  const profit =
-    simulatedAmount -
-    FIXED_CAPITAL_USD;
-
-  sessionProfit +=
-    profit;
-
-  const trade = {
-    type: "TARGET",
-    sessionStart:
-      sessionStartTime,
-    timestamp:
-      now(),
-    mint,
-    cycle:
-      position.cycle,
-    entryPrice,
-    exitPrice:
-      targetPrice,
-    capital:
-      FIXED_CAPITAL_USD,
-    amount:
-      simulatedAmount,
-    profit,
-    profitPercent:
-      (
-        profit /
-        FIXED_CAPITAL_USD
-      ) * 100
-  };
-
-  tradeHistory.push(
-    trade
-  );
-
-  saveJson(
-    TRADES_FILE,
-    tradeHistory
-  );
-
-  const cycle =
-    position.cycle;
-
-  position = null;
-
-  await bot.telegram.sendMessage(
-    CHAT_ID,
-    `🔴 VENTE TEST #${cycle}
-
-Token :
-
-${mint}
-
-Prix de vente :
-
-$${targetPrice.toFixed(8)}
-
-Montant simulé :
-
-${formatUsd(simulatedAmount)}
-
-Résultat :
-
-+${TARGET_GAIN_PERCENT.toFixed(2)}%
-
-Bénéfice réalisé :
-
-+${formatUsd(profit)}
-
-💰 Bénéfices de cette session :
-
-${formatUsd(sessionProfit)}
-
-🔄 Capital du prochain cycle :
-
-${formatUsd(FIXED_CAPITAL_USD)}
-
-🛡️ NOUVELLE PHASE DE SÉCURITÉ
-
-⏳ Observation du marché pendant 30s
-
-❌ Aucun rachat immédiat.`
-  );
-
-  observationUntil =
-    now() +
-    OBSERVATION_AFTER_SELL_MS;
-
-  healthyConfirmations =
-    0;
-}
-
-// ============================================================
-// SORTIE À 45 MINUTES
-// ============================================================
-
-async function timeLimitExit(
-  data
-) {
-  if (!position) {
-    return;
-  }
-
-  if (
-    crashGuardLocked
-  ) {
-    return;
-  }
-
-  if (
-    data.liquidity <=
-    MIN_LIQUIDITY_USD
-  ) {
-    await bot.telegram.sendMessage(
-      CHAT_ID,
-      `⏰ LIMITE 45 MINUTES
-
-Token :
-
-${mint}
-
-⚠️ Position encore ouverte.
-
-💧 Liquidité :
-
-${formatUsd(data.liquidity)}
-
-La liquidité n'est pas suffisamment fiable.
-
-❌ Aucune vente fictive.
-
-❌ Aucun bénéfice fictif.
-
-⛔ Session arrêtée.`
-    );
-
-    position = null;
-
-    return;
-  }
-
-  const exitPrice =
-    data.price;
-
-  const amount =
-    position.tokens *
-    exitPrice;
-
-  const profit =
-    amount -
-    position.capital;
-
-  const profitPercent =
-    (
-      profit /
-      position.capital
-    ) * 100;
-
-  sessionProfit +=
-    profit;
-
-  const trade = {
-    type:
-      "TIME_LIMIT",
-    sessionStart:
-      sessionStartTime,
-    timestamp:
-      now(),
-    mint,
-    cycle:
-      position.cycle,
-    entryPrice:
-      position.entryPrice,
-    exitPrice,
-    capital:
-      position.capital,
-    amount,
-    profit,
-    profitPercent
-  };
-
-  tradeHistory.push(
-    trade
-  );
-
-  saveJson(
-    TRADES_FILE,
-    tradeHistory
-  );
-
-  const cycle =
-    position.cycle;
-
-  position = null;
-
-  await bot.telegram.sendMessage(
-    CHAT_ID,
-    `⏰ SORTIE LIMITE 45 MINUTES
-
-Token :
-
-${mint}
-
-Cycle :
-
-#${cycle}
-
-Prix d'entrée :
-
-$${trade.entryPrice.toFixed(8)}
-
-Prix de sortie :
-
-$${exitPrice.toFixed(8)}
-
-Résultat :
-
-${formatPercent(profitPercent)}
-
-Résultat simulé :
-
-${profit >= 0 ? "+" : ""}${formatUsd(profit)}
-
-💰 Bénéfice session :
-
-${profit >= 0 ? "+" : ""}${formatUsd(sessionProfit)}
-
-⛔ Aucun nouveau cycle.`
-  );
-}
-
-// ============================================================
-// ACCÉLÉRATION TELEGRAM
-// ============================================================
-
-async function handleAccelerationAlert(
-  acceleration
-) {
-  const danger =
-    acceleration.level ===
-      "WARNING" ||
-    acceleration.level ===
-      "EXTREME";
-
-  if (!danger) {
     accelerationWarningActive =
       false;
 
     accelerationAlertSent =
       false;
-
-    return;
   }
 
-  accelerationWarningActive =
-    true;
-
-  if (
-    accelerationAlertSent
-  ) {
-    return;
-  }
-
-  accelerationAlertSent =
-    true;
-
-  const message =
-    acceleration.level ===
-    "EXTREME"
-      ? "🚨 ACCÉLÉRATION TRÈS FORTE"
-      : "⚡ ACCÉLÉRATION ANORMALE";
-
-  await bot.telegram.sendMessage(
-    CHAT_ID,
-    `${message}
-
-Token :
-
-${mint}
-
-Prix 5s :
-
-${formatPercent(acceleration.price5s)}
-
-Prix 10s :
-
-${formatPercent(acceleration.price10s)}
-
-Liquidité 10s :
-
-${formatPercent(acceleration.liquidity10s)}
-
-⚠️ Aucun nouvel achat pendant cette accélération.
-
-${
-  position
-    ? "📌 Une position est déjà ouverte. Pas de vente d'urgence automatique."
-    : "🛡️ Le filtre d'entrée reste bloqué."
+  return acceleration;
 }
 
-Raisons :
-
-${acceleration.reasons
-  .map(
-    (reason) =>
-      `• ${reason}`
-  )
-  .join("\n")}`
-  );
-}
-
-// ============================================================
-// RAPPORT CRASH
-// ============================================================
-
-async function saveCrashReport(
-  data,
-  health,
-  acceleration,
-  reasons
-) {
-  const cutoff =
-    now() -
-    CRASH_REPORT_WINDOW_MS;
-
-  const last60Seconds =
-    marketHistory.filter(
-      (point) =>
-        point.timestamp >=
-        cutoff
-    );
-
-  const report = {
-    id:
-      `crash_${now()}`,
-    timestamp:
-      new Date().toISOString(),
-    sessionStart:
-      new Date(
-        sessionStartTime
-      ).toISOString(),
-    mint,
-    cyclesCompleted:
-      sessionCycles,
-    sessionProfit,
-    crashMarket: {
-      price:
-        data.price,
-      liquidity:
-        data.liquidity,
-      priceChange10s:
-        health.price10s,
-      liquidityChange10s:
-        health.liquidity10s,
-      score:
-        health.score
-    },
-    acceleration: {
-      level:
-        acceleration.level,
-      price5s:
-        acceleration.price5s,
-      price10s:
-        acceleration.price10s,
-      liquidity10s:
-        acceleration.liquidity10s,
-      reasons:
-        acceleration.reasons
-    },
-    reasons,
-    openPosition:
-      position
-        ? {
-            cycle:
-              position.cycle,
-            entryPrice:
-              position.entryPrice,
-            tokens:
-              position.tokens,
-            capital:
-              position.capital
-          }
-        : null,
-    last60Seconds
-  };
-
-  let reports = [];
-
-  try {
-    if (
-      fs.existsSync(
-        CRASH_FILE
-      )
-    ) {
-      const content =
-        fs.readFileSync(
-          CRASH_FILE,
-          "utf8"
-        );
-
-      if (
-        content.trim()
-      ) {
-        reports =
-          JSON.parse(
-            content
-          );
-
-        if (
-          !Array.isArray(
-            reports
-          )
-        ) {
-          reports = [];
-        }
-      }
-    }
-  } catch {
-    reports = [];
-  }
-
-  reports.push(
-    report
-  );
-
-  if (
-    reports.length >
-    20
-  ) {
-    reports =
-      reports.slice(-20);
-  }
-
-  saveJson(
-    CRASH_FILE,
-    reports
-  );
-
-  return report;
-}
-
-// ============================================================
-// RAPPORT TELEGRAM
-// ============================================================
-
-async function sendCrashReport(
-  report
-) {
-  const market =
-    report.crashMarket;
-
-  const acceleration =
-    report.acceleration;
-
-  const lastPoints =
-    report.last60Seconds.slice(
-      -15
-    );
-
-  let lines = "";
-
-  for (
-    const point of
-    lastPoints
-  ) {
-    const time =
-      new Date(
-        point.timestamp
-      ).toLocaleTimeString(
-        "fr-FR",
-        {
-          hour:
-            "2-digit",
-          minute:
-            "2-digit",
-          second:
-            "2-digit"
-        }
-      );
-
-    lines +=
-      `${time} | prix $${point.price.toFixed(8)} | liq ${formatUsd(point.liquidity)}\n`;
-  }
-
-  await bot.telegram.sendMessage(
-    CHAT_ID,
-    `📊 RAPPORT CRASH V5.1
-
-🪙 Token :
-
-${report.mint}
-
-🕐 Crash :
-
-${new Date(
-  report.timestamp
-).toLocaleString("fr-FR")}
-
-💥 Prix au crash :
-
-$${market.price.toFixed(8)}
-
-📉 Prix / 10s :
-
-${formatPercent(market.priceChange10s)}
-
-💧 Liquidité :
-
-${formatUsd(market.liquidity)}
-
-📉 Liquidité / 10s :
-
-${formatPercent(market.liquidityChange10s)}
-
-🧠 Score :
-
-${market.score}/100
-
-⚡ Accélération :
-
-${acceleration.level}
-
-Prix / 5s :
-
-${formatPercent(acceleration.price5s)}
-
-Prix / 10s :
-
-${formatPercent(acceleration.price10s)}
-
-🚨 Signaux :
-
-${report.reasons
-  .map(
-    (reason) =>
-      `• ${reason}`
-  )
-  .join("\n")}
-
-📈 DERNIERS POINTS AVANT CRASH
-
-${lines}
-
-💰 Bénéfices session :
-
-${formatUsd(
-  report.sessionProfit
-)}
-
-🔄 Cycles terminés :
-
-${report.cyclesCompleted}
-
-💾 Rapport complet :
-
-crash_reports.json`
-  );
-
-  try {
-    if (
-      fs.existsSync(
-        CRASH_FILE
-      )
-    ) {
-      await bot.telegram.sendDocument(
-        CHAT_ID,
-        {
-          source:
-            CRASH_FILE
-        },
-        {
-          caption:
-            "📁 Fichier complet crash_reports.json"
-        }
-      );
-    }
-  } catch (error) {
-    console.error(
-      "⚠️ Impossible d'envoyer le fichier Telegram:",
-      error.message
-    );
-  }
-}
-
-// ============================================================
-// CRASH V5.1
-// ============================================================
-
-async function handleCrash(
-  data,
-  health,
-  acceleration,
-  reasons
-) {
-  if (!active) {
-    return;
-  }
-
-  const report =
-    await saveCrashReport(
-      data,
-      health,
-      acceleration,
-      reasons
-    );
-
-  await bot.telegram.sendMessage(
-    CHAT_ID,
-    `🚨 STOP CRASH - MODE TEST V5.1
-
-Token :
-
-${mint}
-
-Prix :
-
-$${data.price.toFixed(8)}
-
-Variation prix ~10s :
-
-${formatPercent(
-  health.price10s
-)}
-
-Liquidité :
-
-${formatUsd(
-  data.liquidity
-)}
-
-Variation liquidité ~10s :
-
-${formatPercent(
-  health.liquidity10s
-)}
-
-⚡ Accélération :
-
-${acceleration.level}
-
-🧠 Score au crash :
-
-${health.score}/100
-
-⚠️ Signaux :
-
-${reasons
-  .map(
-    (reason) =>
-      `• ${reason}`
-  )
-  .join("\n")}
-
-${
-  position
-    ? `⚠️ Position restante :
-
-${position.tokens.toFixed(8)} tokens
-
-⚠️ Prix de sortie NON considéré fiable.
-
-⚠️ Aucun bénéfice fictif ajouté.`
-    : "ℹ️ Aucune position ouverte."
-}
-
-📊 Données des 60 dernières secondes :
-
-SAUVEGARDÉES
-
-📩 Le rapport complet arrive maintenant.
-
-⛔ NOUVEAU CYCLE BLOQUÉ
-
-⛔ RADAR ARRÊTÉ`
-  );
-
-  await sendCrashReport(
-    report
-  );
-
-  await disarmCrashGuard();
-
-  stopRadar(false);
-}
-
-// ============================================================
-// LIMITE TEMPORELLE
-// ============================================================
-
-async function handleTimeLimit(
-  data
-) {
-  if (!active) {
-    return false;
-  }
-
-  const elapsed =
-    now() -
-    sessionStartTime;
-
-  if (
-    elapsed <
-    MAX_TOKEN_SESSION_MS
-  ) {
-    return false;
-  }
-
-  await bot.telegram.sendMessage(
-    CHAT_ID,
-    `⏰ LIMITE DE SESSION ATTEINTE
-
-Token :
-
-${mint}
-
-Durée :
-
-45 minutes
-
-🔄 Cycles terminés :
-
-${sessionCycles}
-
-💰 Bénéfice session :
-
-${sessionProfit >= 0 ? "+" : ""}${formatUsd(sessionProfit)}
-
-⛔ Aucun nouveau cycle.`
-  );
-
-  if (
-    position
-  ) {
-    await timeLimitExit(
-      data
-    );
-  }
-
-  await saveSummary(
-    "TIME_LIMIT"
-  );
-
-  await disarmCrashGuard();
-
-  stopRadar(false);
-
-  return true;
-}
-
-// ============================================================
-// BOUCLE PRINCIPALE
-// ============================================================
+/* =========================================================
+   TICK V5.1
+========================================================= */
 
 async function tick() {
   if (
@@ -2511,16 +2728,33 @@ async function tick() {
     return;
   }
 
-  const data =
-    await getMarketData(
-      mint
+  if (
+    tradeInProgress
+  ) {
+    return;
+  }
+
+  let data;
+
+  try {
+    data =
+      await getMarketData(
+        mint
+      );
+  } catch (error) {
+    console.error(
+      "Erreur marché:",
+      error.message
     );
+
+    return;
+  }
 
   if (!data) {
     return;
   }
 
-  addMarketPoint(
+  addMarketHistory(
     data
   );
 
@@ -2529,157 +2763,143 @@ async function tick() {
       data
     );
 
+  if (
+    health.healthy
+  ) {
+    healthyConfirmations += 1;
+  } else {
+    healthyConfirmations = 0;
+  }
+
   const acceleration =
-    calculateAcceleration();
+    await handleAcceleration(
+      data
+    );
 
-  await handleAccelerationAlert(
-    acceleration
-  );
-
-  const crashReasons =
+  const crash =
     detectCrash(
-      data,
-      health
+      data
     );
 
   if (
-    crashReasons.length >
-    0
+    crash.crash
   ) {
     await handleCrash(
       data,
-      health,
-      acceleration,
-      crashReasons
+      crash
     );
 
     return;
   }
 
-  const timeStopped =
-    await handleTimeLimit(
+  const elapsed =
+    now() -
+    sessionStartTime;
+
+  if (
+    elapsed >=
+    MAX_TOKEN_SESSION_MS
+  ) {
+    await timeLimitExit(
       data
     );
 
-  if (
-    timeStopped
-  ) {
     return;
   }
 
-  if (
-    crashGuardLocked
-  ) {
-    return;
-  }
-
-  if (
-    position
-  ) {
-    if (
-      data.price >=
-      position.targetPrice
-    ) {
-      await simulateTargetSell(
-        data
-      );
-    }
-
-    return;
-  }
-
-  if (
-    observationUntil >
-    now()
-  ) {
-    return;
-  }
-
-  const entry =
-    canEnter(
-      data,
-      health,
-      acceleration
+  if (position) {
+    await checkTargetSell(
+      data
     );
 
-  if (
-    !entry.ok
-  ) {
-    healthyConfirmations =
-      0;
-
     return;
   }
 
-  healthyConfirmations++;
-
-  console.log(
-    `🟡 Marché favorable : ${healthyConfirmations}/${REQUIRED_HEALTHY_CONFIRMATIONS}`
-  );
+  if (
+    !canEnter(data)
+  ) {
+    return;
+  }
 
   if (
-    healthyConfirmations >=
+    healthyConfirmations <
     REQUIRED_HEALTHY_CONFIRMATIONS
   ) {
-    if (
-      crashGuardLocked ||
-      crashGuardBuyBlocked ||
-      !crashGuardArmed
-    ) {
-      healthyConfirmations =
-        0;
+    return;
+  }
 
-      return;
-    }
+  if (
+    acceleration.extreme
+  ) {
+    return;
+  }
 
-    await simulateBuy(
+  try {
+    await realBuy(
       data
     );
+  } catch (error) {
+    await sendTelegram(
+      `❌ ERREUR ACHAT RÉEL\n\n` +
+      `${error.message}\n\n` +
+      `Aucun achat considéré comme réussi.`
+    );
 
-    healthyConfirmations =
-      0;
+    console.error(
+      "Erreur realBuy:",
+      error
+    );
   }
 }
 
-// ============================================================
-// SUMMARY
-// ============================================================
+/* =========================================================
+   SUMMARY
+========================================================= */
 
-async function saveSummary(
-  reason
-) {
+function saveSummary() {
   const summary = {
     version:
-      "V5.1",
-    sessionStart:
+      "V5.1-REAL",
+
+    active,
+
+    mint,
+
+    sessionStartTime:
       sessionStartTime
         ? new Date(
             sessionStartTime
           ).toISOString()
         : null,
-    sessionEnd:
-      new Date().toISOString(),
-    mint,
-    reason,
-    cyclesCompleted:
-      sessionCycles,
+
+    sessionCycles,
+
     sessionProfit,
-    positionOpen:
-      !!position,
-    marketPoints:
-      marketHistory.length,
-    crashGuard: {
-      armed:
-        crashGuardArmed,
-      level:
-        crashGuardLevel,
-      buyBlocked:
-        crashGuardBuyBlocked,
-      locked:
-        crashGuardLocked,
-      emergencyExitDone:
-        crashGuardEmergencyExitDone
-    }
+
+    dailySpentEur,
+
+    dailySpentDate,
+
+    position,
+
+    crashGuardLevel,
+
+    crashGuardBuyBlocked,
+
+    crashGuardLocked,
+
+    crashGuardEmergencyExitDone,
+
+    realTrading:
+      REAL_TRADING,
+
+    wallet:
+      tradingWallet
+        ? tradingWallet.publicKey.toBase58()
+        : null,
+
+    updatedAt:
+      new Date().toISOString(),
   };
 
   saveJson(
@@ -2688,95 +2908,91 @@ async function saveSummary(
   );
 }
 
-// ============================================================
-// START
-// ============================================================
+/* =========================================================
+   START RADAR
+========================================================= */
 
 async function startRadar(
   tokenMint
 ) {
-  if (active) {
-    await bot.telegram.sendMessage(
-      CHAT_ID,
-      `⚠️ Un test est déjà en cours.
-
-Token :
-
-${mint}
-
-Utilise /stoptrade avant d'en lancer un autre.`
+  if (
+    active
+  ) {
+    throw new Error(
+      "Un radar est déjà actif"
     );
-
-    return;
   }
 
-  try {
-    await armCrashGuard(
-      tokenMint.trim()
+  if (
+    !tokenMint
+  ) {
+    throw new Error(
+      "Mint manquant"
+    );
+  }
+
+  if (
+    !REAL_TRADING
+  ) {
+    throw new Error(
+      "REAL_TRADING=false. Active le mode réel dans Railway avant /starttrade."
+    );
+  }
+
+  /*
+   * Vérification du wallet avant toute session.
+   */
+  const solBalance =
+    await getWalletSolBalance();
+
+  if (
+    solBalance <
+    MIN_SOL_RESERVE
+  ) {
+    throw new Error(
+      `Solde SOL insuffisant pour démarrer: ${solBalance.toFixed(6)} SOL`
+    );
+  }
+
+  /*
+   * Vérification marché avant armement.
+   */
+  const initialData =
+    await getMarketData(
+      tokenMint
     );
 
-  } catch (error) {
-
-    console.error(
-      "❌ Impossible d'armer le Crash Guard:",
-      error.message
+  if (!initialData) {
+    throw new Error(
+      "Aucune paire PumpSwap détectée pour ce token"
     );
-
-    await bot.telegram.sendMessage(
-      CHAT_ID,
-      `❌ V5.1 NON DÉMARRÉE
-
-Token :
-
-${tokenMint}
-
-🛡️ Crash Guard :
-
-❌ ARMEMENT IMPOSSIBLE
-
-Erreur :
-
-${error.message}
-
-⛔ Aucun achat ne sera lancé.
-
-Vérifie que le service Crash Guard
-est bien démarré et que les variables
-sont correctement configurées.`
-    );
-
-    return;
   }
 
   mint =
-    tokenMint.trim();
+    tokenMint;
 
-  active =
-    true;
+  crashGuardLevel =
+    "NORMAL";
 
-  sessionStartTime =
-    now();
+  crashGuardBuyBlocked =
+    false;
 
-  observationUntil =
-    0;
+  crashGuardLocked =
+    false;
 
-  position =
+  crashGuardEmergencyExitDone =
+    false;
+
+  crashGuardEmergencyExitInProgress =
+    false;
+
+  crashGuardLastEventId =
     null;
-
-  cycleNumber =
-    0;
-
-  sessionCycles =
-    0;
-
-  sessionProfit =
-    0;
 
   healthyConfirmations =
     0;
 
-  marketHistory =
-    [];
+  marketHistory = [];
 
   accelerationWarningActive =
     false;
@@ -2784,106 +3000,464 @@ sont correctement configurées.`
   accelerationAlertSent =
     false;
 
-  console.log(
-    `🚀 V5.1 démarrée pour ${shortMint(mint)}`
+  position =
+    null;
+
+  cycleNumber =
+    0;
+
+  sessionCycles = [];
+
+  sessionProfit =
+    0;
+
+  observationUntil =
+    0;
+
+  sessionStartTime =
+    now();
+
+  resetDailyIfNeeded();
+
+  /*
+   * Le Guard doit être armé AVANT le début
+   * de la surveillance réelle.
+   */
+  await armCrashGuard(
+    tokenMint
   );
 
-  await bot.telegram.sendMessage(
-    CHAT_ID,
-    `🚀 V5.1 TEST DÉMARRÉ
+  active =
+    true;
 
-Token :
+  await sendTelegram(
+    `🚀 V5.1 RÉEL DÉMARRÉ\n\n` +
+    `Mint : ${tokenMint}\n` +
+    `Capital par achat : ${FIXED_CAPITAL_EUR.toFixed(2)} €\n` +
+    `Objectif : +${TARGET_GAIN_PERCENT}%\n` +
+    `Slippage achat : ${BUY_SLIPPAGE_PERCENT}%\n` +
+    `Slippage vente : ${SELL_SLIPPAGE_PERCENT}%\n` +
+    `Plafond quotidien : ${MAX_DAILY_EUR.toFixed(2)} €\n` +
+    `Wallet : ${tradingWallet.publicKey.toBase58()}\n\n` +
+    `⚠️ Les transactions sont maintenant RÉELLES.`
+  );
 
-${mint}
-
-💵 Mise fixe :
-
-${formatUsd(FIXED_CAPITAL_USD)}
-
-🎯 Objectif :
-
-+${TARGET_GAIN_PERCENT.toFixed(2)}%
-
-⏳ Observation après vente :
-
-30 secondes
-
-⚡ Filtre accélération :
-
-ACTIF
-
-🛡️ CRASH GUARD :
-
-ACTIF
-
-🟢 WATCH :
-
-Aucune action
-
-🟠 DANGER :
-
-Nouveaux achats bloqués
-
-🔴 CRITICAL :
-
-Sortie d'urgence + verrouillage
-
-⏱️ Durée maximale :
-
-45 minutes
-
-🛑 Aucun nouvel achat après :
-
-43 minutes
-
-💾 Sauvegarde automatique :
-
-ACTIVÉE
-
-📩 Rapport crash :
-
-DIRECTEMENT DANS TELEGRAM
-
-⚠️ Simulation uniquement.
-
-Aucune transaction réelle.`
+  /*
+   * Premier tick immédiat.
+   */
+  tick().catch(error =>
+    console.error(
+      "Erreur premier tick:",
+      error
+    )
   );
 
   pollTimer =
     setInterval(
       () => {
-        tick().catch(
-          (error) => {
-            console.error(
-              "❌ Erreur tick:",
-              error.message
-            );
-          }
+        tick().catch(error =>
+          console.error(
+            "Erreur tick:",
+            error
+          )
         );
       },
       POLL_INTERVAL_MS
     );
 
-  tick().catch(
-    (error) => {
-      console.error(
-        "❌ Erreur tick initial:",
-        error.message
-      );
-    }
-  );
+  saveSummary();
 }
 
-// ============================================================
-// STOP
-// ============================================================
+/* =========================================================
+   STOP RADAR
+========================================================= */
 
 async function stopRadar(
   sendMessage = true,
-  skipGuardDisarm = false
+  internal = false
 ) {
+  if (
+    pollTimer
+  ) {
+    clearInterval(
+      pollTimer
+    );
+
+    pollTimer =
+      null;
+  }
+
+  /*
+   * Si /stoptrade est demandé alors qu'une position
+   * réelle existe, on la vend avant de désarmer le Guard.
+   */
+  if (
+    position &&
+    !internal &&
+    REAL_TRADING
+  ) {
+    try {
+      await realSellPosition(
+        "MANUAL_STOP",
+        position.poolAddress
+      );
+    } catch (error) {
+      await sendTelegram(
+        `❌ ARRÊT DU BOT\n\n` +
+        `Impossible de vendre la position réelle.\n` +
+        `${error.message}\n\n` +
+        `La position reste considérée comme ouverte.`
+      );
+
+      /*
+       * On ne considère pas la session comme proprement
+       * arrêtée si une position réelle reste ouverte.
+       */
+      saveSummary();
+
+      return;
+    }
+  }
+
   active =
     false;
+
+  await disarmCrashGuard();
+
+  if (
+    sendMessage
+  ) {
+    await sendTelegram(
+      `⛔ V5.1 RÉEL ARRÊTÉ\n\n` +
+      `Mint : ${mint || "aucun"}\n` +
+      `Cycles : ${sessionCycles.length}\n` +
+      `Résultat cumulé : ${sessionProfit.toFixed(2)}%`
+    );
+  }
+
+  saveSummary();
+
+  if (!internal) {
+    mint =
+      null;
+
+    position =
+      null;
+
+    marketHistory =
+      [];
+
+    crashGuardLevel =
+      "NORMAL";
+
+    crashGuardBuyBlocked =
+      false;
+
+    crashGuardLocked =
+      false;
+
+    crashGuardEmergencyExitDone =
+      false;
+
+    crashGuardLastEventId =
+      null;
+
+    healthyConfirmations =
+      0;
+  }
+}
+
+/* =========================================================
+   TELEGRAM COMMANDS
+========================================================= */
+
+bot.command(
+  "starttrade",
+  async ctx => {
+    try {
+      const parts =
+        ctx.message.text
+          .trim()
+          .split(/\s+/);
+
+      const tokenMint =
+        parts[1];
+
+      if (!tokenMint) {
+        await ctx.reply(
+          "❌ Utilisation : /starttrade MINT"
+        );
+
+        return;
+      }
+
+      try {
+        new PublicKey(
+          tokenMint
+        );
+      } catch {
+        await ctx.reply(
+          "❌ Mint Solana invalide."
+        );
+
+        return;
+      }
+
+      await startRadar(
+        tokenMint
+      );
+
+      await ctx.reply(
+        "✅ Surveillance réelle démarrée."
+      );
+    } catch (error) {
+      console.error(
+        "/starttrade:",
+        error
+      );
+
+      await ctx.reply(
+        `❌ Impossible de démarrer.\n\n${error.message}`
+      );
+    }
+  }
+);
+
+bot.command(
+  "stoptrade",
+  async ctx => {
+    try {
+      await stopRadar(
+        true,
+        false
+      );
+
+      await ctx.reply(
+        "⛔ Surveillance arrêtée."
+      );
+    } catch (error) {
+      console.error(
+        "/stoptrade:",
+        error
+      );
+
+      await ctx.reply(
+        `❌ Erreur arrêt : ${error.message}`
+      );
+    }
+  }
+);
+
+bot.command(
+  "status",
+  async ctx => {
+    resetDailyIfNeeded();
+
+    const solBalance =
+      tradingWallet
+        ? await getWalletSolBalance()
+            .catch(() => null)
+        : null;
+
+    let message =
+      `📊 V5.1 RÉEL\n\n`;
+
+    message +=
+      `Actif : ${active ? "OUI" : "NON"}\n`;
+
+    message +=
+      `Mint : ${mint || "aucun"}\n`;
+
+    message +=
+      `Trading réel : ${REAL_TRADING ? "OUI" : "NON"}\n`;
+
+    message +=
+      `Crash Guard : ${crashGuardLevel}\n`;
+
+    message +=
+      `Buy bloqué : ${crashGuardBuyBlocked ? "OUI" : "NON"}\n`;
+
+    message +=
+      `Trading verrouillé : ${crashGuardLocked ? "OUI" : "NON"}\n`;
+
+    message +=
+      `Position : ${position ? "OUVERTE" : "AUCUNE"}\n`;
+
+    message +=
+      `Cycle : ${cycleNumber}\n`;
+
+    message +=
+      `Résultat cumulé : ${sessionProfit.toFixed(2)}%\n`;
+
+    message +=
+      `Dépensé aujourd'hui : ${dailySpentEur.toFixed(2)} € / ${MAX_DAILY_EUR.toFixed(2)} €\n`;
+
+    message +=
+      `Solde SOL : ${
+        solBalance === null
+          ? "N/A"
+          : solBalance.toFixed(6)
+      } SOL\n`;
+
+    if (position) {
+      message +=
+        `\nPrix entrée : ${position.entryPrice}\n`;
+
+      message +=
+        `Objectif : ${position.targetPrice}\n`;
+
+      message +=
+        `Tokens : ${position.tokenAmount}\n`;
+
+      message +=
+        `TX achat : ${position.buySignature}\n`;
+    }
+
+    await ctx.reply(
+      message
+    );
+  }
+);
+
+bot.command(
+  "lastcrash",
+  async ctx => {
+    const reports =
+      loadCrashReports();
+
+    if (!reports.length) {
+      await ctx.reply(
+        "💥 Aucun crash enregistré."
+      );
+
+      return;
+    }
+
+    const last =
+      reports[
+        reports.length - 1
+      ];
+
+    await ctx.reply(
+      `💥 DERNIER CRASH\n\n` +
+      `Mint : ${last.mint}\n` +
+      `Date : ${last.timestamp}\n` +
+      `Prix : ${last.crashPrice}\n` +
+      `Liquidité : $${Number(
+        last.crashLiquidity || 0
+      ).toFixed(2)}\n` +
+      `Prix 10s : ${
+        last.priceChange10s === null
+          ? "N/A"
+          : Number(
+              last.priceChange10s
+            ).toFixed(2) + "%"
+      }\n` +
+      `Liquidité 10s : ${
+        last.liquidityChange10s === null
+          ? "N/A"
+          : Number(
+              last.liquidityChange10s
+            ).toFixed(2) + "%"
+      }\n` +
+      `Raisons : ${
+        Array.isArray(last.reasons)
+          ? last.reasons.join(", ")
+          : "N/A"
+      }`
+    );
+  }
+);
+
+bot.command(
+  "help",
+  async ctx => {
+    await ctx.reply(
+      `🤖 V5.1 RÉEL\n\n` +
+      `/starttrade MINT\n` +
+      `/stoptrade\n` +
+      `/status\n` +
+      `/lastcrash\n` +
+      `/help\n\n` +
+      `Capital : ${FIXED_CAPITAL_EUR.toFixed(2)} € par achat\n` +
+      `Objectif : +${TARGET_GAIN_PERCENT}%\n` +
+      `Slippage achat : ${BUY_SLIPPAGE_PERCENT}%\n` +
+      `Slippage vente : ${SELL_SLIPPAGE_PERCENT}%`
+    );
+  }
+);
+
+/* =========================================================
+   TELEGRAM ERROR
+========================================================= */
+
+bot.catch(
+  (error, ctx) => {
+    console.error(
+      "Erreur Telegram:",
+      error
+    );
+
+    console.error(
+      "Update:",
+      ctx?.update?.update_id
+    );
+  }
+);
+
+/* =========================================================
+   START BOT
+========================================================= */
+
+bot.launch()
+  .then(() => {
+    console.log(
+      "🤖 Telegram V5.1 REAL démarré"
+    );
+
+    console.log(
+      `💰 REAL_TRADING=${REAL_TRADING}`
+    );
+
+    console.log(
+      `💶 CAPITAL=${FIXED_CAPITAL_EUR} EUR`
+    );
+
+    console.log(
+      `📉 BUY SLIPPAGE=${BUY_SLIPPAGE_PERCENT}%`
+    );
+
+    console.log(
+      `📈 SELL SLIPPAGE=${SELL_SLIPPAGE_PERCENT}%`
+    );
+
+    console.log(
+      `🌐 RPC=${SOLANA_RPC_URL}`
+    );
+
+    console.log(
+      `🛡️ CRASH GUARD=${CRASH_GUARD_URL ? "CONFIGURÉ" : "NON CONFIGURÉ"}`
+    );
+  })
+  .catch(error => {
+    console.error(
+      "❌ Impossible de démarrer Telegram:",
+      error
+    );
+
+    process.exit(1);
+  });
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(
+  signal
+) {
+  console.log(
+    `\n🛑 Réception ${signal}`
+  );
 
   if (
     pollTimer
@@ -2896,375 +3470,41 @@ async function stopRadar(
       null;
   }
 
-  await saveSummary(
-    "STOP"
-  );
-
-  if (
-    !skipGuardDisarm
-  ) {
-    await disarmCrashGuard();
-  }
-
-  if (
-    sendMessage
-  ) {
-    await bot.telegram.sendMessage(
-      CHAT_ID,
-      `⛔ TEST ARRÊTÉ
-
-Token :
-
-${mint || "aucun"}
-
-🔄 Cycles :
-
-${sessionCycles}
-
-💰 Bénéfice session :
-
-${sessionProfit >= 0 ? "+" : ""}${formatUsd(sessionProfit)}
-
-📌 Position ouverte :
-
-${position ? "OUI" : "NON"}
-
-🛡️ Crash Guard :
-
-DÉSARMÉ
-
-⚠️ Simulation uniquement.`
-    );
-  }
-
-  console.log(
-    "⛔ Radar arrêté."
-  );
-}
-
-// ============================================================
-// COMMANDES TELEGRAM
-// ============================================================
-
-bot.command(
-  "starttrade",
-  async (ctx) => {
-    const parts =
-      ctx.message.text
-        .trim()
-        .split(/\s+/);
-
-    if (
-      parts.length < 2
-    ) {
-      await ctx.reply(
-        `❌ Indique le mint du token.
-
-Exemple :
-
-/starttrade TON_MINT`
-      );
-
-      return;
-    }
-
-    await startRadar(
-      parts[1]
-    );
-  }
-);
-
-bot.command(
-  "stoptrade",
-  async (ctx) => {
-    if (!active) {
-      await ctx.reply(
-        "ℹ️ Aucun test en cours."
-      );
-
-      return;
-    }
-
-    await stopRadar(
-      true
-    );
-  }
-);
-
-bot.command(
-  "status",
-  async (ctx) => {
-    if (!active) {
-      await ctx.reply(
-        `⚪ Aucun test en cours.
-
-V5.1 prête.`
-      );
-
-      return;
-    }
-
-    const elapsed =
-      now() -
-      sessionStartTime;
-
-    const minutes =
-      Math.floor(
-        elapsed /
-          60000
-      );
-
-    const seconds =
-      Math.floor(
-        (
-          elapsed %
-          60000
-        ) / 1000
-      );
-
-    await ctx.reply(
-      `📊 STATUS V5.1
-
-Token :
-
-${mint}
-
-⏱️ Session :
-
-${minutes}m ${seconds}s / 45m
-
-🔄 Cycles :
-
-${sessionCycles}
-
-💰 Bénéfice :
-
-${sessionProfit >= 0 ? "+" : ""}${formatUsd(sessionProfit)}
-
-📌 Position :
-
-${position ? "OUVERTE" : "AUCUNE"}
-
-⚡ Accélération :
-
-${accelerationWarningActive ? "⚠️ ACTIVE" : "🟢 normale"}
-
-🛡️ Crash Guard :
-
-${crashGuardLevel}
-
-🛒 Achats :
-
-${crashGuardBuyBlocked ? "⛔ BLOQUÉS" : "🟢 AUTORISÉS"}
-
-🔒 Verrouillage :
-
-${crashGuardLocked ? "🔴 OUI" : "🟢 NON"}
-
-🚨 Sortie urgence :
-
-${crashGuardEmergencyExitDone ? "EFFECTUÉE" : "NON"}
-
-🛡️ Confirmations :
-
-${healthyConfirmations}/${REQUIRED_HEALTHY_CONFIRMATIONS}`
-    );
-  }
-);
-
-// ============================================================
-// DERNIER CRASH
-// ============================================================
-
-bot.command(
-  "lastcrash",
-  async (ctx) => {
-    if (
-      !fs.existsSync(
-        CRASH_FILE
-      )
-    ) {
-      await ctx.reply(
-        `📂 Aucun crash report trouvé.
-
-Le prochain crash sera automatiquement sauvegardé ici et envoyé dans Telegram.`
-      );
-
-      return;
-    }
-
-    try {
-      const content =
-        fs.readFileSync(
-          CRASH_FILE,
-          "utf8"
-        );
-
-      const reports =
-        JSON.parse(
-          content
-        );
-
-      if (
-        !Array.isArray(
-          reports
-        ) ||
-        reports.length ===
-          0
-      ) {
-        await ctx.reply(
-          "📂 Aucun crash report disponible."
-        );
-
-        return;
-      }
-
-      const last =
-        reports[
-          reports.length - 1
-        ];
-
-      await ctx.reply(
-        `📊 DERNIER CRASH
-
-Token :
-
-${last.mint}
-
-Date :
-
-${last.timestamp}
-
-Cycles :
-
-${last.cyclesCompleted}
-
-Bénéfice session :
-
-${formatUsd(
-  last.sessionProfit
-)}
-
-Prix :
-
-$${Number(
-  last.crashMarket.price
-).toFixed(8)}
-
-Liquidité :
-
-${formatUsd(
-  last.crashMarket.liquidity
-)}
-
-⚡ Accélération :
-
-${last.acceleration.level}
-
-📁 Le fichier complet va être envoyé.`
-      );
-
-      await ctx.replyWithDocument(
-        {
-          source:
-            CRASH_FILE
-        },
-        {
-          caption:
-            "📁 crash_reports.json"
-        }
-      );
-
-    } catch (error) {
-      await ctx.reply(
-        `❌ Impossible de lire le crash report.
-
-${error.message}`
-      );
-    }
-  }
-);
-
-// ============================================================
-// AIDE
-// ============================================================
-
-bot.command(
-  "help",
-  async (ctx) => {
-    await ctx.reply(
-      `🤖 COMMANDES V5.1
-
-/starttrade MINT
-
-▶️ démarre un test
-
-/status
-
-📊 affiche l'état
-
-/lastcrash
-
-📁 récupère le dernier crash report
-
-/stoptrade
-
-⛔ arrête le test
-
-/help
-
-ℹ️ affiche cette aide
-
-🛡️ CRASH GUARD
-
-🟡 WATCH
-Aucune action
-
-🟠 DANGER
-Achats bloqués
-
-🔴 CRITICAL
-Sortie d'urgence + verrouillage total
-
-⚠️ V5.1 = SIMULATION UNIQUEMENT`
-    );
-  }
-);
-
-// ============================================================
-// LANCEMENT
-// ============================================================
-
-bot.launch();
-
-console.log(
-  "🤖 Bot Telegram V5.1 lancé."
-);
-
-// ============================================================
-// ARRÊT PROPRE
-// ============================================================
-
-async function shutdown() {
-  try {
-    await disarmCrashGuard();
-  } catch {}
+  /*
+   * On ne lance PAS de vente automatique ici.
+   *
+   * Un redémarrage Railway ne doit pas déclencher
+   * aveuglément une transaction pendant que le processus
+   * est en train de s'arrêter.
+   *
+   * La position reste enregistrée dans les logs/summary.
+   */
+  saveSummary();
 
   try {
-    v51Server.close();
+    bot.stop(
+      signal
+    );
   } catch {}
 
-  bot.stop(
-    "SHUTDOWN"
+  httpServer.close(
+    () => {
+      process.exit(0);
+    }
+  );
+
+  setTimeout(
+    () => process.exit(0),
+    5000
   );
 }
 
 process.once(
   "SIGINT",
-  shutdown
+  () => shutdown("SIGINT")
 );
 
 process.once(
   "SIGTERM",
-  shutdown
+  () => shutdown("SIGTERM")
 );
