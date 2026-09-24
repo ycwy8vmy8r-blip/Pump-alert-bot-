@@ -13,8 +13,16 @@ const {
   PublicKey,
   Transaction,
   ComputeBudgetProgram,
+  SystemProgram,
   sendAndConfirmTransaction,
 } = require("@solana/web3.js");
+
+const {
+  getAssociatedTokenAddressSync,
+  createAssociatedTokenAccountIdempotentInstruction,
+  createSyncNativeInstruction,
+  createCloseAccountInstruction,
+} = require("@solana/spl-token");
 
 const { Telegraf } = require("telegraf");
 
@@ -40,26 +48,38 @@ const PORT =
   Number(process.env.PORT || 3000);
 
 const REAL_TRADING =
-  String(process.env.REAL_TRADING || "false").toLowerCase() === "true";
+  String(
+    process.env.REAL_TRADING || "false"
+  ).toLowerCase() === "true";
 
 const FIXED_CAPITAL_EUR =
-  Number(process.env.FIXED_CAPITAL_EUR || "0.10");
+  Number(
+    process.env.FIXED_CAPITAL_EUR || "0.10"
+  );
 
 const BUY_SLIPPAGE_PERCENT =
-  Number(process.env.BUY_SLIPPAGE_PERCENT || "1");
+  Number(
+    process.env.BUY_SLIPPAGE_PERCENT || "0.1"
+  );
 
 const SELL_SLIPPAGE_PERCENT =
-  Number(process.env.SELL_SLIPPAGE_PERCENT || "2");
+  Number(
+    process.env.SELL_SLIPPAGE_PERCENT || "0.1"
+  );
 
 const SOLANA_RPC_URL =
   process.env.SOLANA_RPC_URL ||
-  "https://rpc.ankr.com/solana";
+  "https://api.mainnet-beta.solana.com";
 
 const MIN_SOL_RESERVE =
-  Number(process.env.MIN_SOL_RESERVE || "0.0001");
+  Number(
+    process.env.MIN_SOL_RESERVE || "0.0001"
+  );
 
 const MAX_DAILY_EUR =
-  Number(process.env.MAX_DAILY_EUR || "1");
+  Number(
+    process.env.MAX_DAILY_EUR || "1"
+  );
 
 const TRADING_PRIVATE_KEY =
   process.env.TRADING_PRIVATE_KEY || "";
@@ -67,23 +87,40 @@ const TRADING_PRIVATE_KEY =
 const EXPECTED_WALLET =
   "2vK4Th2R934xvwSrPnNu9c63W3QKq7KEF4zDQ3LQ2Gpy";
 
+const WSOL_MINT =
+  "So11111111111111111111111111111111111111112";
+
 if (!BOT_TOKEN) {
-  console.error("❌ BOT_TOKEN manquant");
+  console.error(
+    "❌ BOT_TOKEN manquant"
+  );
   process.exit(1);
 }
 
 if (!CHAT_ID) {
-  console.error("❌ CHAT_ID manquant");
+  console.error(
+    "❌ CHAT_ID manquant"
+  );
   process.exit(1);
 }
 
-if (REAL_TRADING && !TRADING_PRIVATE_KEY) {
-  console.error("❌ TRADING_PRIVATE_KEY manquante alors que REAL_TRADING=true");
+if (
+  REAL_TRADING &&
+  !TRADING_PRIVATE_KEY
+) {
+  console.error(
+    "❌ TRADING_PRIVATE_KEY manquante alors que REAL_TRADING=true"
+  );
   process.exit(1);
 }
 
-if (!Number.isFinite(FIXED_CAPITAL_EUR) || FIXED_CAPITAL_EUR <= 0) {
-  console.error("❌ FIXED_CAPITAL_EUR invalide");
+if (
+  !Number.isFinite(FIXED_CAPITAL_EUR) ||
+  FIXED_CAPITAL_EUR <= 0
+) {
+  console.error(
+    "❌ FIXED_CAPITAL_EUR invalide"
+  );
   process.exit(1);
 }
 
@@ -91,7 +128,9 @@ if (
   !Number.isFinite(BUY_SLIPPAGE_PERCENT) ||
   BUY_SLIPPAGE_PERCENT < 0
 ) {
-  console.error("❌ BUY_SLIPPAGE_PERCENT invalide");
+  console.error(
+    "❌ BUY_SLIPPAGE_PERCENT invalide"
+  );
   process.exit(1);
 }
 
@@ -99,7 +138,9 @@ if (
   !Number.isFinite(SELL_SLIPPAGE_PERCENT) ||
   SELL_SLIPPAGE_PERCENT < 0
 ) {
-  console.error("❌ SELL_SLIPPAGE_PERCENT invalide");
+  console.error(
+    "❌ SELL_SLIPPAGE_PERCENT invalide"
+  );
   process.exit(1);
 }
 
@@ -115,24 +156,36 @@ function loadTradingKeypair() {
   let keypair;
 
   try {
-    if (TRADING_PRIVATE_KEY.trim().startsWith("[")) {
-      const arr = JSON.parse(TRADING_PRIVATE_KEY);
+    if (
+      TRADING_PRIVATE_KEY
+        .trim()
+        .startsWith("[")
+    ) {
+      const arr =
+        JSON.parse(
+          TRADING_PRIVATE_KEY
+        );
 
       if (!Array.isArray(arr)) {
-        throw new Error("clé JSON invalide");
+        throw new Error(
+          "clé JSON invalide"
+        );
       }
 
-      keypair = Keypair.fromSecretKey(
-        Uint8Array.from(arr)
-      );
+      keypair =
+        Keypair.fromSecretKey(
+          Uint8Array.from(arr)
+        );
     } else {
-      const decoded = bs58.decode(
-        TRADING_PRIVATE_KEY.trim()
-      );
+      const decoded =
+        bs58.decode(
+          TRADING_PRIVATE_KEY.trim()
+        );
 
-      keypair = Keypair.fromSecretKey(
-        decoded
-      );
+      keypair =
+        Keypair.fromSecretKey(
+          decoded
+        );
     }
   } catch (error) {
     throw new Error(
@@ -143,7 +196,10 @@ function loadTradingKeypair() {
   const derivedAddress =
     keypair.publicKey.toBase58();
 
-  if (derivedAddress !== EXPECTED_WALLET) {
+  if (
+    derivedAddress !==
+    EXPECTED_WALLET
+  ) {
     throw new Error(
       `Le wallet dérivé de TRADING_PRIVATE_KEY est ${derivedAddress}, attendu ${EXPECTED_WALLET}`
     );
@@ -155,9 +211,13 @@ function loadTradingKeypair() {
 let tradingWallet = null;
 
 try {
-  tradingWallet = loadTradingKeypair();
+  tradingWallet =
+    loadTradingKeypair();
 } catch (error) {
-  console.error("❌", error.message);
+  console.error(
+    "❌",
+    error.message
+  );
   process.exit(1);
 }
 
@@ -168,13 +228,18 @@ const connection =
   );
 
 const onlineAmmSdk =
-  new OnlinePumpAmmSdk(connection);
+  new OnlinePumpAmmSdk(
+    connection
+  );
 
 /* =========================================================
    TELEGRAM
 ========================================================= */
 
-const bot = new Telegraf(BOT_TOKEN);
+const bot =
+  new Telegraf(
+    BOT_TOKEN
+  );
 
 /* =========================================================
    STRATEGIE V5.1
@@ -186,9 +251,11 @@ const POLL_INTERVAL_MS = 2000;
 
 const HISTORY_WINDOW_MS = 120000;
 
-const CRASH_REPORT_WINDOW_MS = 60000;
+const CRASH_REPORT_WINDOW_MS =
+  60000;
 
-const OBSERVATION_AFTER_SELL_MS = 30000;
+const OBSERVATION_AFTER_SELL_MS =
+  30000;
 
 const MAX_TOKEN_SESSION_MS =
   45 * 60 * 1000;
@@ -198,25 +265,41 @@ const NO_NEW_BUY_AFTER_MS =
 
 const MIN_LIQUIDITY_USD = 3000;
 
-const ENTRY_LIQUIDITY_DROP_10S = -10;
-const ENTRY_LIQUIDITY_DROP_30S = -15;
+const ENTRY_LIQUIDITY_DROP_10S =
+  -10;
 
-const CRASH_LIQUIDITY_DROP_10S = -50;
+const ENTRY_LIQUIDITY_DROP_30S =
+  -15;
 
-const ENTRY_PRICE_DROP_10S = -4;
-const CRASH_PRICE_DROP_10S = -20;
+const CRASH_LIQUIDITY_DROP_10S =
+  -50;
 
-const ACCEL_PRICE_5S_WARNING = 7;
-const ACCEL_PRICE_10S_WARNING = 10;
+const ENTRY_PRICE_DROP_10S =
+  -4;
 
-const ACCEL_PRICE_5S_EXTREME = 10;
-const ACCEL_PRICE_10S_EXTREME = 15;
+const CRASH_PRICE_DROP_10S =
+  -20;
 
-const ACCEL_LIQUIDITY_DROP = -5;
+const ACCEL_PRICE_5S_WARNING =
+  7;
 
-const REQUIRED_HEALTHY_CONFIRMATIONS = 4;
+const ACCEL_PRICE_10S_WARNING =
+  10;
 
-const MIN_HEALTH_SCORE_FOR_ENTRY = 80;
+const ACCEL_PRICE_5S_EXTREME =
+  10;
+
+const ACCEL_PRICE_10S_EXTREME =
+  15;
+
+const ACCEL_LIQUIDITY_DROP =
+  -5;
+
+const REQUIRED_HEALTHY_CONFIRMATIONS =
+  4;
+
+const MIN_HEALTH_SCORE_FOR_ENTRY =
+  80;
 
 /* =========================================================
    ETAT V5.1
@@ -243,33 +326,43 @@ let healthyConfirmations = 0;
 
 let marketHistory = [];
 
-let accelerationWarningActive = false;
+let accelerationWarningActive =
+  false;
 
-let accelerationAlertSent = false;
+let accelerationAlertSent =
+  false;
 
 /* =========================================================
    CRASH GUARD
 ========================================================= */
 
-let crashGuardLevel = "NORMAL";
+let crashGuardLevel =
+  "NORMAL";
 
-let crashGuardBuyBlocked = false;
+let crashGuardBuyBlocked =
+  false;
 
-let crashGuardLocked = false;
+let crashGuardLocked =
+  false;
 
-let crashGuardEmergencyExitDone = false;
+let crashGuardEmergencyExitDone =
+  false;
 
-let crashGuardEmergencyExitInProgress = false;
+let crashGuardEmergencyExitInProgress =
+  false;
 
-let crashGuardLastEventId = null;
+let crashGuardLastEventId =
+  null;
 
-let crashGuardArmed = false;
+let crashGuardArmed =
+  false;
 
 /* =========================================================
    REAL TRADING STATE
 ========================================================= */
 
-let tradeInProgress = false;
+let tradeInProgress =
+  false;
 
 let dailySpentEur = 0;
 
@@ -288,12 +381,18 @@ let solUsdCacheAt = 0;
 const DATA_DIR =
   fs.existsSync("/data")
     ? "/data"
-    : path.join(__dirname, "data");
+    : path.join(
+        __dirname,
+        "data"
+      );
 
 if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, {
-    recursive: true,
-  });
+  fs.mkdirSync(
+    DATA_DIR,
+    {
+      recursive: true,
+    }
+  );
 }
 
 const MARKET_HISTORY_FILE =
@@ -328,22 +427,42 @@ function now() {
   return Date.now();
 }
 
-function round(value, decimals = 8) {
-  const factor = 10 ** decimals;
-  return Math.round(value * factor) / factor;
-}
+function round(
+  value,
+  decimals = 8
+) {
+  const factor =
+    10 ** decimals;
 
-function sleep(ms) {
-  return new Promise(resolve =>
-    setTimeout(resolve, ms)
+  return (
+    Math.round(
+      value * factor
+    ) / factor
   );
 }
 
-function saveJson(file, data) {
+function sleep(ms) {
+  return new Promise(
+    resolve =>
+      setTimeout(
+        resolve,
+        ms
+      )
+  );
+}
+
+function saveJson(
+  file,
+  data
+) {
   try {
     fs.writeFileSync(
       file,
-      JSON.stringify(data, null, 2),
+      JSON.stringify(
+        data,
+        null,
+        2
+      ),
       "utf8"
     );
   } catch (error) {
@@ -354,11 +473,15 @@ function saveJson(file, data) {
   }
 }
 
-function appendJsonLine(file, data) {
+function appendJsonLine(
+  file,
+  data
+) {
   try {
     fs.appendFileSync(
       file,
-      JSON.stringify(data) + "\n",
+      JSON.stringify(data) +
+        "\n",
       "utf8"
     );
   } catch (error) {
@@ -371,7 +494,11 @@ function appendJsonLine(file, data) {
 
 function loadTrades() {
   try {
-    if (!fs.existsSync(TRADE_HISTORY_FILE)) {
+    if (
+      !fs.existsSync(
+        TRADE_HISTORY_FILE
+      )
+    ) {
       return [];
     }
 
@@ -385,7 +512,9 @@ function loadTrades() {
       return [];
     }
 
-    return JSON.parse(content);
+    return JSON.parse(
+      content
+    );
   } catch (error) {
     console.error(
       "Erreur lecture trade_history:",
@@ -396,30 +525,40 @@ function loadTrades() {
   }
 }
 
-function saveTrades(trades) {
+function saveTrades(
+  trades
+) {
   saveJson(
     TRADE_HISTORY_FILE,
     trades
   );
 }
 
-function addTrade(trade) {
-  const trades = loadTrades();
+function addTrade(
+  trade
+) {
+  const trades =
+    loadTrades();
 
   trades.push({
     ...trade,
     timestamp:
-      trade.timestamp || new Date().toISOString(),
+      trade.timestamp ||
+      new Date().toISOString(),
   });
 
-  saveTrades(trades);
+  saveTrades(
+    trades
+  );
 }
 
 /* =========================================================
    TELEGRAM
 ========================================================= */
 
-async function sendTelegram(message) {
+async function sendTelegram(
+  message
+) {
   try {
     const response =
       await fetch(
@@ -430,11 +569,15 @@ async function sendTelegram(message) {
             "content-type":
               "application/json",
           },
-          body: JSON.stringify({
-            chat_id: CHAT_ID,
-            text: message,
-            disable_web_page_preview: true,
-          }),
+          body:
+            JSON.stringify({
+              chat_id:
+                CHAT_ID,
+              text:
+                message,
+              disable_web_page_preview:
+                true,
+            }),
         }
       );
 
@@ -466,28 +609,44 @@ function resetDailyIfNeeded() {
       .toISOString()
       .slice(0, 10);
 
-  if (dailySpentDate !== today) {
-    dailySpentDate = today;
-    dailySpentEur = 0;
+  if (
+    dailySpentDate !==
+    today
+  ) {
+    dailySpentDate =
+      today;
+
+    dailySpentEur =
+      0;
   }
 }
 
-function canSpendDaily(amountEur) {
+function canSpendDaily(
+  amountEur
+) {
   resetDailyIfNeeded();
 
   return (
-    dailySpentEur + amountEur <=
-    MAX_DAILY_EUR + 1e-9
+    dailySpentEur +
+      amountEur <=
+    MAX_DAILY_EUR +
+      1e-9
   );
 }
 
-function registerDailySpend(amountEur) {
+function registerDailySpend(
+  amountEur
+) {
   resetDailyIfNeeded();
 
-  dailySpentEur += amountEur;
+  dailySpentEur +=
+    amountEur;
 
   dailySpentEur =
-    round(dailySpentEur, 6);
+    round(
+      dailySpentEur,
+      6
+    );
 }
 
 /* =========================================================
@@ -497,13 +656,15 @@ function registerDailySpend(amountEur) {
 async function getSolUsdPrice() {
   if (
     solUsdCache &&
-    now() - solUsdCacheAt < 30000
+    now() -
+      solUsdCacheAt <
+      30000
   ) {
     return solUsdCache;
   }
 
   const SOL_MINT =
-    "So11111111111111111111111111111111111111112";
+    WSOL_MINT;
 
   const url =
     `https://api.dexscreener.com/tokens/v1/solana/${SOL_MINT}`;
@@ -520,7 +681,11 @@ async function getSolUsdPrice() {
   const pairs =
     await response.json();
 
-  if (!Array.isArray(pairs)) {
+  if (
+    !Array.isArray(
+      pairs
+    )
+  ) {
     throw new Error(
       "Réponse DexScreener SOL invalide"
     );
@@ -528,55 +693,81 @@ async function getSolUsdPrice() {
 
   const validPairs =
     pairs
-      .filter(pair => {
-        if (!pair) return false;
+      .filter(
+        pair => {
+          if (!pair) {
+            return false;
+          }
 
-        const chain =
-          String(pair.chainId || "")
-            .toLowerCase();
+          const chain =
+            String(
+              pair.chainId ||
+                ""
+            ).toLowerCase();
 
-        if (chain !== "solana") {
-          return false;
+          if (
+            chain !==
+            "solana"
+          ) {
+            return false;
+          }
+
+          const base =
+            pair.baseToken
+              ?.address;
+
+          const quote =
+            pair.quoteToken
+              ?.address;
+
+          return (
+            base === SOL_MINT ||
+            quote === SOL_MINT
+          );
         }
+      )
+      .filter(
+        pair => {
+          const liquidity =
+            Number(
+              pair
+                .liquidity
+                ?.usd ||
+                0
+            );
 
-        const base =
-          pair.baseToken?.address;
+          const price =
+            Number(
+              pair
+                .priceUsd ||
+                0
+            );
 
-        const quote =
-          pair.quoteToken?.address;
-
-        return (
-          base === SOL_MINT ||
-          quote === SOL_MINT
-        );
-      })
-      .filter(pair => {
-        const liquidity =
-          Number(
-            pair.liquidity?.usd || 0
+          return (
+            liquidity > 0 &&
+            price > 0
           );
-
-        const price =
-          Number(
-            pair.priceUsd || 0
-          );
-
-        return (
-          liquidity > 0 &&
-          price > 0
-        );
-      })
+        }
+      )
       .sort(
         (a, b) =>
           Number(
-            b.liquidity?.usd || 0
+            b
+              .liquidity
+              ?.usd ||
+              0
           ) -
           Number(
-            a.liquidity?.usd || 0
+            a
+              .liquidity
+              ?.usd ||
+              0
           )
       );
 
-  if (!validPairs.length) {
+  if (
+    !validPairs.length
+  ) {
     throw new Error(
       "Aucune paire SOL/USD valide trouvée"
     );
@@ -584,11 +775,15 @@ async function getSolUsdPrice() {
 
   const price =
     Number(
-      validPairs[0].priceUsd
+      validPairs[0]
+        .priceUsd
     );
 
-  solUsdCache = price;
-  solUsdCacheAt = now();
+  solUsdCache =
+    price;
+
+  solUsdCacheAt =
+    now();
 
   return price;
 }
@@ -596,7 +791,9 @@ async function getSolUsdPrice() {
 async function getEurUsdPrice() {
   if (
     eurUsdCache &&
-    now() - eurUsdCacheAt < 300000
+    now() -
+      eurUsdCacheAt <
+      300000
   ) {
     return eurUsdCache;
   }
@@ -621,7 +818,9 @@ async function getEurUsdPrice() {
     );
 
   if (
-    !Number.isFinite(rate) ||
+    !Number.isFinite(
+      rate
+    ) ||
     rate <= 0
   ) {
     throw new Error(
@@ -629,8 +828,11 @@ async function getEurUsdPrice() {
     );
   }
 
-  eurUsdCache = rate;
-  eurUsdCacheAt = now();
+  eurUsdCache =
+    rate;
+
+  eurUsdCacheAt =
+    now();
 
   return rate;
 }
@@ -651,10 +853,17 @@ async function getEurSolQuote() {
     solUsd;
 
   return {
-    eur: FIXED_CAPITAL_EUR,
-    usd: eurUsdValue,
-    sol: solAmount,
+    eur:
+      FIXED_CAPITAL_EUR,
+
+    usd:
+      eurUsdValue,
+
+    sol:
+      solAmount,
+
     eurUsd,
+
     solUsd,
   };
 }
@@ -676,14 +885,19 @@ async function getWalletSolBalance() {
       "confirmed"
     );
 
-  return lamports / 1e9;
+  return (
+    lamports /
+    1e9
+  );
 }
 
 /* =========================================================
    TOKEN BALANCE
 ========================================================= */
 
-async function getTokenBalanceRaw(tokenMint) {
+async function getTokenBalanceRaw(
+  tokenMint
+) {
   if (!tradingWallet) {
     throw new Error(
       "Wallet de trading non disponible"
@@ -691,26 +905,35 @@ async function getTokenBalanceRaw(tokenMint) {
   }
 
   const mintPk =
-    new PublicKey(tokenMint);
+    new PublicKey(
+      tokenMint
+    );
 
   const response =
     await connection.getParsedTokenAccountsByOwner(
       tradingWallet.publicKey,
       {
-        mint: mintPk,
+        mint:
+          mintPk,
       },
       "confirmed"
     );
 
-  let totalRaw = new BN(0);
+  let totalRaw =
+    new BN(0);
 
-  let decimals = null;
+  let decimals =
+    null;
 
   for (
-    const account of response.value
+    const account of
+      response.value
   ) {
     const info =
-      account.account?.data?.parsed?.info;
+      account.account
+        ?.data
+        ?.parsed
+        ?.info;
 
     const tokenAmount =
       info?.tokenAmount;
@@ -727,20 +950,25 @@ async function getTokenBalanceRaw(tokenMint) {
       );
 
     totalRaw =
-      totalRaw.add(raw);
+      totalRaw.add(
+        raw
+      );
 
     if (
       decimals === null
     ) {
       decimals =
         Number(
-          tokenAmount.decimals
+          tokenAmount
+            .decimals
         );
     }
   }
 
   return {
-    raw: totalRaw,
+    raw:
+      totalRaw,
+
     decimals:
       decimals === null
         ? 0
@@ -752,7 +980,9 @@ async function getTokenBalanceRaw(tokenMint) {
    MARKET DATA V5.1
 ========================================================= */
 
-async function getMarketData(tokenMint) {
+async function getMarketData(
+  tokenMint
+) {
   const url =
     `https://api.dexscreener.com/token-pairs/v1/solana/${tokenMint}`;
 
@@ -768,7 +998,11 @@ async function getMarketData(tokenMint) {
   const pairs =
     await response.json();
 
-  if (!Array.isArray(pairs)) {
+  if (
+    !Array.isArray(
+      pairs
+    )
+  ) {
     throw new Error(
       "DexScreener réponse invalide"
     );
@@ -776,27 +1010,41 @@ async function getMarketData(tokenMint) {
 
   const pumpSwapPairs =
     pairs
-      .filter(pair =>
-        String(pair?.dexId || "")
-          .toLowerCase() ===
-        "pumpswap"
+      .filter(
+        pair =>
+          String(
+            pair?.dexId ||
+              ""
+          ).toLowerCase() ===
+          "pumpswap"
       )
-      .filter(pair =>
-        Number(
-          pair?.priceUsd || 0
-        ) > 0
+      .filter(
+        pair =>
+          Number(
+            pair
+              ?.priceUsd ||
+              0
+          ) > 0
       )
       .sort(
         (a, b) =>
           Number(
-            b?.liquidity?.usd || 0
+            b
+              ?.liquidity
+              ?.usd ||
+              0
           ) -
           Number(
-            a?.liquidity?.usd || 0
+            a
+              ?.liquidity
+              ?.usd ||
+              0
           )
       );
 
-  if (!pumpSwapPairs.length) {
+  if (
+    !pumpSwapPairs.length
+  ) {
     return null;
   }
 
@@ -804,39 +1052,64 @@ async function getMarketData(tokenMint) {
     pumpSwapPairs[0];
 
   return {
-    timestamp: now(),
+    timestamp:
+      now(),
 
     price:
-      Number(pair.priceUsd || 0),
+      Number(
+        pair.priceUsd ||
+          0
+      ),
 
     liquidity:
       Number(
-        pair.liquidity?.usd || 0
+        pair
+          .liquidity
+          ?.usd ||
+          0
       ),
 
     pairAddress:
-      pair.pairAddress || null,
+      pair.pairAddress ||
+      null,
 
     volume24h:
       Number(
-        pair.volume?.h24 || 0
+        pair
+          .volume
+          ?.h24 ||
+          0
       ),
 
     buys5m:
       Number(
-        pair.txns?.m5?.buys || 0
+        pair
+          .txns
+          ?.m5
+          ?.buys ||
+          0
       ),
 
     sells5m:
       Number(
-        pair.txns?.m5?.sells || 0
+        pair
+          .txns
+          ?.m5
+          ?.sells ||
+          0
       ),
 
     baseToken:
-      pair.baseToken?.address || null,
+      pair
+        .baseToken
+        ?.address ||
+      null,
 
     quoteToken:
-      pair.quoteToken?.address || null,
+      pair
+        .quoteToken
+        ?.address ||
+      null,
 
     pair,
   };
@@ -846,70 +1119,103 @@ async function getMarketData(tokenMint) {
    MARKET HISTORY
 ========================================================= */
 
-function addMarketHistory(data) {
+function addMarketHistory(
+  data
+) {
   if (!data) {
     return;
   }
 
   marketHistory.push({
-    timestamp: data.timestamp,
-    price: data.price,
-    liquidity: data.liquidity,
-    volume24h: data.volume24h,
-    buys5m: data.buys5m,
-    sells5m: data.sells5m,
+    timestamp:
+      data.timestamp,
+
+    price:
+      data.price,
+
+    liquidity:
+      data.liquidity,
+
+    volume24h:
+      data.volume24h,
+
+    buys5m:
+      data.buys5m,
+
+    sells5m:
+      data.sells5m,
   });
 
   const cutoff =
-    now() - HISTORY_WINDOW_MS;
+    now() -
+    HISTORY_WINDOW_MS;
 
   marketHistory =
     marketHistory.filter(
       item =>
-        item.timestamp >= cutoff
+        item.timestamp >=
+        cutoff
     );
 
   appendJsonLine(
     MARKET_HISTORY_FILE,
     {
       mint,
+
       ...marketHistory[
-        marketHistory.length - 1
+        marketHistory.length -
+          1
       ],
     }
   );
 }
 
-function getHistoryAgo(ms) {
+function getHistoryAgo(
+  ms
+) {
   const target =
     now() - ms;
 
-  let selected = null;
+  let selected =
+    null;
 
   for (
-    const item of marketHistory
+    const item of
+      marketHistory
   ) {
     if (
-      item.timestamp <= target
+      item.timestamp <=
+      target
     ) {
-      selected = item;
+      selected =
+        item;
     }
   }
 
   return selected;
 }
 
-function percentChange(current, old) {
+function percentChange(
+  current,
+  old
+) {
   if (
-    !Number.isFinite(current) ||
-    !Number.isFinite(old) ||
+    !Number.isFinite(
+      current
+    ) ||
+    !Number.isFinite(
+      old
+    ) ||
     old === 0
   ) {
     return null;
   }
 
   return (
-    ((current - old) / old) *
+    (
+      (current - old) /
+      old
+    ) *
     100
   );
 }
@@ -918,20 +1224,38 @@ function percentChange(current, old) {
    ACCELERATION
 ========================================================= */
 
-function analyzeAcceleration(data) {
+function analyzeAcceleration(
+  data
+) {
   const five =
-    getHistoryAgo(5000);
+    getHistoryAgo(
+      5000
+    );
 
   const ten =
-    getHistoryAgo(10000);
+    getHistoryAgo(
+      10000
+    );
 
-  if (!five || !ten) {
+  if (
+    !five ||
+    !ten
+  ) {
     return {
-      price5s: null,
-      price10s: null,
-      liquidity10s: null,
-      warning: false,
-      extreme: false,
+      price5s:
+        null,
+
+      price10s:
+        null,
+
+      liquidity10s:
+        null,
+
+      warning:
+        false,
+
+      extreme:
+        false,
     };
   }
 
@@ -995,22 +1319,40 @@ function analyzeAcceleration(data) {
    HEALTH
 ========================================================= */
 
-function calculateHealth(data) {
+function calculateHealth(
+  data
+) {
   const ten =
-    getHistoryAgo(10000);
+    getHistoryAgo(
+      10000
+    );
 
   const thirty =
-    getHistoryAgo(30000);
+    getHistoryAgo(
+      30000
+    );
 
-  let score = 100;
+  let score =
+    100;
 
-  if (!ten || !thirty) {
+  if (
+    !ten ||
+    !thirty
+  ) {
     return {
       score,
-      healthy: false,
-      liquidityChange10s: null,
-      liquidityChange30s: null,
-      priceChange10s: null,
+
+      healthy:
+        false,
+
+      liquidityChange10s:
+        null,
+
+      liquidityChange30s:
+        null,
+
+      priceChange10s:
+        null,
     };
   }
 
@@ -1033,7 +1375,8 @@ function calculateHealth(data) {
     );
 
   if (
-    liquidityChange10s !== null &&
+    liquidityChange10s !==
+      null &&
     liquidityChange10s <
       ENTRY_LIQUIDITY_DROP_10S
   ) {
@@ -1041,7 +1384,8 @@ function calculateHealth(data) {
   }
 
   if (
-    liquidityChange30s !== null &&
+    liquidityChange30s !==
+      null &&
     liquidityChange30s <
       ENTRY_LIQUIDITY_DROP_30S
   ) {
@@ -1049,7 +1393,8 @@ function calculateHealth(data) {
   }
 
   if (
-    priceChange10s !== null &&
+    priceChange10s !==
+      null &&
     priceChange10s <
       ENTRY_PRICE_DROP_10S
   ) {
@@ -1066,17 +1411,23 @@ function calculateHealth(data) {
   score =
     Math.max(
       0,
-      Math.min(100, score)
+      Math.min(
+        100,
+        score
+      )
     );
 
   return {
     score,
+
     healthy:
       score >=
       MIN_HEALTH_SCORE_FOR_ENTRY,
 
     liquidityChange10s,
+
     liquidityChange30s,
+
     priceChange10s,
   };
 }
@@ -1088,17 +1439,21 @@ function calculateHealth(data) {
 function getLatestValidMarketPrice() {
   for (
     let i =
-      marketHistory.length - 1;
+      marketHistory.length -
+      1;
     i >= 0;
     i--
   ) {
     const price =
       Number(
-        marketHistory[i]?.price
+        marketHistory[i]
+          ?.price
       );
 
     if (
-      Number.isFinite(price) &&
+      Number.isFinite(
+        price
+      ) &&
       price > 0
     ) {
       return price;
@@ -1117,11 +1472,15 @@ async function crashGuardRequest(
   endpoint,
   body = null
 ) {
-  if (!CRASH_GUARD_URL) {
+  if (
+    !CRASH_GUARD_URL
+  ) {
     return null;
   }
 
-  if (!CRASH_GUARD_SECRET) {
+  if (
+    !CRASH_GUARD_SECRET
+  ) {
     throw new Error(
       "CRASH_GUARD_SECRET manquant"
     );
@@ -1143,16 +1502,22 @@ async function crashGuardRequest(
         `${CRASH_GUARD_URL}${endpoint}`,
         {
           method,
+
           headers: {
             "content-type":
               "application/json",
+
             "x-crash-guard-secret":
               CRASH_GUARD_SECRET,
           },
+
           body:
             body === null
               ? undefined
-              : JSON.stringify(body),
+              : JSON.stringify(
+                  body
+                ),
+
           signal:
             controller.signal,
         }
@@ -1161,25 +1526,37 @@ async function crashGuardRequest(
     const text =
       await response.text();
 
-    if (!response.ok) {
+    if (
+      !response.ok
+    ) {
       throw new Error(
         `Crash Guard HTTP ${response.status}: ${text}`
       );
     }
 
     try {
-      return JSON.parse(text);
+      return JSON.parse(
+        text
+      );
     } catch {
       return text;
     }
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(
+      timeout
+    );
   }
 }
 
-async function armCrashGuard(tokenMint) {
-  if (!CRASH_GUARD_URL) {
-    crashGuardArmed = false;
+async function armCrashGuard(
+  tokenMint
+) {
+  if (
+    !CRASH_GUARD_URL
+  ) {
+    crashGuardArmed =
+      false;
+
     return;
   }
 
@@ -1187,11 +1564,13 @@ async function armCrashGuard(tokenMint) {
     "POST",
     "/arm",
     {
-      mint: tokenMint,
+      mint:
+        tokenMint,
     }
   );
 
-  crashGuardArmed = true;
+  crashGuardArmed =
+    true;
 
   console.log(
     "🛡️ Crash Guard armé pour",
@@ -1200,8 +1579,12 @@ async function armCrashGuard(tokenMint) {
 }
 
 async function disarmCrashGuard() {
-  if (!CRASH_GUARD_URL) {
-    crashGuardArmed = false;
+  if (
+    !CRASH_GUARD_URL
+  ) {
+    crashGuardArmed =
+      false;
+
     return;
   }
 
@@ -1217,7 +1600,85 @@ async function disarmCrashGuard() {
     );
   }
 
-  crashGuardArmed = false;
+  crashGuardArmed =
+    false;
+}
+
+/* =========================================================
+   WSOL HELPERS
+========================================================= */
+
+function getWsolAta() {
+  if (!tradingWallet) {
+    throw new Error(
+      "Wallet trading absent"
+    );
+  }
+
+  return getAssociatedTokenAddressSync(
+    new PublicKey(
+      WSOL_MINT
+    ),
+    tradingWallet.publicKey,
+    false
+  );
+}
+
+function addWsolAccountInstructions(
+  transaction,
+  wsolAta,
+  amountLamports,
+  shouldFund
+) {
+  if (!tradingWallet) {
+    throw new Error(
+      "Wallet trading absent"
+    );
+  }
+
+  /*
+   * PumpSwap attend un vrai compte SPL WSOL.
+   *
+   * On crée l'ATA de manière idempotente.
+   * Pour un BUY, on le finance avec les lamports du swap
+   * puis on appelle syncNative.
+   *
+   * Pour un SELL, il suffit que le compte existe déjà.
+   */
+  transaction.add(
+    createAssociatedTokenAccountIdempotentInstruction(
+      tradingWallet.publicKey,
+      wsolAta,
+      tradingWallet.publicKey,
+      new PublicKey(
+        WSOL_MINT
+      )
+    )
+  );
+
+  if (
+    shouldFund &&
+    amountLamports > 0
+  ) {
+    transaction.add(
+      SystemProgram.transfer({
+        fromPubkey:
+          tradingWallet.publicKey,
+
+        toPubkey:
+          wsolAta,
+
+        lamports:
+          amountLamports,
+      })
+    );
+
+    transaction.add(
+      createSyncNativeInstruction(
+        wsolAta
+      )
+    );
+  }
 }
 
 /* =========================================================
@@ -1248,13 +1709,21 @@ async function sendRealSwap(
     );
   }
 
-  if (!BN.isBN(amountBn)) {
+  if (
+    !BN.isBN(amountBn)
+  ) {
     amountBn =
-      new BN(String(amountBn));
+      new BN(
+        String(
+          amountBn
+        )
+      );
   }
 
   if (
-    amountBn.lte(new BN(0))
+    amountBn.lte(
+      new BN(0)
+    )
   ) {
     throw new Error(
       "Montant swap invalide"
@@ -1262,10 +1731,19 @@ async function sendRealSwap(
   }
 
   const poolPk =
-    new PublicKey(poolAddress);
+    new PublicKey(
+      poolAddress
+    );
+
+  const wsolAta =
+    getWsolAta();
 
   console.log(
     `🔄 Swap ${mode} | pool=${poolAddress} | amount=${amountBn.toString()} | slippage=${slippagePercent}%`
+  );
+
+  console.log(
+    `🪙 WSOL ATA=${wsolAta.toBase58()}`
   );
 
   const swapState =
@@ -1276,14 +1754,18 @@ async function sendRealSwap(
 
   let instructions;
 
-  if (mode === "BUY") {
+  if (
+    mode === "BUY"
+  ) {
     instructions =
       await PUMP_AMM_SDK.buyQuoteInput(
         swapState,
         amountBn,
         slippagePercent
       );
-  } else if (mode === "SELL") {
+  } else if (
+    mode === "SELL"
+  ) {
     instructions =
       await PUMP_AMM_SDK.sellBaseInput(
         swapState,
@@ -1297,7 +1779,9 @@ async function sendRealSwap(
   }
 
   if (
-    !Array.isArray(instructions) ||
+    !Array.isArray(
+      instructions
+    ) ||
     instructions.length === 0
   ) {
     throw new Error(
@@ -1311,28 +1795,97 @@ async function sendRealSwap(
   transaction.add(
     ComputeBudgetProgram.setComputeUnitLimit(
       {
-        units: 200000,
+        units:
+          200000,
       }
     )
   );
 
+  /*
+   * IMPORTANT :
+   *
+   * PumpSwap utilise WSOL comme quote token
+   * pour les pools SOL.
+   *
+   * Le SDK produit l'instruction AMM mais le compte
+   * user_quote_token_account doit être un compte SPL
+   * WSOL initialisé.
+   *
+   * BUY:
+   *   création ATA WSOL
+   *   transfert des lamports
+   *   syncNative
+   *   swap
+   *   fermeture WSOL après le swap
+   *
+   * SELL:
+   *   création ATA WSOL si nécessaire
+   *   swap
+   *   fermeture WSOL après le swap
+   */
+
+  addWsolAccountInstructions(
+    transaction,
+    wsolAta,
+    mode === "BUY"
+      ? Number(
+          amountBn.toString()
+        )
+      : 0,
+    mode === "BUY"
+  );
+
   for (
-    const instruction of instructions
+    const instruction of
+      instructions
   ) {
-    transaction.add(instruction);
+    transaction.add(
+      instruction
+    );
   }
 
   /*
-   * Pré-simulation obligatoire.
-   * Si elle échoue, aucune transaction n'est envoyée.
+   * Pour un BUY, tout éventuel WSOL restant
+   * après le swap est récupéré en SOL.
+   *
+   * Pour un SELL, les SOL reçus sont d'abord
+   * crédités sur le compte WSOL puis récupérés
+   * avec closeAccount.
    */
+  transaction.add(
+    createCloseAccountInstruction(
+      wsolAta,
+      tradingWallet.publicKey,
+      tradingWallet.publicKey
+    )
+  );
+
+  /*
+   * Simulation obligatoire.
+   *
+   * Aucune transaction réelle ne part si la simulation
+   * échoue.
+   */
+  const latestBlockhash =
+    await connection.getLatestBlockhash(
+      "confirmed"
+    );
+
+  transaction.recentBlockhash =
+    latestBlockhash.blockhash;
+
+  transaction.feePayer =
+    tradingWallet.publicKey;
+
   const simulation =
     await connection.simulateTransaction(
       transaction,
       [tradingWallet]
     );
 
-  if (simulation.value.err) {
+  if (
+    simulation.value.err
+  ) {
     console.error(
       "❌ Simulation PumpSwap échouée:",
       JSON.stringify(
@@ -1344,7 +1897,9 @@ async function sendRealSwap(
       simulation.value.logs
     ) {
       console.error(
-        simulation.value.logs.join("\n")
+        simulation.value.logs.join(
+          "\n"
+        )
       );
     }
 
@@ -1362,8 +1917,7 @@ async function sendRealSwap(
   /*
    * Une seule tentative d'envoi.
    *
-   * Si cette opération devient ambiguë après envoi,
-   * on ne relance PAS automatiquement un deuxième swap.
+   * Pas de retry automatique d'un swap ambigu.
    */
   const signature =
     await sendAndConfirmTransaction(
@@ -1371,10 +1925,14 @@ async function sendRealSwap(
       transaction,
       [tradingWallet],
       {
-        commitment: "confirmed",
+        commitment:
+          "confirmed",
+
         preflightCommitment:
           "confirmed",
-        skipPreflight: false,
+
+        skipPreflight:
+          false,
       }
     );
 
@@ -1389,21 +1947,28 @@ async function sendRealSwap(
    REAL BUY
 ========================================================= */
 
-async function realBuy(data) {
+async function realBuy(
+  data
+) {
   if (!REAL_TRADING) {
     throw new Error(
       "Le bot n'est pas en mode réel"
     );
   }
 
-  if (tradeInProgress) {
+  if (
+    tradeInProgress
+  ) {
     console.log(
       "⏳ Transaction déjà en cours"
     );
+
     return false;
   }
 
-  if (!data?.pairAddress) {
+  if (
+    !data?.pairAddress
+  ) {
     throw new Error(
       "Pair PumpSwap absente"
     );
@@ -1426,7 +1991,8 @@ async function realBuy(data) {
     return false;
   }
 
-  tradeInProgress = true;
+  tradeInProgress =
+    true;
 
   try {
     const quote =
@@ -1437,7 +2003,8 @@ async function realBuy(data) {
 
     if (
       solBalance <
-      quote.sol + MIN_SOL_RESERVE
+      quote.sol +
+        MIN_SOL_RESERVE
     ) {
       await sendTelegram(
         `⛔ ACHAT BLOQUÉ\n\n` +
@@ -1457,12 +2024,15 @@ async function realBuy(data) {
 
     const lamports =
       Math.ceil(
-        quote.sol * 1e9
+        quote.sol *
+          1e9
       );
 
     const quoteBn =
       new BN(
-        String(lamports)
+        String(
+          lamports
+        )
       );
 
     console.log(
@@ -1481,6 +2051,10 @@ async function realBuy(data) {
       `Lamports: ${quoteBn.toString()}`
     );
 
+    console.log(
+      `Slippage achat: ${BUY_SLIPPAGE_PERCENT}%`
+    );
+
     const signature =
       await sendRealSwap(
         data.pairAddress,
@@ -1489,12 +2063,9 @@ async function realBuy(data) {
         BUY_SLIPPAGE_PERCENT
       );
 
-    /*
-     * Lecture du solde après confirmation.
-     * On utilise la différence pour connaître exactement
-     * combien de tokens CET achat a reçu.
-     */
-    await sleep(1000);
+    await sleep(
+      1000
+    );
 
     const tokenAfter =
       await getTokenBalanceRaw(
@@ -1507,7 +2078,9 @@ async function realBuy(data) {
       );
 
     if (
-      receivedRaw.lte(new BN(0))
+      receivedRaw.lte(
+        new BN(0)
+      )
     ) {
       throw new Error(
         "Aucun token détecté après l'achat confirmé"
@@ -1524,7 +2097,9 @@ async function realBuy(data) {
       10 ** decimals;
 
     if (
-      !Number.isFinite(receivedTokens) ||
+      !Number.isFinite(
+        receivedTokens
+      ) ||
       receivedTokens <= 0
     ) {
       throw new Error(
@@ -1538,8 +2113,11 @@ async function realBuy(data) {
 
     const targetPrice =
       actualEntryPrice *
-      (1 +
-        TARGET_GAIN_PERCENT / 100);
+      (
+        1 +
+        TARGET_GAIN_PERCENT /
+          100
+      );
 
     const newPosition = {
       mint,
@@ -1595,10 +2173,6 @@ async function realBuy(data) {
         cycleNumber + 1,
     };
 
-    /*
-     * On vérifie immédiatement si un CRITICAL est arrivé
-     * pendant la transaction.
-     */
     position =
       newPosition;
 
@@ -1606,23 +2180,26 @@ async function realBuy(data) {
       FIXED_CAPITAL_EUR
     );
 
-    cycleNumber += 1;
+    cycleNumber +=
+      1;
 
-    /*
-     * Si Crash Guard a verrouillé pendant l'achat,
-     * on vend immédiatement la quantité réellement reçue.
-     */
-    if (crashGuardLocked) {
+    if (
+      crashGuardLocked
+    ) {
       console.log(
         "🚨 CRITICAL arrivé pendant l'achat. Vente d'urgence immédiate."
       );
 
       await emergencyExitFromCrashGuard(
         {
-          level: "CRITICAL",
+          level:
+            "CRITICAL",
+
           pool:
             data.pairAddress,
+
           mint,
+
           reason:
             "CRITICAL pendant achat",
         }
@@ -1631,7 +2208,8 @@ async function realBuy(data) {
       return false;
     }
 
-    healthyConfirmations = 0;
+    healthyConfirmations =
+      0;
 
     sessionCycles.push({
       cycle:
@@ -1717,7 +2295,8 @@ async function realBuy(data) {
 
     return true;
   } finally {
-    tradeInProgress = false;
+    tradeInProgress =
+      false;
   }
 }
 
@@ -1733,7 +2312,9 @@ async function realSellPosition(
     return null;
   }
 
-  if (tradeInProgress) {
+  if (
+    tradeInProgress
+  ) {
     console.log(
       "⏳ Une autre transaction est déjà en cours"
     );
@@ -1756,18 +2337,25 @@ async function realSellPosition(
     );
 
   if (
-    amountRaw.lte(new BN(0))
+    amountRaw.lte(
+      new BN(0)
+    )
   ) {
     throw new Error(
       "Montant de vente invalide"
     );
   }
 
-  tradeInProgress = true;
+  tradeInProgress =
+    true;
 
   try {
     const beforeSol =
       await getWalletSolBalance();
+
+    console.log(
+      `🔴 VENTE RÉELLE | tokens=${amountRaw.toString()} | slippage=${SELL_SLIPPAGE_PERCENT}%`
+    );
 
     const signature =
       await sendRealSwap(
@@ -1777,30 +2365,33 @@ async function realSellPosition(
         SELL_SLIPPAGE_PERCENT
       );
 
-    await sleep(1000);
+    await sleep(
+      1000
+    );
 
     const afterSol =
       await getWalletSolBalance();
 
     const solDelta =
-      afterSol - beforeSol;
+      afterSol -
+      beforeSol;
 
-    /*
-     * Le delta SOL inclut aussi potentiellement les frais.
-     * On l'utilise uniquement comme information.
-     */
     const exitPrice =
-      currentPosition.capitalUsd > 0 &&
-      currentPosition.tokenAmount > 0
+      currentPosition.capitalUsd >
+        0 &&
+      currentPosition.tokenAmount >
+        0
         ? currentPosition.capitalUsd /
           currentPosition.tokenAmount
         : null;
 
-    let profitPercent = null;
+    let profitPercent =
+      null;
 
     if (
       exitPrice !== null &&
-      currentPosition.entryPrice > 0
+      currentPosition.entryPrice >
+        0
     ) {
       profitPercent =
         (
@@ -1809,7 +2400,8 @@ async function realSellPosition(
             currentPosition.entryPrice
           ) /
           currentPosition.entryPrice
-        ) * 100;
+        ) *
+        100;
     }
 
     const cycleResult = {
@@ -1851,7 +2443,9 @@ async function realSellPosition(
     });
 
     if (
-      Number.isFinite(profitPercent)
+      Number.isFinite(
+        profitPercent
+      )
     ) {
       sessionProfit +=
         profitPercent;
@@ -1870,9 +2464,11 @@ async function realSellPosition(
       signature,
     });
 
-    position = null;
+    position =
+      null;
 
-    healthyConfirmations = 0;
+    healthyConfirmations =
+      0;
 
     observationUntil =
       now() +
@@ -1896,7 +2492,8 @@ async function realSellPosition(
 
     return signature;
   } finally {
-    tradeInProgress = false;
+    tradeInProgress =
+      false;
   }
 }
 
@@ -1920,7 +2517,8 @@ async function emergencyExitFromCrashGuard(
   }
 
   if (!position) {
-    crashGuardEmergencyExitDone = true;
+    crashGuardEmergencyExitDone =
+      true;
 
     await sendTelegram(
       `🚨 CRASH GUARD CRITICAL\n\n` +
@@ -1969,10 +2567,6 @@ async function emergencyExitFromCrashGuard(
       );
     }
   } catch (error) {
-    /*
-     * On NE marque PAS l'exit comme effectué si la vente échoue.
-     * Cela permet à l'état de rester visible comme non liquidé.
-     */
     await sendTelegram(
       `❌ ERREUR VENTE D'URGENCE\n\n` +
       `${error.message}\n\n` +
@@ -2017,24 +2611,30 @@ async function applyCrashGuardSignal(
   if (
     signal.mint &&
     mint &&
-    signal.mint !== mint
+    signal.mint !==
+      mint
   ) {
     return;
   }
 
   const level =
     String(
-      signal.level || "NORMAL"
+      signal.level ||
+        "NORMAL"
     ).toUpperCase();
 
-  if (level === "WATCH") {
+  if (
+    level === "WATCH"
+  ) {
     crashGuardLevel =
       "WATCH";
 
     return;
   }
 
-  if (level === "DANGER") {
+  if (
+    level === "DANGER"
+  ) {
     crashGuardLevel =
       "DANGER";
 
@@ -2051,7 +2651,9 @@ async function applyCrashGuardSignal(
     return;
   }
 
-  if (level === "CRITICAL") {
+  if (
+    level === "CRITICAL"
+  ) {
     crashGuardLevel =
       "CRITICAL";
 
@@ -2078,11 +2680,12 @@ async function applyCrashGuardSignal(
       stopRadar(
         false,
         true
-      ).catch(error =>
-        console.error(
-          "Erreur stop après CRITICAL:",
-          error.message
-        )
+      ).catch(
+        error =>
+          console.error(
+            "Erreur stop après CRITICAL:",
+            error.message
+          )
       );
     }
   }
@@ -2092,7 +2695,9 @@ async function applyCrashGuardSignal(
    HTTP SERVER POUR CRASH GUARD
 ========================================================= */
 
-function isAuthorizedCrashGuard(req) {
+function isAuthorizedCrashGuard(
+  req
+) {
   return (
     req.headers[
       "x-crash-guard-secret"
@@ -2103,10 +2708,15 @@ function isAuthorizedCrashGuard(req) {
 
 const httpServer =
   http.createServer(
-    async (req, res) => {
+    async (
+      req,
+      res
+    ) => {
       if (
-        req.method === "GET" &&
-        req.url === "/health"
+        req.method ===
+          "GET" &&
+        req.url ===
+          "/health"
       ) {
         res.writeHead(
           200,
@@ -2119,18 +2729,26 @@ const httpServer =
         res.end(
           JSON.stringify({
             ok: true,
+
             service:
               "v51-real-trading",
+
             realTrading:
               REAL_TRADING,
+
             wallet:
               tradingWallet
                 ? tradingWallet.publicKey.toBase58()
                 : null,
+
             active,
+
             mint,
+
             crashGuardLevel,
+
             crashGuardLocked,
+
             position:
               !!position,
           })
@@ -2140,12 +2758,15 @@ const httpServer =
       }
 
       if (
-        req.method === "POST" &&
+        req.method ===
+          "POST" &&
         req.url ===
           "/crash-guard/event"
       ) {
         if (
-          !isAuthorizedCrashGuard(req)
+          !isAuthorizedCrashGuard(
+            req
+          )
         ) {
           res.writeHead(
             401,
@@ -2158,6 +2779,7 @@ const httpServer =
           res.end(
             JSON.stringify({
               ok: false,
+
               error:
                 "unauthorized",
             })
@@ -2182,7 +2804,9 @@ const httpServer =
 
             try {
               signal =
-                JSON.parse(body);
+                JSON.parse(
+                  body
+                );
             } catch {
               res.writeHead(
                 400,
@@ -2195,6 +2819,7 @@ const httpServer =
               res.end(
                 JSON.stringify({
                   ok: false,
+
                   error:
                     "invalid json",
                 })
@@ -2219,11 +2844,12 @@ const httpServer =
 
             applyCrashGuardSignal(
               signal
-            ).catch(error =>
-              console.error(
-                "Erreur traitement Crash Guard:",
-                error
-              )
+            ).catch(
+              error =>
+                console.error(
+                  "Erreur traitement Crash Guard:",
+                  error
+                )
             );
           }
         );
@@ -2242,6 +2868,7 @@ const httpServer =
       res.end(
         JSON.stringify({
           ok: false,
+
           error:
             "not found",
         })
@@ -2258,14 +2885,16 @@ httpServer.listen(
     );
 
     console.log(
-      `🌐 Host: 0.0.0.0`
+      "🌐 Host: 0.0.0.0"
     );
 
     console.log(
       `💰 Mode réel: ${REAL_TRADING}`
     );
 
-    if (tradingWallet) {
+    if (
+      tradingWallet
+    ) {
       console.log(
         `👛 Wallet: ${tradingWallet.publicKey.toBase58()}`
       );
@@ -2277,7 +2906,9 @@ httpServer.listen(
    ENTRY CONDITIONS
 ========================================================= */
 
-function canEnter(data) {
+function canEnter(
+  data
+) {
   if (!active) {
     return false;
   }
@@ -2286,15 +2917,21 @@ function canEnter(data) {
     return false;
   }
 
-  if (tradeInProgress) {
+  if (
+    tradeInProgress
+  ) {
     return false;
   }
 
-  if (crashGuardLocked) {
+  if (
+    crashGuardLocked
+  ) {
     return false;
   }
 
-  if (crashGuardBuyBlocked) {
+  if (
+    crashGuardBuyBlocked
+  ) {
     return false;
   }
 
@@ -2332,7 +2969,9 @@ function canEnter(data) {
   }
 
   const health =
-    calculateHealth(data);
+    calculateHealth(
+      data
+    );
 
   if (
     health.score <
@@ -2342,7 +2981,9 @@ function canEnter(data) {
   }
 
   const acceleration =
-    analyzeAcceleration(data);
+    analyzeAcceleration(
+      data
+    );
 
   if (
     acceleration.extreme
@@ -2357,14 +2998,21 @@ function canEnter(data) {
    CRASH DETECTION V5.1
 ========================================================= */
 
-function detectCrash(data) {
+function detectCrash(
+  data
+) {
   const ten =
-    getHistoryAgo(10000);
+    getHistoryAgo(
+      10000
+    );
 
   if (!ten) {
     return {
-      crash: false,
-      reasons: [],
+      crash:
+        false,
+
+      reasons:
+        [],
     };
   }
 
@@ -2383,7 +3031,8 @@ function detectCrash(data) {
   const reasons = [];
 
   if (
-    liquidityChange10s !== null &&
+    liquidityChange10s !==
+      null &&
     liquidityChange10s <=
       CRASH_LIQUIDITY_DROP_10S
   ) {
@@ -2393,7 +3042,8 @@ function detectCrash(data) {
   }
 
   if (
-    priceChange10s !== null &&
+    priceChange10s !==
+      null &&
     priceChange10s <=
       CRASH_PRICE_DROP_10S
   ) {
@@ -2438,17 +3088,23 @@ function loadCrashReports() {
       return [];
     }
 
-    return JSON.parse(content);
+    return JSON.parse(
+      content
+    );
   } catch {
     return [];
   }
 }
 
-function saveCrashReport(report) {
+function saveCrashReport(
+  report
+) {
   const reports =
     loadCrashReports();
 
-  reports.push(report);
+  reports.push(
+    report
+  );
 
   saveJson(
     CRASH_REPORTS_FILE,
@@ -2529,26 +3185,26 @@ async function handleCrash(
     `Prix : ${data.price}\n` +
     `Liquidité : $${data.liquidity.toFixed(2)}\n` +
     `Prix 10s : ${
-      crash.priceChange10s === null
+      crash.priceChange10s ===
+      null
         ? "N/A"
-        : crash.priceChange10s.toFixed(2) + "%"
+        : crash.priceChange10s.toFixed(
+            2
+          ) + "%"
     }\n` +
     `Liquidité 10s : ${
-      crash.liquidityChange10s === null
+      crash.liquidityChange10s ===
+      null
         ? "N/A"
-        : crash.liquidityChange10s.toFixed(2) + "%"
+        : crash.liquidityChange10s.toFixed(
+            2
+          ) + "%"
     }\n` +
-    `Raisons : ${crash.reasons.join(", ")}`
+    `Raisons : ${crash.reasons.join(
+      ", "
+    )}`
   );
 
-  /*
-   * En réel, on ne laisse pas une position ouverte
-   * uniquement parce que le détecteur V5.1 classique
-   * a déclenché.
-   *
-   * On tente une vente réelle si Crash Guard n'a pas
-   * déjà pris en charge la position.
-   */
   if (
     position &&
     !crashGuardEmergencyExitDone
@@ -2571,11 +3227,12 @@ async function handleCrash(
   stopRadar(
     false,
     true
-  ).catch(error =>
-    console.error(
-      "Erreur stopRadar crash:",
-      error.message
-    )
+  ).catch(
+    error =>
+      console.error(
+        "Erreur stopRadar crash:",
+        error.message
+      )
   );
 }
 
@@ -2583,7 +3240,9 @@ async function handleCrash(
    TIME LIMIT EXIT
 ========================================================= */
 
-async function timeLimitExit(data) {
+async function timeLimitExit(
+  data
+) {
   if (!position) {
     return;
   }
@@ -2621,7 +3280,9 @@ async function timeLimitExit(data) {
    TARGET SELL
 ========================================================= */
 
-async function checkTargetSell(data) {
+async function checkTargetSell(
+  data
+) {
   if (!position) {
     return false;
   }
@@ -2665,7 +3326,9 @@ async function handleAcceleration(
   data
 ) {
   const acceleration =
-    analyzeAcceleration(data);
+    analyzeAcceleration(
+      data
+    );
 
   if (
     acceleration.warning &&
@@ -2680,19 +3343,28 @@ async function handleAcceleration(
     await sendTelegram(
       `⚠️ ACCÉLÉRATION V5.1\n\n` +
       `Prix 5s : ${
-        acceleration.price5s === null
+        acceleration.price5s ===
+        null
           ? "N/A"
-          : acceleration.price5s.toFixed(2) + "%"
+          : acceleration.price5s.toFixed(
+              2
+            ) + "%"
       }\n` +
       `Prix 10s : ${
-        acceleration.price10s === null
+        acceleration.price10s ===
+        null
           ? "N/A"
-          : acceleration.price10s.toFixed(2) + "%"
+          : acceleration.price10s.toFixed(
+              2
+            ) + "%"
       }\n` +
       `Liquidité 10s : ${
-        acceleration.liquidity10s === null
+        acceleration.liquidity10s ===
+        null
           ? "N/A"
-          : acceleration.liquidity10s.toFixed(2) + "%"
+          : acceleration.liquidity10s.toFixed(
+              2
+            ) + "%"
       }`
     );
   }
@@ -2766,9 +3438,11 @@ async function tick() {
   if (
     health.healthy
   ) {
-    healthyConfirmations += 1;
+    healthyConfirmations +=
+      1;
   } else {
-    healthyConfirmations = 0;
+    healthyConfirmations =
+      0;
   }
 
   const acceleration =
@@ -2915,33 +3589,24 @@ function saveSummary() {
 async function startRadar(
   tokenMint
 ) {
-  if (
-    active
-  ) {
+  if (active) {
     throw new Error(
       "Un radar est déjà actif"
     );
   }
 
-  if (
-    !tokenMint
-  ) {
+  if (!tokenMint) {
     throw new Error(
       "Mint manquant"
     );
   }
 
-  if (
-    !REAL_TRADING
-  ) {
+  if (!REAL_TRADING) {
     throw new Error(
       "REAL_TRADING=false. Active le mode réel dans Railway avant /starttrade."
     );
   }
 
-  /*
-   * Vérification du wallet avant toute session.
-   */
   const solBalance =
     await getWalletSolBalance();
 
@@ -2954,9 +3619,6 @@ async function startRadar(
     );
   }
 
-  /*
-   * Vérification marché avant armement.
-   */
   const initialData =
     await getMarketData(
       tokenMint
@@ -2992,7 +3654,8 @@ async function startRadar(
   healthyConfirmations =
     0;
 
-  marketHistory = [];
+  marketHistory =
+    [];
 
   accelerationWarningActive =
     false;
@@ -3006,7 +3669,8 @@ async function startRadar(
   cycleNumber =
     0;
 
-  sessionCycles = [];
+  sessionCycles =
+    [];
 
   sessionProfit =
     0;
@@ -3019,10 +3683,6 @@ async function startRadar(
 
   resetDailyIfNeeded();
 
-  /*
-   * Le Guard doit être armé AVANT le début
-   * de la surveillance réelle.
-   */
   await armCrashGuard(
     tokenMint
   );
@@ -3042,24 +3702,23 @@ async function startRadar(
     `⚠️ Les transactions sont maintenant RÉELLES.`
   );
 
-  /*
-   * Premier tick immédiat.
-   */
-  tick().catch(error =>
-    console.error(
-      "Erreur premier tick:",
-      error
-    )
+  tick().catch(
+    error =>
+      console.error(
+        "Erreur premier tick:",
+        error
+      )
   );
 
   pollTimer =
     setInterval(
       () => {
-        tick().catch(error =>
-          console.error(
-            "Erreur tick:",
-            error
-          )
+        tick().catch(
+          error =>
+            console.error(
+              "Erreur tick:",
+              error
+            )
         );
       },
       POLL_INTERVAL_MS
@@ -3076,9 +3735,7 @@ async function stopRadar(
   sendMessage = true,
   internal = false
 ) {
-  if (
-    pollTimer
-  ) {
+  if (pollTimer) {
     clearInterval(
       pollTimer
     );
@@ -3087,10 +3744,6 @@ async function stopRadar(
       null;
   }
 
-  /*
-   * Si /stoptrade est demandé alors qu'une position
-   * réelle existe, on la vend avant de désarmer le Guard.
-   */
   if (
     position &&
     !internal &&
@@ -3109,10 +3762,6 @@ async function stopRadar(
         `La position reste considérée comme ouverte.`
       );
 
-      /*
-       * On ne considère pas la session comme proprement
-       * arrêtée si une position réelle reste ouverte.
-       */
       saveSummary();
 
       return;
@@ -3124,9 +3773,7 @@ async function stopRadar(
 
   await disarmCrashGuard();
 
-  if (
-    sendMessage
-  ) {
+  if (sendMessage) {
     await sendTelegram(
       `⛔ V5.1 RÉEL ARRÊTÉ\n\n` +
       `Mint : ${mint || "aucun"}\n` +
@@ -3256,32 +3903,57 @@ bot.command(
     const solBalance =
       tradingWallet
         ? await getWalletSolBalance()
-            .catch(() => null)
+            .catch(
+              () => null
+            )
         : null;
 
     let message =
       `📊 V5.1 RÉEL\n\n`;
 
     message +=
-      `Actif : ${active ? "OUI" : "NON"}\n`;
+      `Actif : ${
+        active
+          ? "OUI"
+          : "NON"
+      }\n`;
 
     message +=
-      `Mint : ${mint || "aucun"}\n`;
+      `Mint : ${
+        mint ||
+        "aucun"
+      }\n`;
 
     message +=
-      `Trading réel : ${REAL_TRADING ? "OUI" : "NON"}\n`;
+      `Trading réel : ${
+        REAL_TRADING
+          ? "OUI"
+          : "NON"
+      }\n`;
 
     message +=
       `Crash Guard : ${crashGuardLevel}\n`;
 
     message +=
-      `Buy bloqué : ${crashGuardBuyBlocked ? "OUI" : "NON"}\n`;
+      `Buy bloqué : ${
+        crashGuardBuyBlocked
+          ? "OUI"
+          : "NON"
+      }\n`;
 
     message +=
-      `Trading verrouillé : ${crashGuardLocked ? "OUI" : "NON"}\n`;
+      `Trading verrouillé : ${
+        crashGuardLocked
+          ? "OUI"
+          : "NON"
+      }\n`;
 
     message +=
-      `Position : ${position ? "OUVERTE" : "AUCUNE"}\n`;
+      `Position : ${
+        position
+          ? "OUVERTE"
+          : "AUCUNE"
+      }\n`;
 
     message +=
       `Cycle : ${cycleNumber}\n`;
@@ -3294,9 +3966,12 @@ bot.command(
 
     message +=
       `Solde SOL : ${
-        solBalance === null
+        solBalance ===
+        null
           ? "N/A"
-          : solBalance.toFixed(6)
+          : solBalance.toFixed(
+              6
+            )
       } SOL\n`;
 
     if (position) {
@@ -3325,7 +4000,9 @@ bot.command(
     const reports =
       loadCrashReports();
 
-    if (!reports.length) {
+    if (
+      !reports.length
+    ) {
       await ctx.reply(
         "💥 Aucun crash enregistré."
       );
@@ -3335,7 +4012,8 @@ bot.command(
 
     const last =
       reports[
-        reports.length - 1
+        reports.length -
+          1
       ];
 
     await ctx.reply(
@@ -3344,25 +4022,36 @@ bot.command(
       `Date : ${last.timestamp}\n` +
       `Prix : ${last.crashPrice}\n` +
       `Liquidité : $${Number(
-        last.crashLiquidity || 0
+        last.crashLiquidity ||
+          0
       ).toFixed(2)}\n` +
       `Prix 10s : ${
-        last.priceChange10s === null
+        last.priceChange10s ===
+        null
           ? "N/A"
           : Number(
               last.priceChange10s
-            ).toFixed(2) + "%"
+            ).toFixed(
+              2
+            ) + "%"
       }\n` +
       `Liquidité 10s : ${
-        last.liquidityChange10s === null
+        last.liquidityChange10s ===
+        null
           ? "N/A"
           : Number(
               last.liquidityChange10s
-            ).toFixed(2) + "%"
+            ).toFixed(
+              2
+            ) + "%"
       }\n` +
       `Raisons : ${
-        Array.isArray(last.reasons)
-          ? last.reasons.join(", ")
+        Array.isArray(
+          last.reasons
+        )
+          ? last.reasons.join(
+              ", "
+            )
           : "N/A"
       }`
     );
@@ -3392,7 +4081,10 @@ bot.command(
 ========================================================= */
 
 bot.catch(
-  (error, ctx) => {
+  (
+    error,
+    ctx
+  ) => {
     console.error(
       "Erreur Telegram:",
       error
@@ -3400,7 +4092,8 @@ bot.catch(
 
     console.error(
       "Update:",
-      ctx?.update?.update_id
+      ctx?.update
+        ?.update_id
     );
   }
 );
@@ -3436,17 +4129,23 @@ bot.launch()
     );
 
     console.log(
-      `🛡️ CRASH GUARD=${CRASH_GUARD_URL ? "CONFIGURÉ" : "NON CONFIGURÉ"}`
+      `🛡️ CRASH GUARD=${
+        CRASH_GUARD_URL
+          ? "CONFIGURÉ"
+          : "NON CONFIGURÉ"
+      }`
     );
   })
-  .catch(error => {
-    console.error(
-      "❌ Impossible de démarrer Telegram:",
-      error
-    );
+  .catch(
+    error => {
+      console.error(
+        "❌ Impossible de démarrer Telegram:",
+        error
+      );
 
-    process.exit(1);
-  });
+      process.exit(1);
+    }
+  );
 
 /* =========================================================
    GRACEFUL SHUTDOWN
@@ -3459,9 +4158,7 @@ async function shutdown(
     `\n🛑 Réception ${signal}`
   );
 
-  if (
-    pollTimer
-  ) {
+  if (pollTimer) {
     clearInterval(
       pollTimer
     );
@@ -3471,13 +4168,7 @@ async function shutdown(
   }
 
   /*
-   * On ne lance PAS de vente automatique ici.
-   *
-   * Un redémarrage Railway ne doit pas déclencher
-   * aveuglément une transaction pendant que le processus
-   * est en train de s'arrêter.
-   *
-   * La position reste enregistrée dans les logs/summary.
+   * Pas de vente automatique pendant SIGTERM/SIGINT.
    */
   saveSummary();
 
@@ -3494,17 +4185,24 @@ async function shutdown(
   );
 
   setTimeout(
-    () => process.exit(0),
+    () =>
+      process.exit(0),
     5000
   );
 }
 
 process.once(
   "SIGINT",
-  () => shutdown("SIGINT")
+  () =>
+    shutdown(
+      "SIGINT"
+    )
 );
 
 process.once(
   "SIGTERM",
-  () => shutdown("SIGTERM")
+  () =>
+    shutdown(
+      "SIGTERM"
+    )
 );
