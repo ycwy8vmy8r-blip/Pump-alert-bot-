@@ -8,7 +8,7 @@
   },
   "dependencies": {
     "@pump-fun/pump-swap-sdk": "^1.20.0",
-    "@solana/spl-token": "^0.4.14"
+    "@solana/spl-token": "^0.4.14",
     "bn.js": "^5.2.1",
     "bs58": "^5.0.0",
     "dotenv": "^16.4.7",
