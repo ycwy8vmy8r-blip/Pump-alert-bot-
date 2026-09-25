@@ -21,7 +21,6 @@ const {
   getAssociatedTokenAddressSync,
   createAssociatedTokenAccountIdempotentInstruction,
   createSyncNativeInstruction,
-  createCloseAccountInstruction,
 } = require("@solana/spl-token");
 
 const { Telegraf } = require("telegraf");
@@ -91,23 +90,16 @@ const WSOL_MINT =
   "So11111111111111111111111111111111111111112";
 
 if (!BOT_TOKEN) {
-  console.error(
-    "❌ BOT_TOKEN manquant"
-  );
+  console.error("❌ BOT_TOKEN manquant");
   process.exit(1);
 }
 
 if (!CHAT_ID) {
-  console.error(
-    "❌ CHAT_ID manquant"
-  );
+  console.error("❌ CHAT_ID manquant");
   process.exit(1);
 }
 
-if (
-  REAL_TRADING &&
-  !TRADING_PRIVATE_KEY
-) {
+if (REAL_TRADING && !TRADING_PRIVATE_KEY) {
   console.error(
     "❌ TRADING_PRIVATE_KEY manquante alors que REAL_TRADING=true"
   );
@@ -118,9 +110,7 @@ if (
   !Number.isFinite(FIXED_CAPITAL_EUR) ||
   FIXED_CAPITAL_EUR <= 0
 ) {
-  console.error(
-    "❌ FIXED_CAPITAL_EUR invalide"
-  );
+  console.error("❌ FIXED_CAPITAL_EUR invalide");
   process.exit(1);
 }
 
@@ -128,9 +118,7 @@ if (
   !Number.isFinite(BUY_SLIPPAGE_PERCENT) ||
   BUY_SLIPPAGE_PERCENT < 0
 ) {
-  console.error(
-    "❌ BUY_SLIPPAGE_PERCENT invalide"
-  );
+  console.error("❌ BUY_SLIPPAGE_PERCENT invalide");
   process.exit(1);
 }
 
@@ -138,9 +126,7 @@ if (
   !Number.isFinite(SELL_SLIPPAGE_PERCENT) ||
   SELL_SLIPPAGE_PERCENT < 0
 ) {
-  console.error(
-    "❌ SELL_SLIPPAGE_PERCENT invalide"
-  );
+  console.error("❌ SELL_SLIPPAGE_PERCENT invalide");
   process.exit(1);
 }
 
@@ -167,9 +153,7 @@ function loadTradingKeypair() {
         );
 
       if (!Array.isArray(arr)) {
-        throw new Error(
-          "clé JSON invalide"
-        );
+        throw new Error("clé JSON invalide");
       }
 
       keypair =
@@ -214,10 +198,7 @@ try {
   tradingWallet =
     loadTradingKeypair();
 } catch (error) {
-  console.error(
-    "❌",
-    error.message
-  );
+  console.error("❌", error.message);
   process.exit(1);
 }
 
@@ -246,60 +227,29 @@ const bot =
 ========================================================= */
 
 const TARGET_GAIN_PERCENT = 5;
-
 const POLL_INTERVAL_MS = 2000;
-
 const HISTORY_WINDOW_MS = 120000;
-
-const CRASH_REPORT_WINDOW_MS =
-  60000;
-
-const OBSERVATION_AFTER_SELL_MS =
-  30000;
-
-const MAX_TOKEN_SESSION_MS =
-  45 * 60 * 1000;
-
-const NO_NEW_BUY_AFTER_MS =
-  43 * 60 * 1000;
+const CRASH_REPORT_WINDOW_MS = 60000;
+const OBSERVATION_AFTER_SELL_MS = 30000;
+const MAX_TOKEN_SESSION_MS = 45 * 60 * 1000;
+const NO_NEW_BUY_AFTER_MS = 43 * 60 * 1000;
 
 const MIN_LIQUIDITY_USD = 3000;
 
-const ENTRY_LIQUIDITY_DROP_10S =
-  -10;
+const ENTRY_LIQUIDITY_DROP_10S = -10;
+const ENTRY_LIQUIDITY_DROP_30S = -15;
+const CRASH_LIQUIDITY_DROP_10S = -50;
+const ENTRY_PRICE_DROP_10S = -4;
+const CRASH_PRICE_DROP_10S = -20;
 
-const ENTRY_LIQUIDITY_DROP_30S =
-  -15;
+const ACCEL_PRICE_5S_WARNING = 7;
+const ACCEL_PRICE_10S_WARNING = 10;
+const ACCEL_PRICE_5S_EXTREME = 10;
+const ACCEL_PRICE_10S_EXTREME = 15;
+const ACCEL_LIQUIDITY_DROP = -5;
 
-const CRASH_LIQUIDITY_DROP_10S =
-  -50;
-
-const ENTRY_PRICE_DROP_10S =
-  -4;
-
-const CRASH_PRICE_DROP_10S =
-  -20;
-
-const ACCEL_PRICE_5S_WARNING =
-  7;
-
-const ACCEL_PRICE_10S_WARNING =
-  10;
-
-const ACCEL_PRICE_5S_EXTREME =
-  10;
-
-const ACCEL_PRICE_10S_EXTREME =
-  15;
-
-const ACCEL_LIQUIDITY_DROP =
-  -5;
-
-const REQUIRED_HEALTHY_CONFIRMATIONS =
-  4;
-
-const MIN_HEALTH_SCORE_FOR_ENTRY =
-  80;
+const REQUIRED_HEALTHY_CONFIRMATIONS = 4;
+const MIN_HEALTH_SCORE_FOR_ENTRY = 80;
 
 /* =========================================================
    ETAT V5.1
@@ -307,65 +257,38 @@ const MIN_HEALTH_SCORE_FOR_ENTRY =
 
 let active = false;
 let mint = null;
-
 let pollTimer = null;
-
 let observationUntil = 0;
-
 let sessionStartTime = 0;
-
 let position = null;
-
 let cycleNumber = 0;
-
 let sessionCycles = [];
-
 let sessionProfit = 0;
-
 let healthyConfirmations = 0;
-
 let marketHistory = [];
 
-let accelerationWarningActive =
-  false;
-
-let accelerationAlertSent =
-  false;
+let accelerationWarningActive = false;
+let accelerationAlertSent = false;
 
 /* =========================================================
    CRASH GUARD
 ========================================================= */
 
-let crashGuardLevel =
-  "NORMAL";
-
-let crashGuardBuyBlocked =
-  false;
-
-let crashGuardLocked =
-  false;
-
-let crashGuardEmergencyExitDone =
-  false;
-
-let crashGuardEmergencyExitInProgress =
-  false;
-
-let crashGuardLastEventId =
-  null;
-
-let crashGuardArmed =
-  false;
+let crashGuardLevel = "NORMAL";
+let crashGuardBuyBlocked = false;
+let crashGuardLocked = false;
+let crashGuardEmergencyExitDone = false;
+let crashGuardEmergencyExitInProgress = false;
+let crashGuardLastEventId = null;
+let crashGuardArmed = false;
 
 /* =========================================================
    REAL TRADING STATE
 ========================================================= */
 
-let tradeInProgress =
-  false;
+let tradeInProgress = false;
 
 let dailySpentEur = 0;
-
 let dailySpentDate = "";
 
 let eurUsdCache = null;
@@ -663,11 +586,8 @@ async function getSolUsdPrice() {
     return solUsdCache;
   }
 
-  const SOL_MINT =
-    WSOL_MINT;
-
   const url =
-    `https://api.dexscreener.com/tokens/v1/solana/${SOL_MINT}`;
+    `https://api.dexscreener.com/tokens/v1/solana/${WSOL_MINT}`;
 
   const response =
     await fetch(url);
@@ -721,8 +641,8 @@ async function getSolUsdPrice() {
               ?.address;
 
           return (
-            base === SOL_MINT ||
-            quote === SOL_MINT
+            base === WSOL_MINT ||
+            quote === WSOL_MINT
           );
         }
       )
@@ -1637,14 +1557,14 @@ function addWsolAccountInstructions(
   }
 
   /*
-   * PumpSwap attend un vrai compte SPL WSOL.
+   * PumpSwap attend un compte SPL WSOL
+   * initialisé pour user_quote_token_account.
    *
-   * On crée l'ATA de manière idempotente.
-   * Pour un BUY, on le finance avec les lamports du swap
-   * puis on appelle syncNative.
-   *
-   * Pour un SELL, il suffit que le compte existe déjà.
+   * La création est idempotente :
+   * - si le compte existe : rien à créer
+   * - s'il n'existe pas : il est créé
    */
+
   transaction.add(
     createAssociatedTokenAccountIdempotentInstruction(
       tradingWallet.publicKey,
@@ -1655,6 +1575,14 @@ function addWsolAccountInstructions(
       )
     )
   );
+
+  /*
+   * BUY :
+   *
+   * On dépose les lamports du montant du swap
+   * dans le compte WSOL puis SyncNative transforme
+   * ce solde natif en solde SPL WSOL.
+   */
 
   if (
     shouldFund &&
@@ -1746,11 +1674,51 @@ async function sendRealSwap(
     `🪙 WSOL ATA=${wsolAta.toBase58()}`
   );
 
+  /*
+   * Récupération de l'état réel du pool.
+   */
   const swapState =
     await onlineAmmSdk.swapSolanaState(
       poolPk,
       tradingWallet.publicKey
     );
+
+  if (
+    !swapState ||
+    !swapState.pool
+  ) {
+    throw new Error(
+      "État PumpSwap du pool introuvable"
+    );
+  }
+
+  /*
+   * Vérification importante :
+   * notre stratégie fournit du SOL/WSOL.
+   *
+   * Si le pool utilise un autre quote mint,
+   * on ne tente PAS de l'acheter avec des lamports.
+   */
+  const quoteMint =
+    new PublicKey(
+      swapState.pool.quoteMint
+    );
+
+  console.log(
+    `🪙 Quote mint du pool=${quoteMint.toBase58()}`
+  );
+
+  if (
+    !quoteMint.equals(
+      new PublicKey(
+        WSOL_MINT
+      )
+    )
+  ) {
+    throw new Error(
+      `Pool PumpSwap non-SOL : quoteMint=${quoteMint.toBase58()}`
+    );
+  }
 
   let instructions;
 
@@ -1796,32 +1764,34 @@ async function sendRealSwap(
     ComputeBudgetProgram.setComputeUnitLimit(
       {
         units:
-          200000,
+          250000,
       }
     )
   );
 
   /*
-   * IMPORTANT :
+   * =====================================================
+   * CORRECTION DU BUG Custom:3012
+   * =====================================================
    *
-   * PumpSwap utilise WSOL comme quote token
-   * pour les pools SOL.
+   * PumpSwap vérifie que user_quote_token_account
+   * est un compte SPL initialisé.
    *
-   * Le SDK produit l'instruction AMM mais le compte
-   * user_quote_token_account doit être un compte SPL
-   * WSOL initialisé.
+   * Pour un pool SOL, ce compte est le compte WSOL
+   * de notre wallet.
    *
-   * BUY:
-   *   création ATA WSOL
-   *   transfert des lamports
-   *   syncNative
-   *   swap
-   *   fermeture WSOL après le swap
+   * BUY :
+   *   1. création ATA WSOL si nécessaire
+   *   2. transfert des lamports
+   *   3. SyncNative
+   *   4. instruction PumpSwap BUY
    *
-   * SELL:
-   *   création ATA WSOL si nécessaire
-   *   swap
-   *   fermeture WSOL après le swap
+   * SELL :
+   *   1. création ATA WSOL si nécessaire
+   *   2. instruction PumpSwap SELL
+   *
+   * On ne ferme volontairement PAS le compte WSOL
+   * après la transaction pour cette version.
    */
 
   addWsolAccountInstructions(
@@ -1845,26 +1815,8 @@ async function sendRealSwap(
   }
 
   /*
-   * Pour un BUY, tout éventuel WSOL restant
-   * après le swap est récupéré en SOL.
-   *
-   * Pour un SELL, les SOL reçus sont d'abord
-   * crédités sur le compte WSOL puis récupérés
-   * avec closeAccount.
-   */
-  transaction.add(
-    createCloseAccountInstruction(
-      wsolAta,
-      tradingWallet.publicKey,
-      tradingWallet.publicKey
-    )
-  );
-
-  /*
-   * Simulation obligatoire.
-   *
-   * Aucune transaction réelle ne part si la simulation
-   * échoue.
+   * Blockhash explicite pour la simulation
+   * et la transaction réelle.
    */
   const latestBlockhash =
     await connection.getLatestBlockhash(
@@ -1877,6 +1829,12 @@ async function sendRealSwap(
   transaction.feePayer =
     tradingWallet.publicKey;
 
+  /*
+   * Simulation obligatoire.
+   *
+   * Si la simulation échoue :
+   * aucune transaction réelle n'est envoyée.
+   */
   const simulation =
     await connection.simulateTransaction(
       transaction,
@@ -1897,9 +1855,17 @@ async function sendRealSwap(
       simulation.value.logs
     ) {
       console.error(
+        "----- LOGS SOLANA -----"
+      );
+
+      console.error(
         simulation.value.logs.join(
           "\n"
         )
+      );
+
+      console.error(
+        "-----------------------"
       );
     }
 
@@ -1916,8 +1882,7 @@ async function sendRealSwap(
 
   /*
    * Une seule tentative d'envoi.
-   *
-   * Pas de retry automatique d'un swap ambigu.
+   * Aucun retry automatique.
    */
   const signature =
     await sendAndConfirmTransaction(
@@ -2001,17 +1966,43 @@ async function realBuy(
     const solBalance =
       await getWalletSolBalance();
 
+    /*
+     * La première utilisation du WSOL ATA peut nécessiter
+     * du SOL supplémentaire pour sa création.
+     *
+     * On garde une réserve supplémentaire prudente.
+     */
+    const wsolAta =
+      getWsolAta();
+
+    const wsolAtaInfo =
+      await connection.getAccountInfo(
+        wsolAta,
+        "confirmed"
+      );
+
+    const estimatedWsolAtaRent =
+      wsolAtaInfo
+        ? 0
+        : 0.003;
+
     if (
       solBalance <
       quote.sol +
-        MIN_SOL_RESERVE
+        MIN_SOL_RESERVE +
+        estimatedWsolAtaRent
     ) {
       await sendTelegram(
         `⛔ ACHAT BLOQUÉ\n\n` +
         `Solde SOL insuffisant.\n` +
         `Disponible : ${solBalance.toFixed(6)} SOL\n` +
-        `Nécessaire achat : ${quote.sol.toFixed(6)} SOL\n` +
-        `Réserve : ${MIN_SOL_RESERVE} SOL`
+        `Achat : ${quote.sol.toFixed(6)} SOL\n` +
+        `Réserve : ${MIN_SOL_RESERVE} SOL\n` +
+        `${
+          wsolAtaInfo
+            ? "ATA WSOL déjà présente."
+            : "Création initiale ATA WSOL nécessaire."
+        }`
       );
 
       return false;
