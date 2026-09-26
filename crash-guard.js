@@ -1,7 +1,8 @@
 "use strict";
 
 const http = require("http");
-const ws = require("ws");
+const WebSocket = require("ws");
+const { PublicKey } = require("@solana/web3.js");
 
 // ============================================================
 // CONFIGURATION
@@ -10,12 +11,10 @@ const ws = require("ws");
 const PORT = Number(process.env.PORT || 3000);
 
 const RPC_HTTP =
-  process.env.RPC_HTTP ||
-  "https://api.mainnet-beta.solana.com";
+  process.env.RPC_HTTP || "https://api.mainnet-beta.solana.com";
 
 const RPC_WS =
-  process.env.RPC_WS ||
-  "wss://api.mainnet-beta.solana.com";
+  process.env.RPC_WS || "wss://api.mainnet-beta.solana.com";
 
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
 const CHAT_ID = process.env.CHAT_ID || "";
@@ -24,170 +23,127 @@ const CRASH_GUARD_SECRET =
   process.env.CRASH_GUARD_SECRET || "";
 
 const CRASH_GUARD_TARGET_URL =
-  process.env.CRASH_GUARD_TARGET_URL || "";
+  (process.env.CRASH_GUARD_TARGET_URL || "").replace(/\/+$/, "");
 
-// PumpSwap / Pump AMM
-const PUMPSWAP_PROGRAM_ID =
+const PUMP_SWAP_PROGRAM_ID =
   "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
-// Native SOL / WSOL mint
-const SOL_MINT =
-  "So11111111111111111111111111111111111111112";
+const SOL_MINT = "So11111111111111111111111111111111111111112";
 
-// ============================================================
-// SEUILS CRASH GUARD
-// ============================================================
+// Seuils de variation des réserves on-chain.
+const WATCH_DROP_5S = Number(process.env.WATCH_DROP_5S || -5);
+const WATCH_DROP_10S = Number(process.env.WATCH_DROP_10S || -8);
 
-const WATCH_DROP_5S = -5;
-const WATCH_DROP_10S = -8;
+const DANGER_DROP_5S = Number(process.env.DANGER_DROP_5S || -10);
+const DANGER_DROP_10S = Number(process.env.DANGER_DROP_10S || -15);
 
-const DANGER_DROP_5S = -10;
-const DANGER_DROP_10S = -15;
+const CRITICAL_DROP_5S = Number(process.env.CRITICAL_DROP_5S || -20);
+const CRITICAL_DROP_10S = Number(process.env.CRITICAL_DROP_10S || -30);
 
-const CRITICAL_DROP_5S = -20;
-const CRITICAL_DROP_10S = -30;
-
-const DANGER_HOLD_MS = 15000;
-
-// ============================================================
-// TIMING
-// ============================================================
+const DANGER_HOLD_MS = Number(process.env.DANGER_HOLD_MS || 15000);
 
 const SAMPLE_INTERVAL_MS = 1000;
-const DEX_REFRESH_INTERVAL_MS = 5000;
-
+const DEX_INTERVAL_MS = 15000;
+const DEX_BACKOFF_MS = 15000;
+const DEX_CACHE_TTL_MS = 10000;
 const HISTORY_MAX = 120;
+const HTTP_TIMEOUT_MS = 10000;
 
-const HTTP_TIMEOUT_MS = 5000;
+const TOKEN_ACCOUNT_AMOUNT_OFFSET = 64;
 
-const DEX_RETRY_COUNT = 3;
-const DEX_RETRY_BASE_DELAY_MS = 1200;
-
-// ============================================================
-// PERSISTENCE
-// ============================================================
-
-const DATA_DIR = "/data";
-
-const LOG_FILE =
-  `${DATA_DIR}/crash_guard.jsonl`;
-
-function ensureDataDir() {
-  try {
-    require("fs").mkdirSync(DATA_DIR, {
-      recursive: true,
-    });
-  } catch (_) {}
-}
-
-ensureDataDir();
-
-function logEvent(type, data = {}) {
-  const row = {
-    timestamp: new Date().toISOString(),
-    type,
-    ...data,
-  };
-
-  console.log(JSON.stringify(row));
-
-  try {
-    require("fs").appendFileSync(
-      LOG_FILE,
-      JSON.stringify(row) + "\n"
-    );
-  } catch (_) {}
-}
+const POOL_BASE_MINT_OFFSET = 43;
+const POOL_QUOTE_MINT_OFFSET = 75;
+const POOL_BASE_VAULT_OFFSET = 139;
+const POOL_QUOTE_VAULT_OFFSET = 171;
 
 // ============================================================
-// ETAT
+// STATE
 // ============================================================
 
-const state = {
-  armed: false,
+let armed = false;
+let currentMint = null;
+let currentPool = null;
 
-  currentMint: null,
-  currentPool: null,
+let baseMint = null;
+let quoteMint = null;
+let baseVault = null;
+let quoteVault = null;
+let tokenVault = null;
+let solVault = null;
+let tokenDecimals = 0;
+let tokenIsBase = true;
 
-  baseMint: null,
-  quoteMint: null,
+let ws = null;
+let reconnectTimer = null;
+let sampleTimer = null;
+let dexTimer = null;
 
-  baseVault: null,
-  quoteVault: null,
-
-  baseDecimals: 6,
-  quoteDecimals: 9,
-
-  ws: null,
-
-  subscriptions: {},
-
-  vaultAmounts: {
-    base: null,
-    quote: null,
-  },
-
-  history: [],
-
-  dex: {
-    priceUsd: null,
-    liquidityUsd: null,
-    pairAddress: null,
-    updatedAt: 0,
-  },
-
-  level: "WATCH",
-
-  dangerUntil: 0,
-
-  criticalLatched: false,
-
-  lastSignal: null,
-
-  timers: {
-    sample: null,
-    dex: null,
-  },
-
-  eventId: 0,
-
-  // Cache DexScreener
-  dexCache: {
-    pool: null,
-    market: null,
-    lastSuccessAt: 0,
-  },
-
-  // Empêche les rafales de requêtes DexScreener
-  dexNextAllowedAt: 0,
+let reconnectAttempts = 0;
+let subscriptionIds = new Map();
+let vaultAmounts = {
+  token: null,
+  sol: null,
 };
 
+let history = [];
+let dexData = null;
+let dexUnavailable = false;
+let dexLastError = null;
+let dexBlockedUntil = 0;
+let dexLastRequestAt = 0;
+let dexCacheAt = 0;
+let dexErrorLogged = false;
+
+let level = "NORMAL";
+let dangerUntil = 0;
+let criticalLatched = false;
+let lastSignal = null;
+let eventId = 0;
+
+let starting = false;
+let stopping = false;
+
 // ============================================================
-// UTILITAIRES
+// UTILITIES
 // ============================================================
 
-function sleep(ms) {
-  return new Promise((resolve) =>
-    setTimeout(resolve, ms)
-  );
+function log(...args) {
+  console.log(new Date().toISOString(), ...args);
 }
 
-function pctChange(oldValue, newValue) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function readPubkey(data, offset) {
+  if (!data || data.length < offset + 32) {
+    throw new Error(`Données de pool insuffisantes à l'offset ${offset}`);
+  }
+
+  return new PublicKey(data.subarray(offset, offset + 32)).toBase58();
+}
+
+function readTokenAmount(data) {
+  if (!data || data.length < TOKEN_ACCOUNT_AMOUNT_OFFSET + 8) {
+    return null;
+  }
+
+  return data.readBigUInt64LE(TOKEN_ACCOUNT_AMOUNT_OFFSET);
+}
+
+function rawToNumber(raw, decimals = 0) {
+  if (raw === null || raw === undefined) return null;
+  return Number(raw) / Math.pow(10, decimals);
+}
+
+function percentChange(oldValue, newValue) {
   if (
     oldValue === null ||
     oldValue === undefined ||
     newValue === null ||
-    newValue === undefined
+    newValue === undefined ||
+    oldValue === 0
   ) {
-    return null;
-  }
-
-  if (!Number.isFinite(oldValue) ||
-      !Number.isFinite(newValue)) {
-    return null;
-  }
-
-  if (oldValue === 0) {
     return null;
   }
 
@@ -195,2411 +151,1385 @@ function pctChange(oldValue, newValue) {
 }
 
 function safeNumber(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
-}
-
-function pubkeyFromBytes(buffer, offset) {
-  return buffer.subarray(offset, offset + 32)
-    .toString("base64");
-}
-
-function base58Encode(buffer) {
-  const ALPHABET =
-    "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-  let digits = [0];
-
-  for (const byte of buffer) {
-    let carry = byte;
-
-    for (let i = 0; i < digits.length; i++) {
-      const value = digits[i] * 256 + carry;
-
-      digits[i] = value % 58;
-      carry = Math.floor(value / 58);
-    }
-
-    while (carry > 0) {
-      digits.push(carry % 58);
-      carry = Math.floor(carry / 58);
-    }
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return null;
   }
 
-  let result = "";
-
-  for (let i = 0; i < buffer.length && buffer[i] === 0; i++) {
-    result += "1";
-  }
-
-  for (let i = digits.length - 1; i >= 0; i--) {
-    result += ALPHABET[digits[i]];
-  }
-
-  return result;
+  return Number(value);
 }
 
-function pubkeyFromAccountData(buffer, offset) {
-  return base58Encode(
-    buffer.subarray(offset, offset + 32)
-  );
+function parseBase64Account(account) {
+  if (!account || !account.data || !account.data[0]) {
+    return null;
+  }
+
+  return Buffer.from(account.data[0], "base64");
+}
+
+function isWsolMint(mint) {
+  return mint === SOL_MINT;
+}
+
+function validateMint(mint) {
+  try {
+    new PublicKey(mint);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ============================================================
 // HTTP / RPC
 // ============================================================
 
-async function rpc(method, params = []) {
+async function fetchJson(url, options = {}, timeoutMs = HTTP_TIMEOUT_MS) {
   const controller = new AbortController();
-
-  const timer = setTimeout(() => {
-    controller.abort();
-  }, HTTP_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(RPC_HTTP, {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+
+    const text = await response.text();
+    let json = null;
+
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      throw new Error(`Réponse JSON invalide, HTTP ${response.status}`);
+    }
+
+    if (!response.ok) {
+      const error = new Error(`HTTP ${response.status}`);
+      error.status = response.status;
+
+      const retryAfter = response.headers.get("retry-after");
+      if (retryAfter) {
+        const seconds = Number(retryAfter);
+        if (Number.isFinite(seconds)) {
+          error.retryAfterMs = Math.max(0, seconds * 1000);
+        }
+      }
+
+      throw error;
+    }
+
+    return json;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function rpc(method, params) {
+  const json = await fetchJson(
+    RPC_HTTP,
+    {
       method: "POST",
-
-      headers: {
-        "content-type": "application/json",
-      },
-
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: Date.now(),
         method,
         params,
       }),
+    },
+    HTTP_TIMEOUT_MS
+  );
 
-      signal: controller.signal,
-    });
-
-    const text = await response.text();
-
-    if (!response.ok) {
-      throw new Error(
-        `RPC HTTP ${response.status}: ${text.slice(0, 500)}`
-      );
-    }
-
-    let json;
-
-    try {
-      json = JSON.parse(text);
-    } catch (_) {
-      throw new Error(
-        `RPC réponse JSON invalide: ${text.slice(0, 500)}`
-      );
-    }
-
-    if (json.error) {
-      throw new Error(
-        `RPC ${json.error.code}: ${json.error.message}`
-      );
-    }
-
-    return json.result;
-  } finally {
-    clearTimeout(timer);
+  if (json.error) {
+    throw new Error(
+      `RPC ${method}: ${json.error.message || JSON.stringify(json.error)}`
+    );
   }
+
+  return json.result;
+}
+
+async function getAccountInfo(address) {
+  return rpc("getAccountInfo", [
+    address,
+    {
+      encoding: "base64",
+      commitment: "confirmed",
+    },
+  ]);
 }
 
 // ============================================================
 // DEXSCREENER
 // ============================================================
 
+function getRetryAfterMs(error) {
+  if (error && Number.isFinite(error.retryAfterMs)) {
+    return Math.max(error.retryAfterMs, DEX_BACKOFF_MS);
+  }
+
+  return DEX_BACKOFF_MS;
+}
+
 async function dexFetch(url) {
   const now = Date.now();
 
-  if (now < state.dexNextAllowedAt) {
-    throw new Error(
-      "DexScreener temporisation active"
-    );
+  if (now < dexBlockedUntil) {
+    const error = new Error("DexScreener temporairement limité");
+    error.status = 429;
+    throw error;
   }
-
-  let lastError = null;
-
-  for (
-    let attempt = 0;
-    attempt < DEX_RETRY_COUNT;
-    attempt++
-  ) {
-    try {
-      const response = await fetch(url, {
-        headers: {
-          accept: "application/json",
-          "user-agent":
-            "pump-crash-guard/1.0",
-        },
-      });
-
-      const text = await response.text();
-
-      if (response.status === 429) {
-        const retryAfterHeader =
-          response.headers.get("retry-after");
-
-        const retryAfterSeconds =
-          Number(retryAfterHeader);
-
-        const delay =
-          Number.isFinite(retryAfterSeconds) &&
-          retryAfterSeconds > 0
-            ? Math.min(
-                retryAfterSeconds * 1000,
-                15000
-              )
-            : DEX_RETRY_BASE_DELAY_MS *
-              Math.pow(2, attempt);
-
-        state.dexNextAllowedAt =
-          Date.now() + delay;
-
-        lastError = new Error(
-          "DexScreener HTTP 429"
-        );
-
-        logEvent("dex_429", {
-          attempt: attempt + 1,
-          delay,
-          url,
-        });
-
-        if (attempt < DEX_RETRY_COUNT - 1) {
-          await sleep(delay);
-          continue;
-        }
-
-        throw lastError;
-      }
-
-      if (!response.ok) {
-        throw new Error(
-          `DexScreener HTTP ${response.status}`
-        );
-      }
-
-      let json;
-
-      try {
-        json = JSON.parse(text);
-      } catch (_) {
-        throw new Error(
-          "DexScreener réponse JSON invalide"
-        );
-      }
-
-      state.dexNextAllowedAt =
-        Date.now() + 250;
-
-      return json;
-    } catch (error) {
-      lastError = error;
-
-      if (
-        attempt < DEX_RETRY_COUNT - 1 &&
-        !String(error.message).includes(
-          "temporisation active"
-        )
-      ) {
-        const delay =
-          DEX_RETRY_BASE_DELAY_MS *
-          Math.pow(2, attempt);
-
-        await sleep(delay);
-      }
-    }
-  }
-
-  throw lastError ||
-    new Error("DexScreener indisponible");
-}
-
-// ============================================================
-// RECHERCHE ON-CHAIN DU POOL PUMPSWAP
-// ============================================================
-
-function decodePoolAccount(buffer) {
-  if (!Buffer.isBuffer(buffer)) {
-    buffer = Buffer.from(buffer);
-  }
-
-  // Ancien / nouveau layout PumpSwap.
-  // Le layout utilisé ici correspond au compte Pool
-  // documenté par PumpSwap.
-
-  if (buffer.length < 301) {
-    throw new Error(
-      `Compte Pool trop petit: ${buffer.length} octets`
-    );
-  }
-
-  const baseMint =
-    pubkeyFromAccountData(buffer, 43);
-
-  const quoteMint =
-    pubkeyFromAccountData(buffer, 75);
-
-  const baseVault =
-    pubkeyFromAccountData(buffer, 139);
-
-  const quoteVault =
-    pubkeyFromAccountData(buffer, 171);
-
-  return {
-    baseMint,
-    quoteMint,
-    baseVault,
-    quoteVault,
-  };
-}
-
-async function getProgramPoolCandidates(mint) {
-  const filters = [
-    {
-      dataSize: 301,
-    },
-  ];
-
-  const results = [];
-
-  // ----------------------------------------------------------
-  // Le mint peut être le BASE mint
-  // ----------------------------------------------------------
 
   try {
-    const basePools =
-      await rpc("getProgramAccounts", [
-        PUMPSWAP_PROGRAM_ID,
-        {
-          encoding: "base64",
+    const result = await fetchJson(url, {}, HTTP_TIMEOUT_MS);
 
-          filters: [
-            ...filters,
-
-            {
-              memcmp: {
-                offset: 43,
-                bytes: mint,
-              },
-            },
-          ],
-        },
-      ]);
-
-    for (const item of basePools || []) {
-      try {
-        const raw =
-          Buffer.from(
-            item.account.data[0],
-            "base64"
-          );
-
-        const decoded =
-          decodePoolAccount(raw);
-
-        if (
-          decoded.baseMint === mint &&
-          decoded.quoteMint === SOL_MINT
-        ) {
-          results.push({
-            pool: item.pubkey,
-            ...decoded,
-          });
-        }
-      } catch (_) {}
-    }
-  } catch (error) {
-    logEvent(
-      "onchain_pool_search_base_error",
-      {
-        mint,
-        error: error.message,
-      }
-    );
-  }
-
-  // ----------------------------------------------------------
-  // Le mint peut être le QUOTE mint
-  // ----------------------------------------------------------
-
-  try {
-    const quotePools =
-      await rpc("getProgramAccounts", [
-        PUMPSWAP_PROGRAM_ID,
-        {
-          encoding: "base64",
-
-          filters: [
-            ...filters,
-
-            {
-              memcmp: {
-                offset: 75,
-                bytes: mint,
-              },
-            },
-          ],
-        },
-      ]);
-
-    for (const item of quotePools || []) {
-      try {
-        const raw =
-          Buffer.from(
-            item.account.data[0],
-            "base64"
-          );
-
-        const decoded =
-          decodePoolAccount(raw);
-
-        if (
-          decoded.quoteMint === mint &&
-          decoded.baseMint === SOL_MINT
-        ) {
-          results.push({
-            pool: item.pubkey,
-            ...decoded,
-          });
-        }
-      } catch (_) {}
-    }
-  } catch (error) {
-    logEvent(
-      "onchain_pool_search_quote_error",
-      {
-        mint,
-        error: error.message,
-      }
-    );
-  }
-
-  return results;
-}
-
-async function getTokenAccountRawAmount(address) {
-  const result =
-    await rpc("getTokenAccountBalance", [
-      address,
-      {
-        commitment: "confirmed",
-      },
-    ]);
-
-  return {
-    raw: BigInt(result.value.amount),
-    ui: Number(result.value.uiAmount || 0),
-  };
-}
-
-async function findBestOnChainPumpSwapPool(mint) {
-  const candidates =
-    await getProgramPoolCandidates(mint);
-
-  if (!candidates.length) {
-    return null;
-  }
-
-  const scored = [];
-
-  for (const candidate of candidates) {
-    try {
-      const quote =
-        await getTokenAccountRawAmount(
-          candidate.quoteVault
-        );
-
-      const base =
-        await getTokenAccountRawAmount(
-          candidate.baseVault
-        );
-
-      scored.push({
-        ...candidate,
-
-        quoteReserveRaw:
-          quote.raw.toString(),
-
-        quoteReserveUi:
-          quote.ui,
-
-        baseReserveRaw:
-          base.raw.toString(),
-
-        baseReserveUi:
-          base.ui,
-      });
-    } catch (error) {
-      logEvent(
-        "onchain_pool_reserve_error",
-        {
-          pool: candidate.pool,
-          error: error.message,
-        }
-      );
-    }
-  }
-
-  if (!scored.length) {
-    return null;
-  }
-
-  // Pour un pool SOL-quoted, la réserve SOL
-  // est un bon critère de sélection.
-  scored.sort(
-    (a, b) =>
-      b.quoteReserveUi -
-      a.quoteReserveUi
-  );
-
-  return scored[0];
-}
-
-// ============================================================
-// RECHERCHE DU POOL
-// ============================================================
-
-async function findPumpSwapPool(mint) {
-  // ----------------------------------------------------------
-  // 1. Si le cache est encore utilisable, on le garde
-  // ----------------------------------------------------------
-
-  if (
-    state.dexCache.pool &&
-    state.dexCache.pool.mint === mint
-  ) {
-    return state.dexCache.pool;
-  }
-
-  // ----------------------------------------------------------
-  // 2. Première source = ON-CHAIN
-  // ----------------------------------------------------------
-
-  try {
-    const onChain =
-      await findBestOnChainPumpSwapPool(mint);
-
-    if (onChain) {
-      const result = {
-        pool: onChain.pool,
-        mint,
-
-        baseMint: onChain.baseMint,
-        quoteMint: onChain.quoteMint,
-
-        baseVault: onChain.baseVault,
-        quoteVault: onChain.quoteVault,
-
-        priceUsd: null,
-        liquidityUsd: null,
-
-        source: "onchain",
-      };
-
-      state.dexCache.pool = result;
-
-      logEvent(
-        "pool_found_onchain",
-        result
-      );
-
-      return result;
-    }
-  } catch (error) {
-    logEvent(
-      "pool_onchain_failed",
-      {
-        mint,
-        error: error.message,
-      }
-    );
-  }
-
-  // ----------------------------------------------------------
-  // 3. Fallback DexScreener
-  // ----------------------------------------------------------
-
-  try {
-    const data =
-      await dexFetch(
-        `https://api.dexscreener.com/token-pairs/v1/solana/${mint}`
-      );
-
-    const pairs =
-      Array.isArray(data)
-        ? data
-        : Array.isArray(data?.pairs)
-          ? data.pairs
-          : [];
-
-    const pumpPairs =
-      pairs
-        .filter(
-          (pair) =>
-            pair &&
-            pair.dexId === "pumpswap" &&
-            pair.pairAddress
-        )
-        .sort(
-          (a, b) =>
-            Number(
-              b?.liquidity?.usd || 0
-            ) -
-            Number(
-              a?.liquidity?.usd || 0
-            )
-        );
-
-    if (!pumpPairs.length) {
-      throw new Error(
-        "Aucun pool PumpSwap trouvé"
-      );
+    if (dexUnavailable) {
+      log("DexScreener de nouveau disponible.");
     }
 
-    const pair =
-      pumpPairs[0];
-
-    const result = {
-      pool: pair.pairAddress,
-      mint,
-
-      baseMint:
-        pair.baseToken?.address || null,
-
-      quoteMint:
-        pair.quoteToken?.address || null,
-
-      baseVault: null,
-      quoteVault: null,
-
-      priceUsd:
-        safeNumber(pair.priceUsd),
-
-      liquidityUsd:
-        safeNumber(
-          pair.liquidity?.usd
-        ),
-
-      source: "dexscreener",
-    };
-
-    state.dexCache.pool = result;
-
-    state.dexCache.lastSuccessAt =
-      Date.now();
-
-    logEvent(
-      "pool_found_dex",
-      result
-    );
+    dexUnavailable = false;
+    dexLastError = null;
+    dexErrorLogged = false;
 
     return result;
   } catch (error) {
-    throw new Error(
-      `Impossible de trouver le pool PumpSwap: ${error.message}`
-    );
+    if (error.status === 429) {
+      dexBlockedUntil = Date.now() + getRetryAfterMs(error);
+      dexUnavailable = true;
+      dexLastError = "HTTP 429";
+
+      if (!dexErrorLogged) {
+        log(
+          "DexScreener HTTP 429. Pause des requêtes jusqu'à",
+          new Date(dexBlockedUntil).toISOString()
+        );
+        dexErrorLogged = true;
+      }
+    }
+
+    throw error;
   }
 }
 
+function normalizeDexPair(pair) {
+  if (!pair) return null;
+
+  return {
+    pairAddress: pair.pairAddress || null,
+    dexId: pair.dexId || null,
+    priceUsd: safeNumber(Number(pair.priceUsd)),
+    liquidityUsd: safeNumber(Number(pair.liquidity?.usd)),
+    volume24hUsd: safeNumber(Number(pair.volume?.h24)),
+    priceChange5m: safeNumber(Number(pair.priceChange?.m5)),
+    priceChange1h: safeNumber(Number(pair.priceChange?.h1)),
+    baseMint: pair.baseToken?.address || null,
+    quoteMint: pair.quoteToken?.address || null,
+    updatedAt: Date.now(),
+  };
+}
+
+function selectSolPair(pairs, mint) {
+  if (!Array.isArray(pairs)) return null;
+
+  const candidates = pairs.filter((pair) => {
+    if (!pair || pair.chainId !== "solana") return false;
+    if (String(pair.dexId || "").toLowerCase() !== "pumpswap") {
+      return false;
+    }
+
+    const base = pair.baseToken?.address;
+    const quote = pair.quoteToken?.address;
+
+    return (
+      (base === mint && isWsolMint(quote)) ||
+      (quote === mint && isWsolMint(base))
+    );
+  });
+
+  candidates.sort(
+    (a, b) =>
+      Number(b.liquidity?.usd || 0) -
+      Number(a.liquidity?.usd || 0)
+  );
+
+  return candidates[0] || null;
+}
+
+async function findPoolWithDexScreener(mint) {
+  const url = `https://api.dexscreener.com/token-pairs/v1/solana/${mint}`;
+  const pairs = await dexFetch(url);
+  const pair = selectSolPair(pairs, mint);
+
+  if (!pair) {
+    throw new Error("Aucun pool PumpSwap avec WSOL trouvé sur DexScreener");
+  }
+
+  return {
+    poolAddress: pair.pairAddress,
+    dexPair: normalizeDexPair(pair),
+  };
+}
+
 // ============================================================
-// DECODAGE DECIMALES
+// PUMPSWAP POOL DISCOVERY VIA SOLANA RPC
 // ============================================================
+
+function decodePoolAccount(pubkey, account) {
+  const data = parseBase64Account(account);
+
+  // Accepte les versions de compte dont la taille a évolué,
+  // mais exige que tous les champs utilisés soient présents.
+  const minLength = POOL_QUOTE_VAULT_OFFSET + 32;
+
+  if (!data || data.length < minLength) {
+    return null;
+  }
+
+  try {
+    const decodedBaseMint = readPubkey(data, POOL_BASE_MINT_OFFSET);
+    const decodedQuoteMint = readPubkey(data, POOL_QUOTE_MINT_OFFSET);
+    const decodedBaseVault = readPubkey(data, POOL_BASE_VAULT_OFFSET);
+    const decodedQuoteVault = readPubkey(data, POOL_QUOTE_VAULT_OFFSET);
+
+    return {
+      poolAddress: pubkey,
+      baseMint: decodedBaseMint,
+      quoteMint: decodedQuoteMint,
+      baseVault: decodedBaseVault,
+      quoteVault: decodedQuoteVault,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function getPoolsByMintOffset(mint, offset) {
+  const accounts = await rpc("getProgramAccounts", [
+    PUMP_SWAP_PROGRAM_ID,
+    {
+      commitment: "confirmed",
+      encoding: "base64",
+      filters: [
+        {
+          memcmp: {
+            offset,
+            bytes: mint,
+          },
+        },
+      ],
+    },
+  ]);
+
+  if (!Array.isArray(accounts)) return [];
+
+  return accounts
+    .map((entry) => decodePoolAccount(entry.pubkey, entry.account))
+    .filter(Boolean);
+}
 
 async function getTokenDecimals(mint) {
-  try {
-    const result =
-      await rpc("getTokenSupply", [
-        mint,
-      ]);
+  const result = await getAccountInfo(mint);
+  const data = parseBase64Account(result?.value);
 
-    return Number(
-      result.value.decimals
-    );
-  } catch (error) {
-    logEvent(
-      "token_decimals_error",
-      {
-        mint,
-        error: error.message,
-      }
-    );
-
-    return 6;
+  if (!data || data.length < 45) {
+    throw new Error(`Impossible de lire les décimales du mint ${mint}`);
   }
+
+  return data[44];
+}
+
+async function getVaultRawAmount(address) {
+  const result = await getAccountInfo(address);
+  const data = parseBase64Account(result?.value);
+
+  if (!data) {
+    throw new Error(`Compte de réserve introuvable: ${address}`);
+  }
+
+  const amount = readTokenAmount(data);
+
+  if (amount === null) {
+    throw new Error(`Compte de réserve invalide: ${address}`);
+  }
+
+  return amount;
+}
+
+async function getSolPoolCandidates(mint) {
+  const [baseCandidates, quoteCandidates] = await Promise.all([
+    getPoolsByMintOffset(mint, POOL_BASE_MINT_OFFSET),
+    getPoolsByMintOffset(mint, POOL_QUOTE_MINT_OFFSET),
+  ]);
+
+  const combined = new Map();
+
+  for (const pool of [...baseCandidates, ...quoteCandidates]) {
+    if (!pool || !pool.poolAddress) continue;
+
+    const validOrientation =
+      (pool.baseMint === mint && isWsolMint(pool.quoteMint)) ||
+      (pool.quoteMint === mint && isWsolMint(pool.baseMint));
+
+    // IMPORTANT : les pools USDC et les autres quotes sont rejetés ici.
+    if (!validOrientation) continue;
+
+    combined.set(pool.poolAddress, pool);
+  }
+
+  return [...combined.values()];
+}
+
+async function findPoolWithRpc(mint) {
+  log("Recherche RPC de pools PumpSwap SOL pour", mint);
+
+  const candidates = await getSolPoolCandidates(mint);
+
+  if (candidates.length === 0) {
+    throw new Error(
+      "Aucun pool PumpSwap SOL/WSOL trouvé pour ce token. " +
+      "Les pools USDC et autres quotes ont été ignorés."
+    );
+  }
+
+  // Le pool avec la réserve WSOL la plus élevée est retenu.
+  // Cela évite de sélectionner un pool USDC par erreur.
+  const scored = await Promise.all(
+    candidates.map(async (pool) => {
+      try {
+        const tokenIsBase = pool.baseMint === mint;
+        const candidateTokenVault = tokenIsBase
+          ? pool.baseVault
+          : pool.quoteVault;
+        const candidateSolVault = tokenIsBase
+          ? pool.quoteVault
+          : pool.baseVault;
+
+        const solRaw = await getVaultRawAmount(candidateSolVault);
+
+        return {
+          ...pool,
+          tokenIsBase,
+          tokenVault: candidateTokenVault,
+          solVault: candidateSolVault,
+          solRaw,
+        };
+      } catch (error) {
+        log(
+          "Pool ignoré, lecture de réserve impossible:",
+          pool.poolAddress,
+          error.message
+        );
+        return null;
+      }
+    })
+  );
+
+  const valid = scored.filter(Boolean);
+
+  if (valid.length === 0) {
+    throw new Error(
+      "Pools PumpSwap SOL trouvés, mais leurs réserves WSOL sont illisibles."
+    );
+  }
+
+  valid.sort((a, b) => {
+    if (a.solRaw > b.solRaw) return -1;
+    if (a.solRaw < b.solRaw) return 1;
+    return 0;
+  });
+
+  const selected = valid[0];
+
+  log(
+    "Pool SOL sélectionné via RPC:",
+    selected.poolAddress,
+    "réserve WSOL brute:",
+    selected.solRaw.toString()
+  );
+
+  return {
+    poolAddress: selected.poolAddress,
+    pool: selected,
+  };
+}
+
+async function discoverPool(mint) {
+  try {
+    const result = await findPoolWithDexScreener(mint);
+
+    log("Pool PumpSwap SOL trouvé via DexScreener:", result.poolAddress);
+
+    return {
+      poolAddress: result.poolAddress,
+      dexPair: result.dexPair,
+    };
+  } catch (error) {
+    log(
+      "Découverte DexScreener indisponible ou sans pool SOL:",
+      error.message
+    );
+  }
+
+  // DexScreener n'est pas indispensable à la découverte du pool.
+  return findPoolWithRpc(mint);
 }
 
 // ============================================================
-// DEX DATA
+// POOL INITIALIZATION
+// ============================================================
+
+async function initializePool(mint, poolAddress) {
+  const result = await getAccountInfo(poolAddress);
+  const decoded = decodePoolAccount(poolAddress, result?.value);
+
+  if (!decoded) {
+    throw new Error(
+      `Impossible de décoder le compte du pool PumpSwap ${poolAddress}`
+    );
+  }
+
+  const tokenIsBase = decoded.baseMint === mint;
+  const tokenIsQuote = decoded.quoteMint === mint;
+
+  if (!tokenIsBase && !tokenIsQuote) {
+    throw new Error("Le pool trouvé ne contient pas le token demandé.");
+  }
+
+  const quoteIsSol =
+    (tokenIsBase && isWsolMint(decoded.quoteMint)) ||
+    (tokenIsQuote && isWsolMint(decoded.baseMint));
+
+  if (!quoteIsSol) {
+    throw new Error(
+      `Pool non accepté : quoteMint/baseMint n'est pas WSOL. ` +
+      `baseMint=${decoded.baseMint}, quoteMint=${decoded.quoteMint}`
+    );
+  }
+
+  const selectedTokenVault = tokenIsBase
+    ? decoded.baseVault
+    : decoded.quoteVault;
+
+  const selectedSolVault = tokenIsBase
+    ? decoded.quoteVault
+    : decoded.baseVault;
+
+  const decimals = await getTokenDecimals(mint);
+
+  // Vérifie que les deux comptes de réserve sont lisibles.
+  const [tokenRaw, solRaw] = await Promise.all([
+    getVaultRawAmount(selectedTokenVault),
+    getVaultRawAmount(selectedSolVault),
+  ]);
+
+  return {
+    poolAddress,
+    baseMint: decoded.baseMint,
+    quoteMint: decoded.quoteMint,
+    baseVault: decoded.baseVault,
+    quoteVault: decoded.quoteVault,
+    tokenVault: selectedTokenVault,
+    solVault: selectedSolVault,
+    tokenDecimals: decimals,
+    tokenIsBase: tokenIsBase,
+    initialTokenRaw: tokenRaw,
+    initialSolRaw: solRaw,
+  };
+}
+
+// ============================================================
+// DEX DATA REFRESH
 // ============================================================
 
 async function updateDexData() {
-  if (
-    !state.currentPool
-  ) {
+  if (!armed || !currentPool) return;
+
+  const now = Date.now();
+
+  if (now < dexBlockedUntil) {
+    dexUnavailable = true;
+    dexLastError = "DexScreener en pause après limitation de débit";
     return;
   }
+
+  if (now - dexLastRequestAt < DEX_CACHE_TTL_MS) {
+    return;
+  }
+
+  dexLastRequestAt = now;
 
   try {
-    const data =
-      await dexFetch(
-        `https://api.dexscreener.com/latest/dex/pairs/solana/${state.currentPool}`
-      );
+    const url =
+      `https://api.dexscreener.com/latest/dex/pairs/solana/${currentPool}`;
 
-    const pair =
-      data?.pair || null;
+    const json = await dexFetch(url);
+    const pairs = Array.isArray(json?.pairs) ? json.pairs : [];
+
+    const pair = pairs.find((item) => {
+      if (!item || item.chainId !== "solana") return false;
+      if (String(item.dexId || "").toLowerCase() !== "pumpswap") {
+        return false;
+      }
+
+      const base = item.baseToken?.address;
+      const quote = item.quoteToken?.address;
+
+      return (
+        (base === currentMint && isWsolMint(quote)) ||
+        (quote === currentMint && isWsolMint(base))
+      );
+    });
 
     if (!pair) {
-      return;
+      throw new Error("Pair SOL/WSOL non trouvée dans la réponse DexScreener");
     }
 
-    state.dex.priceUsd =
-      safeNumber(pair.priceUsd);
-
-    state.dex.liquidityUsd =
-      safeNumber(
-        pair.liquidity?.usd
-      );
-
-    state.dex.pairAddress =
-      pair.pairAddress ||
-      state.currentPool;
-
-    state.dex.updatedAt =
-      Date.now();
-
-    state.dexCache.market = {
-      priceUsd: state.dex.priceUsd,
-      liquidityUsd:
-        state.dex.liquidityUsd,
-      pairAddress:
-        state.dex.pairAddress,
-    };
-
-    state.dexCache.lastSuccessAt =
-      Date.now();
-
-    logEvent(
-      "dex_update",
-      {
-        pool: state.currentPool,
-        priceUsd:
-          state.dex.priceUsd,
-        liquidityUsd:
-          state.dex.liquidityUsd,
-      }
-    );
+    dexData = normalizeDexPair(pair);
+    dexCacheAt = Date.now();
+    dexUnavailable = false;
+    dexLastError = null;
   } catch (error) {
-    // --------------------------------------------------------
-    // IMPORTANT :
-    // Un 429 DexScreener ne doit PAS arrêter Crash Guard.
-    // On conserve simplement la dernière valeur valide.
-    // --------------------------------------------------------
+    dexUnavailable = true;
+    dexLastError = error.message;
 
-    logEvent(
-      "dex_update_failed",
-      {
-        pool: state.currentPool,
-        error: error.message,
-        cachedPriceUsd:
-          state.dex.priceUsd,
-        cachedLiquidityUsd:
-          state.dex.liquidityUsd,
-      }
-    );
+    // Ne pas supprimer les dernières données valides en cas de 429.
+    if (error.status !== 429) {
+      log("Mise à jour DexScreener impossible:", error.message);
+    }
   }
 }
 
 // ============================================================
-// WEBSOCKET SOLANA
+// WEBSOCKET SUBSCRIPTIONS
 // ============================================================
+
+function clearReconnectTimer() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function closeWebSocket() {
+  clearReconnectTimer();
+
+  if (ws) {
+    const old = ws;
+    ws = null;
+
+    try {
+      old.removeAllListeners();
+      old.close();
+    } catch {
+      // Ignorer une fermeture déjà effectuée.
+    }
+  }
+
+  subscriptionIds.clear();
+}
 
 function connectWebSocket() {
-  if (!state.armed) {
+  if (!armed || !tokenVault || !solVault) return;
+
+  clearReconnectTimer();
+
+  try {
+    ws = new WebSocket(RPC_WS);
+  } catch (error) {
+    scheduleReconnect(error.message);
     return;
   }
 
-  if (state.ws) {
-    try {
-      state.ws.close();
-    } catch (_) {}
-  }
+  ws.on("open", () => {
+    reconnectAttempts = 0;
+    log("Crash Guard WebSocket connecté.");
 
-  const socket =
-    new ws(RPC_WS);
-
-  state.ws = socket;
-
-  socket.on("open", () => {
-    logEvent(
-      "websocket_connected",
-      {
-        mint: state.currentMint,
-        pool: state.currentPool,
-      }
-    );
-
-    subscribeVault(
-      socket,
-      "base",
-      state.baseVault
-    );
-
-    subscribeVault(
-      socket,
-      "quote",
-      state.quoteVault
-    );
+    subscribeVault("token", tokenVault);
+    subscribeVault("sol", solVault);
   });
 
-  socket.on("message", (message) => {
-    try {
-      const parsed =
-        JSON.parse(
-          message.toString()
-        );
+  ws.on("message", (buffer) => {
+    handleWebSocketMessage(buffer.toString());
+  });
 
-      handleWebSocketMessage(parsed);
-    } catch (error) {
-      logEvent(
-        "websocket_message_error",
-        {
-          error: error.message,
-        }
-      );
+  ws.on("error", (error) => {
+    log("WebSocket:", error.message);
+  });
+
+  ws.on("close", () => {
+    if (ws) ws = null;
+    subscriptionIds.clear();
+
+    if (armed) {
+      scheduleReconnect("WebSocket fermé");
     }
-  });
-
-  socket.on("close", () => {
-    logEvent(
-      "websocket_closed"
-    );
-
-    if (state.armed) {
-      setTimeout(() => {
-        if (state.armed) {
-          connectWebSocket();
-        }
-      }, 3000);
-    }
-  });
-
-  socket.on("error", (error) => {
-    logEvent(
-      "websocket_error",
-      {
-        error:
-          error.message,
-      }
-    );
   });
 }
 
-function subscribeVault(
-  socket,
-  type,
-  address
-) {
-  if (!address) {
-    return;
-  }
+function subscribeVault(kind, address) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-  const id =
-    Date.now() +
-    Math.floor(
-      Math.random() * 1000
-    );
+  const requestId = kind === "token" ? 101 : 102;
 
-  state.subscriptions[id] =
-    type;
-
-  socket.send(
+  ws.send(
     JSON.stringify({
       jsonrpc: "2.0",
-      id,
-
-      method:
-        "accountSubscribe",
-
+      id: requestId,
+      method: "accountSubscribe",
       params: [
         address,
-
         {
           encoding: "base64",
-          commitment:
-            "confirmed",
+          commitment: "confirmed",
         },
       ],
     })
   );
+
+  subscriptionIds.set(requestId, kind);
 }
 
-// ============================================================
-// VAULT DECODING
-// ============================================================
+function scheduleReconnect(reason) {
+  if (!armed || reconnectTimer) return;
 
-function decodeTokenVault(
-  base64
-) {
-  const buffer =
-    Buffer.from(
-      base64,
-      "base64"
-    );
+  reconnectAttempts += 1;
 
-  // SPL Token account:
-  // amount = uint64 à l'offset 64
-  if (buffer.length < 72) {
-    return null;
-  }
+  const delay = Math.min(
+    30000,
+    1000 * Math.pow(2, Math.min(reconnectAttempts - 1, 5))
+  );
 
-  return buffer.readBigUInt64LE(64);
+  log(
+    `Reconnexion WebSocket dans ${delay} ms (${reason}).`
+  );
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (armed) connectWebSocket();
+  }, delay);
 }
 
-function handleWebSocketMessage(message) {
-  if (
-    message.method ===
-    "accountNotification"
-  ) {
-    const subscription =
-      message.params?.subscription;
+function handleWebSocketMessage(text) {
+  let message;
 
-    const result =
-      message.params?.result;
-
-    if (!subscription || !result) {
-      return;
-    }
-
-    const type =
-      state.subscriptions[
-        subscription
-      ];
-
-    if (!type) {
-      return;
-    }
-
-    const value =
-      result.value;
-
-    const encoded =
-      value?.data?.[0];
-
-    if (
-      !encoded ||
-      value?.data?.[1] !==
-        "base64"
-    ) {
-      return;
-    }
-
-    const amount =
-      decodeTokenVault(
-        encoded
-      );
-
-    if (amount === null) {
-      return;
-    }
-
-    if (type === "base") {
-      state.vaultAmounts.base =
-        amount;
-    }
-
-    if (type === "quote") {
-      state.vaultAmounts.quote =
-        amount;
-    }
+  try {
+    message = JSON.parse(text);
+  } catch {
+    return;
   }
 
-  if (
-    message.result &&
-    typeof message.id ===
-      "number"
-  ) {
-    const type =
-      state.subscriptions[
-        message.id
-      ];
+  if (message.id !== undefined && message.result !== undefined) {
+    const kind = subscriptionIds.get(message.id);
 
-    if (
-      type &&
-      typeof message.result ===
-        "number"
-    ) {
-      state.subscriptions[
-        message.result
-      ] = type;
-
-      delete state.subscriptions[
-        message.id
-      ];
+    if (kind) {
+      subscriptionIds.set(message.result, kind);
+      subscriptionIds.delete(message.id);
     }
+
+    return;
+  }
+
+  if (message.method !== "accountNotification") return;
+
+  const subscription = message.params?.subscription;
+  const kind = subscriptionIds.get(subscription);
+
+  if (!kind) return;
+
+  const account = message.params?.result?.value;
+  const data = parseBase64Account(account);
+
+  if (!data) return;
+
+  const amount = readTokenAmount(data);
+
+  if (amount === null) return;
+
+  if (kind === "token") {
+    vaultAmounts.token = amount;
+  } else if (kind === "sol") {
+    vaultAmounts.sol = amount;
   }
 }
 
 // ============================================================
-// SNAPSHOT
+// ON-CHAIN SNAPSHOTS AND CLASSIFICATION
 // ============================================================
+
+async function refreshVaultAmounts() {
+  const [tokenRaw, solRaw] = await Promise.all([
+    getVaultRawAmount(tokenVault),
+    getVaultRawAmount(solVault),
+  ]);
+
+  vaultAmounts.token = tokenRaw;
+  vaultAmounts.sol = solRaw;
+}
 
 function createSnapshot() {
-  if (
-    state.vaultAmounts.base ===
-      null ||
-    state.vaultAmounts.quote ===
-      null
-  ) {
+  if (vaultAmounts.token === null || vaultAmounts.sol === null) {
     return null;
   }
 
-  const baseRaw =
-    state.vaultAmounts.base;
+  const now = Date.now();
 
-  const quoteRaw =
-    state.vaultAmounts.quote;
+  const tokenReserve = rawToNumber(
+    vaultAmounts.token,
+    tokenDecimals
+  );
 
-  const base =
-    Number(baseRaw) /
-    Math.pow(
-      10,
-      state.baseDecimals
-    );
-
-  const quote =
-    Number(quoteRaw) /
-    Math.pow(
-      10,
-      state.quoteDecimals
-    );
+  const solReserve = rawToNumber(vaultAmounts.sol, 9);
 
   if (
-    !Number.isFinite(base) ||
-    !Number.isFinite(quote) ||
-    base <= 0 ||
-    quote <= 0
+    !Number.isFinite(tokenReserve) ||
+    !Number.isFinite(solReserve) ||
+    tokenReserve <= 0 ||
+    solReserve <= 0
   ) {
     return null;
   }
-
-  const timestamp =
-    Date.now();
-
-  const price =
-    quote / base;
 
   return {
-    timestamp,
-
-    baseReserve: base,
-    quoteReserve: quote,
-
-    price,
-
-    dexPriceUsd:
-      state.dex.priceUsd,
-
-    dexLiquidityUsd:
-      state.dex.liquidityUsd,
+    timestamp: now,
+    tokenReserve,
+    solReserve,
+    tokenRaw: vaultAmounts.token.toString(),
+    solRaw: vaultAmounts.sol.toString(),
+    dexPriceUsd: dexData?.priceUsd ?? null,
+    dexLiquidityUsd: dexData?.liquidityUsd ?? null,
+    dexUnavailable,
+    dexLastError,
   };
 }
 
-// ============================================================
-// ANALYSE
-// ============================================================
-
-function getSnapshotAgo(
-  milliseconds
-) {
-  if (!state.history.length) {
-    return null;
-  }
-
-  const target =
-    Date.now() -
-    milliseconds;
-
-  let closest = null;
-
-  for (
-    let i =
-      state.history.length - 1;
-    i >= 0;
-    i--
-  ) {
-    const item =
-      state.history[i];
-
-    if (
-      item.timestamp <=
-      target
-    ) {
-      closest = item;
-      break;
+function getSnapshotAtOrBefore(targetTimestamp) {
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    if (history[i].timestamp <= targetTimestamp) {
+      return history[i];
     }
   }
 
-  return closest;
+  return null;
 }
 
-function analyzeSnapshot(
-  current
-) {
-  const fiveSec =
-    getSnapshotAgo(5000);
+function analyzeSnapshot(snapshot) {
+  const fiveSecondsAgo = getSnapshotAtOrBefore(
+    snapshot.timestamp - 5000
+  );
 
-  const tenSec =
-    getSnapshotAgo(10000);
+  const tenSecondsAgo = getSnapshotAtOrBefore(
+    snapshot.timestamp - 10000
+  );
 
-  if (!fiveSec || !tenSec) {
-    return null;
-  }
+  const token5 = fiveSecondsAgo
+    ? percentChange(
+        fiveSecondsAgo.tokenReserve,
+        snapshot.tokenReserve
+      )
+    : null;
 
-  const price5s =
-    pctChange(
-      fiveSec.price,
-      current.price
-    );
+  const token10 = tenSecondsAgo
+    ? percentChange(
+        tenSecondsAgo.tokenReserve,
+        snapshot.tokenReserve
+      )
+    : null;
 
-  const price10s =
-    pctChange(
-      tenSec.price,
-      current.price
-    );
+  const sol5 = fiveSecondsAgo
+    ? percentChange(
+        fiveSecondsAgo.solReserve,
+        snapshot.solReserve
+      )
+    : null;
 
-  const quote5s =
-    pctChange(
-      fiveSec.quoteReserve,
-      current.quoteReserve
-    );
-
-  const quote10s =
-    pctChange(
-      tenSec.quoteReserve,
-      current.quoteReserve
-    );
-
-  const base5s =
-    pctChange(
-      fiveSec.baseReserve,
-      current.baseReserve
-    );
-
-  const base10s =
-    pctChange(
-      tenSec.baseReserve,
-      current.baseReserve
-    );
+  const sol10 = tenSecondsAgo
+    ? percentChange(
+        tenSecondsAgo.solReserve,
+        snapshot.solReserve
+      )
+    : null;
 
   return {
-    price5s,
-    price10s,
-
-    quote5s,
-    quote10s,
-
-    base5s,
-    base10s,
-
-    dexPriceUsd:
-      current.dexPriceUsd,
-
-    dexLiquidityUsd:
-      current.dexLiquidityUsd,
+    tokenChange5s: token5,
+    tokenChange10s: token10,
+    solChange5s: sol5,
+    solChange10s: sol10,
+    historyReady: Boolean(fiveSecondsAgo && tenSecondsAgo),
   };
 }
-
-// ============================================================
-// CLASSIFICATION
-// ============================================================
 
 function classify(metrics) {
-  if (!metrics) {
-    return "WATCH";
+  if (!metrics.historyReady) {
+    return "NORMAL";
   }
 
-  // CRITICAL sticky
-  if (state.criticalLatched) {
+  const changes = [
+    metrics.tokenChange5s,
+    metrics.tokenChange10s,
+    metrics.solChange5s,
+    metrics.solChange10s,
+  ].filter((value) => value !== null && Number.isFinite(value));
+
+  if (changes.length === 0) return "NORMAL";
+
+  const worst5 = Math.min(
+    metrics.tokenChange5s ?? 0,
+    metrics.solChange5s ?? 0
+  );
+
+  const worst10 = Math.min(
+    metrics.tokenChange10s ?? 0,
+    metrics.solChange10s ?? 0
+  );
+
+  if (
+    criticalLatched ||
+    worst5 <= CRITICAL_DROP_5S ||
+    worst10 <= CRITICAL_DROP_10S
+  ) {
+    criticalLatched = true;
     return "CRITICAL";
   }
 
-  const critical =
-    (
-      metrics.price5s !== null &&
-      metrics.price5s <=
-        CRITICAL_DROP_5S
-    ) ||
-    (
-      metrics.price10s !== null &&
-      metrics.price10s <=
-        CRITICAL_DROP_10S
-    ) ||
-    (
-      metrics.quote5s !== null &&
-      metrics.quote5s <=
-        CRITICAL_DROP_5S
-    ) ||
-    (
-      metrics.quote10s !== null &&
-      metrics.quote10s <=
-        CRITICAL_DROP_10S
-    ) ||
-    (
-      metrics.base5s !== null &&
-      metrics.base5s <=
-        CRITICAL_DROP_5S
-    ) ||
-    (
-      metrics.base10s !== null &&
-      metrics.base10s <=
-        CRITICAL_DROP_10S
-    );
-
-  if (critical) {
-    state.criticalLatched = true;
-
-    return "CRITICAL";
+  if (
+    worst5 <= DANGER_DROP_5S ||
+    worst10 <= DANGER_DROP_10S
+  ) {
+    dangerUntil = Date.now() + DANGER_HOLD_MS;
+    return "DANGER";
   }
 
-  const danger =
-    (
-      metrics.price5s !== null &&
-      metrics.price5s <=
-        DANGER_DROP_5S
-    ) ||
-    (
-      metrics.price10s !== null &&
-      metrics.price10s <=
-        DANGER_DROP_10S
-    ) ||
-    (
-      metrics.quote5s !== null &&
-      metrics.quote5s <=
-        DANGER_DROP_5S
-    ) ||
-    (
-      metrics.quote10s !== null &&
-      metrics.quote10s <=
-        DANGER_DROP_10S
-    ) ||
-    (
-      metrics.base5s !== null &&
-      metrics.base5s <=
-        DANGER_DROP_5S
-    ) ||
-    (
-      metrics.base10s !== null &&
-      metrics.base10s <=
-        DANGER_DROP_10S
-    );
-
-  if (danger) {
-    state.dangerUntil =
-      Date.now() +
-      DANGER_HOLD_MS;
-
+  if (Date.now() < dangerUntil) {
     return "DANGER";
   }
 
   if (
-    Date.now() <
-    state.dangerUntil
+    worst5 <= WATCH_DROP_5S ||
+    worst10 <= WATCH_DROP_10S
   ) {
-    return "DANGER";
-  }
-
-  const watch =
-    (
-      metrics.price5s !== null &&
-      metrics.price5s <=
-        WATCH_DROP_5S
-    ) ||
-    (
-      metrics.price10s !== null &&
-      metrics.price10s <=
-        WATCH_DROP_10S
-    ) ||
-    (
-      metrics.quote5s !== null &&
-      metrics.quote5s <=
-        WATCH_DROP_5S
-    ) ||
-    (
-      metrics.quote10s !== null &&
-      metrics.quote10s <=
-        WATCH_DROP_10S
-    ) ||
-    (
-      metrics.base5s !== null &&
-      metrics.base5s <=
-        WATCH_DROP_5S
-    ) ||
-    (
-      metrics.base10s !== null &&
-      metrics.base10s <=
-        WATCH_DROP_10S
-    );
-
-  if (watch) {
     return "WATCH";
   }
 
-  return "WATCH";
+  return "NORMAL";
 }
 
 // ============================================================
-// SIGNAL
+// SIGNALS
 // ============================================================
 
-function buildSignal(
-  level,
-  metrics
-) {
-  state.eventId += 1;
-
+function buildSignal(nextLevel, snapshot, metrics) {
   return {
-    id:
-      state.eventId,
-
-    timestamp:
-      new Date().toISOString(),
-
-    level,
-
-    mint:
-      state.currentMint,
-
-    pool:
-      state.currentPool,
-
+    id: `${currentMint}-${Date.now()}-${++eventId}`,
+    level: nextLevel,
+    mint: currentMint,
+    pool: currentPool,
+    timestamp: new Date().toISOString(),
     onchain: {
-      price5s:
-        metrics?.price5s ?? null,
-
-      price10s:
-        metrics?.price10s ?? null,
-
-      quote5s:
-        metrics?.quote5s ?? null,
-
-      quote10s:
-        metrics?.quote10s ?? null,
-
-      base5s:
-        metrics?.base5s ?? null,
-
-      base10s:
-        metrics?.base10s ?? null,
+      tokenReserve: snapshot.tokenReserve,
+      solReserve: snapshot.solReserve,
+      tokenChange5s: metrics.tokenChange5s,
+      tokenChange10s: metrics.tokenChange10s,
+      solChange5s: metrics.solChange5s,
+      solChange10s: metrics.solChange10s,
     },
-
-    dex: {
-      priceUsd:
-        state.dex.priceUsd,
-
-      liquidityUsd:
-        state.dex.liquidityUsd,
-
-      updatedAt:
-        state.dex.updatedAt,
-    },
+    dex: dexData
+      ? {
+          priceUsd: dexData.priceUsd,
+          liquidityUsd: dexData.liquidityUsd,
+          volume24hUsd: dexData.volume24hUsd,
+          priceChange5m: dexData.priceChange5m,
+          updatedAt: dexData.updatedAt,
+          stale: Date.now() - dexCacheAt > DEX_CACHE_TTL_MS,
+        }
+      : null,
+    dexUnavailable,
+    dexLastError,
   };
 }
 
-// ============================================================
-// TELEGRAM
-// ============================================================
+async function sendTelegram(text) {
+  if (!BOT_TOKEN || !CHAT_ID) return;
 
-async function sendTelegram(
-  text
-) {
-  if (
-    !BOT_TOKEN ||
-    !CHAT_ID
-  ) {
+  try {
+    await fetchJson(
+      `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          chat_id: CHAT_ID,
+          text,
+          disable_web_page_preview: true,
+        }),
+      },
+      HTTP_TIMEOUT_MS
+    );
+  } catch (error) {
+    log("Telegram envoi impossible:", error.message);
+  }
+}
+
+async function sendSignalToV51(signal) {
+  if (!CRASH_GUARD_TARGET_URL || !CRASH_GUARD_SECRET) {
+    log("Signal non transmis : URL ou secret Crash Guard manquant.");
     return;
   }
 
   try {
-    const response =
-      await fetch(
-        `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-        {
-          method: "POST",
-
-          headers: {
-            "content-type":
-              "application/json",
-          },
-
-          body: JSON.stringify({
-            chat_id: CHAT_ID,
-            text,
-            disable_web_page_preview:
-              true,
-          }),
-        }
-      );
-
-    if (!response.ok) {
-      logEvent(
-        "telegram_error",
-        {
-          status:
-            response.status,
-        }
-      );
-    }
-  } catch (error) {
-    logEvent(
-      "telegram_exception",
+    await fetchJson(
+      `${CRASH_GUARD_TARGET_URL}/crash-guard/event`,
       {
-        error:
-          error.message,
-      }
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-crash-guard-secret": CRASH_GUARD_SECRET,
+        },
+        body: JSON.stringify(signal),
+      },
+      HTTP_TIMEOUT_MS
     );
+  } catch (error) {
+    log("Transmission du signal à V5.1 impossible:", error.message);
   }
 }
 
 function formatPercent(value) {
-  if (
-    value === null ||
-    value === undefined ||
-    !Number.isFinite(value)
-  ) {
-    return "N/A";
-  }
-
-  return `${value.toFixed(2)}%`;
+  return value === null || value === undefined
+    ? "N/D"
+    : `${value.toFixed(2)} %`;
 }
 
-async function notifyLevel(
-  signal
-) {
-  let emoji = "👀";
+async function applyLevel(nextLevel, snapshot, metrics) {
+  const previousLevel = level;
 
-  if (signal.level === "DANGER") {
-    emoji = "⚠️";
-  }
+  if (nextLevel === previousLevel) return;
 
-  if (signal.level === "CRITICAL") {
-    emoji = "🚨";
+  level = nextLevel;
+
+  const signal = buildSignal(nextLevel, snapshot, metrics);
+  lastSignal = signal;
+
+  if (nextLevel === "NORMAL") {
+    log("Niveau revenu à NORMAL.");
+    return;
   }
 
   const text =
-`${emoji} CRASH GUARD ${signal.level}
+    `🚨 CRASH GUARD : ${nextLevel}\n` +
+    `Token : ${currentMint}\n` +
+    `Pool : ${currentPool}\n` +
+    `Réserve token, 5 s : ${formatPercent(metrics.tokenChange5s)}\n` +
+    `Réserve token, 10 s : ${formatPercent(metrics.tokenChange10s)}\n` +
+    `Réserve WSOL, 5 s : ${formatPercent(metrics.solChange5s)}\n` +
+    `Réserve WSOL, 10 s : ${formatPercent(metrics.solChange10s)}\n` +
+    `Prix DexScreener : ${
+      dexData?.priceUsd == null ? "N/D" : `$${dexData.priceUsd}`
+    }\n` +
+    `Liquidité DexScreener : ${
+      dexData?.liquidityUsd == null
+        ? "N/D"
+        : `$${dexData.liquidityUsd}`
+    }\n` +
+    `Données DEX indisponibles : ${dexUnavailable ? "oui" : "non"}`;
 
-Token:
-${signal.mint}
-
-Pool:
-${signal.pool}
-
-On-chain 5s:
-Prix ${formatPercent(signal.onchain.price5s)}
-Quote ${formatPercent(signal.onchain.quote5s)}
-
-On-chain 10s:
-Prix ${formatPercent(signal.onchain.price10s)}
-Quote ${formatPercent(signal.onchain.quote10s)}
-
-DEX:
-Prix ${signal.dex.priceUsd ?? "N/A"}
-Liquidité ${signal.dex.liquidityUsd ?? "N/A"}
-
-ID:
-${signal.id}`;
+  log(text.replace(/\n/g, " | "));
 
   await sendTelegram(text);
-}
 
-// ============================================================
-// COMMUNICATION V5.1
-// ============================================================
-
-async function sendSignalToV51(
-  signal
-) {
-  if (
-    !CRASH_GUARD_TARGET_URL ||
-    !CRASH_GUARD_SECRET
-  ) {
-    logEvent(
-      "v51_signal_skipped",
-      {
-        reason:
-          "CRASH_GUARD_TARGET_URL ou CRASH_GUARD_SECRET absent",
-      }
-    );
-
-    return;
-  }
-
-  const controller =
-    new AbortController();
-
-  const timer =
-    setTimeout(
-      () =>
-        controller.abort(),
-      HTTP_TIMEOUT_MS
-    );
-
-  try {
-    const response =
-      await fetch(
-        `${CRASH_GUARD_TARGET_URL}/crash-guard/event`,
-        {
-          method: "POST",
-
-          headers: {
-            "content-type":
-              "application/json",
-
-            "x-crash-guard-secret":
-              CRASH_GUARD_SECRET,
-          },
-
-          body:
-            JSON.stringify(signal),
-
-          signal:
-            controller.signal,
-        }
-      );
-
-    const text =
-      await response.text();
-
-    logEvent(
-      "v51_signal_sent",
-      {
-        level:
-          signal.level,
-
-        status:
-          response.status,
-
-        response:
-          text.slice(0, 500),
-      }
-    );
-  } catch (error) {
-    logEvent(
-      "v51_signal_failed",
-      {
-        level:
-          signal.level,
-
-        error:
-          error.message,
-      }
-    );
-  } finally {
-    clearTimeout(timer);
+  if (nextLevel === "DANGER" || nextLevel === "CRITICAL") {
+    await sendSignalToV51(signal);
   }
 }
 
 // ============================================================
-// APPLICATION DU NIVEAU
+// SAMPLING
 // ============================================================
 
-async function applyLevel(
-  level,
-  metrics
-) {
-  const previous =
-    state.level;
-
-  state.level =
-    level;
-
-  // Aucun changement
-  if (
-    previous === level &&
-    level !== "CRITICAL"
-  ) {
-    return;
-  }
-
-  const signal =
-    buildSignal(
-      level,
-      metrics
-    );
-
-  state.lastSignal =
-    signal;
-
-  logEvent(
-    "crash_guard_level",
-    {
-      previous,
-      level,
-      signal,
-    }
-  );
-
-  // WATCH = information seulement
-  if (
-    level === "WATCH"
-  ) {
-    await notifyLevel(
-      signal
-    );
-
-    return;
-  }
-
-  // DANGER = bloque les nouveaux achats
-  if (
-    level === "DANGER"
-  ) {
-    await notifyLevel(
-      signal
-    );
-
-    await sendSignalToV51(
-      signal
-    );
-
-    return;
-  }
-
-  // CRITICAL = bloque + sortie d'urgence
-  if (
-    level === "CRITICAL"
-  ) {
-    await notifyLevel(
-      signal
-    );
-
-    await sendSignalToV51(
-      signal
-    );
-
-    return;
-  }
-}
-
-// ============================================================
-// SAMPLE ON-CHAIN
-// ============================================================
+let sampleInProgress = false;
 
 async function sampleOnChain() {
-  if (!state.armed) {
-    return;
-  }
+  if (!armed || sampleInProgress) return;
 
-  const snapshot =
-    createSnapshot();
+  sampleInProgress = true;
 
-  if (!snapshot) {
-    return;
-  }
+  try {
+    // Le WebSocket apporte les changements rapidement.
+    // Le RPC périodique maintient les réserves à jour si le WS décroche.
+    if (
+      vaultAmounts.token === null ||
+      vaultAmounts.sol === null ||
+      !ws ||
+      ws.readyState !== WebSocket.OPEN
+    ) {
+      await refreshVaultAmounts();
+    }
 
-  state.history.push(
-    snapshot
-  );
+    const snapshot = createSnapshot();
+    if (!snapshot) return;
 
-  while (
-    state.history.length >
-    HISTORY_MAX
-  ) {
-    state.history.shift();
-  }
+    history.push(snapshot);
 
-  const metrics =
-    analyzeSnapshot(
-      snapshot
+    const cutoff = Date.now() - HISTORY_MAX * 1000;
+
+    history = history.filter(
+      (item) => item.timestamp >= cutoff
     );
 
-  if (!metrics) {
-    return;
+    const metrics = analyzeSnapshot(snapshot);
+
+    if (!metrics.historyReady) return;
+
+    const nextLevel = classify(metrics);
+
+    await applyLevel(nextLevel, snapshot, metrics);
+  } catch (error) {
+    log("Échantillonnage on-chain impossible:", error.message);
+  } finally {
+    sampleInProgress = false;
   }
-
-  const level =
-    classify(metrics);
-
-  await applyLevel(
-    level,
-    metrics
-  );
 }
 
 // ============================================================
-// ARM
+// ARM / DISARM
 // ============================================================
 
 async function arm(mint) {
-  if (!mint) {
-    throw new Error(
-      "Mint manquant"
-    );
+  if (starting) {
+    throw new Error("Un démarrage Crash Guard est déjà en cours.");
   }
 
-  // Désarme proprement avant de réarmer
-  if (state.armed) {
-    await disarm();
+  if (!validateMint(mint)) {
+    throw new Error("Adresse de token Solana invalide.");
   }
 
-  logEvent(
-    "arm_start",
-    {
-      mint,
-    }
-  );
-
-  // ----------------------------------------------------------
-  // Recherche du pool
-  // ----------------------------------------------------------
-
-  const pool =
-    await findPumpSwapPool(
-      mint
-    );
-
-  if (!pool) {
-    throw new Error(
-      "Aucun pool PumpSwap trouvé"
-    );
-  }
-
-  // Crash Guard surveille actuellement
-  // les pools SOL-quoted.
-  if (
-    pool.quoteMint &&
-    pool.quoteMint !== SOL_MINT
-  ) {
-    throw new Error(
-      `Pool trouvé mais quoteMint non-SOL: ${pool.quoteMint}`
-    );
-  }
-
-  state.currentMint =
-    mint;
-
-  state.currentPool =
-    pool.pool;
-
-  // ----------------------------------------------------------
-  // On récupère les données Pool directement on-chain
-  // ----------------------------------------------------------
-
-  const accountInfo =
-    await rpc(
-      "getAccountInfo",
-      [
-        state.currentPool,
-        {
-          encoding: "base64",
-        },
-      ]
-    );
-
-  if (
-    !accountInfo ||
-    !accountInfo.value
-  ) {
-    throw new Error(
-      "Compte Pool introuvable on-chain"
-    );
-  }
-
-  const poolData =
-    Buffer.from(
-      accountInfo.value.data[0],
-      "base64"
-    );
-
-  const decoded =
-    decodePoolAccount(
-      poolData
-    );
-
-  state.baseMint =
-    decoded.baseMint;
-
-  state.quoteMint =
-    decoded.quoteMint;
-
-  state.baseVault =
-    decoded.baseVault;
-
-  state.quoteVault =
-    decoded.quoteVault;
-
-  // ----------------------------------------------------------
-  // Vérification orientation
-  // ----------------------------------------------------------
-
-  if (
-    state.baseMint !==
-      mint &&
-    state.quoteMint !==
-      mint
-  ) {
-    throw new Error(
-      "Le pool trouvé ne correspond pas au mint demandé"
-    );
-  }
-
-  if (
-    state.quoteMint !==
-    SOL_MINT
-  ) {
-    throw new Error(
-      `Le pool n'est pas SOL-quoted. quoteMint=${state.quoteMint}`
-    );
-  }
-
-  // ----------------------------------------------------------
-  // Décimales
-  // ----------------------------------------------------------
-
-  state.baseDecimals =
-    await getTokenDecimals(
-      state.baseMint
-    );
-
-  state.quoteDecimals = 9;
-
-  // ----------------------------------------------------------
-  // RESET
-  // ----------------------------------------------------------
-
-  state.vaultAmounts = {
-    base: null,
-    quote: null,
-  };
-
-  state.history = [];
-
-  state.level =
-    "WATCH";
-
-  state.dangerUntil =
-    0;
-
-  state.criticalLatched =
-    false;
-
-  state.lastSignal =
-    null;
-
-  state.subscriptions =
-    {};
-
-  state.dex = {
-    priceUsd:
-      pool.priceUsd ?? null,
-
-    liquidityUsd:
-      pool.liquidityUsd ?? null,
-
-    pairAddress:
-      pool.pool,
-
-    updatedAt:
-      pool.priceUsd ||
-      pool.liquidityUsd
-        ? Date.now()
-        : 0,
-  };
-
-  state.armed =
-    true;
-
-  // ----------------------------------------------------------
-  // LOG
-  // ----------------------------------------------------------
-
-  logEvent(
-    "armed",
-    {
-      mint:
-        state.currentMint,
-
-      pool:
-        state.currentPool,
-
-      baseMint:
-        state.baseMint,
-
-      quoteMint:
-        state.quoteMint,
-
-      baseVault:
-        state.baseVault,
-
-      quoteVault:
-        state.quoteVault,
-
-      baseDecimals:
-        state.baseDecimals,
-
-      quoteDecimals:
-        state.quoteDecimals,
-
-      poolSource:
-        pool.source,
-    }
-  );
-
-  // ----------------------------------------------------------
-  // WEBSOCKET
-  // ----------------------------------------------------------
-
-  connectWebSocket();
-
-  // ----------------------------------------------------------
-  // DEX initial
-  //
-  // IMPORTANT :
-  // cette opération est NON BLOQUANTE.
-  // Un 429 ne bloque donc plus /starttrade.
-  // ----------------------------------------------------------
-
-  await updateDexData();
-
-  // ----------------------------------------------------------
-  // TIMERS
-  // ----------------------------------------------------------
-
-  state.timers.sample =
-    setInterval(
-      () => {
-        sampleOnChain()
-          .catch((error) => {
-            logEvent(
-              "sample_error",
-              {
-                error:
-                  error.message,
-              }
-            );
-          });
-      },
-      SAMPLE_INTERVAL_MS
-    );
-
-  state.timers.dex =
-    setInterval(
-      () => {
-        updateDexData()
-          .catch((error) => {
-            logEvent(
-              "dex_timer_error",
-              {
-                error:
-                  error.message,
-              }
-            );
-          });
-      },
-      DEX_REFRESH_INTERVAL_MS
-    );
-
-  return {
-    ok: true,
-
-    mint:
-      state.currentMint,
-
-    pool:
-      state.currentPool,
-
-    poolSource:
-      pool.source,
-
-    baseMint:
-      state.baseMint,
-
-    quoteMint:
-      state.quoteMint,
-  };
-}
-
-// ============================================================
-// DISARM
-// ============================================================
-
-async function disarm() {
-  state.armed =
-    false;
-
-  if (
-    state.timers.sample
-  ) {
-    clearInterval(
-      state.timers.sample
-    );
-
-    state.timers.sample =
-      null;
-  }
-
-  if (
-    state.timers.dex
-  ) {
-    clearInterval(
-      state.timers.dex
-    );
-
-    state.timers.dex =
-      null;
-  }
-
-  if (state.ws) {
-    try {
-      state.ws.close();
-    } catch (_) {}
-  }
-
-  state.ws =
-    null;
-
-  state.subscriptions =
-    {};
-
-  state.history =
-    [];
-
-  state.vaultAmounts = {
-    base: null,
-    quote: null,
-  };
-
-  state.currentMint =
-    null;
-
-  state.currentPool =
-    null;
-
-  state.baseMint =
-    null;
-
-  state.quoteMint =
-    null;
-
-  state.baseVault =
-    null;
-
-  state.quoteVault =
-    null;
-
-  state.level =
-    "WATCH";
-
-  state.dangerUntil =
-    0;
-
-  state.criticalLatched =
-    false;
-
-  state.lastSignal =
-    null;
-
-  logEvent(
-    "disarmed"
-  );
-
-  return {
-    ok: true,
-  };
-}
-
-// ============================================================
-// HTTP SERVER
-// ============================================================
-
-function authorized(req) {
-  if (!CRASH_GUARD_SECRET) {
-    return false;
-  }
-
-  const provided =
-    req.headers[
-      "x-crash-guard-secret"
-    ];
-
-  return (
-    typeof provided ===
-      "string" &&
-    provided ===
-      CRASH_GUARD_SECRET
-  );
-}
-
-function sendJson(
-  res,
-  status,
-  body
-) {
-  res.writeHead(
-    status,
-    {
-      "content-type":
-        "application/json; charset=utf-8",
-    }
-  );
-
-  res.end(
-    JSON.stringify(body)
-  );
-}
-
-function readBody(req) {
-  return new Promise(
-    (resolve, reject) => {
-      let body = "";
-
-      req.on(
-        "data",
-        (chunk) => {
-          body += chunk;
-
-          if (
-            body.length >
-            100000
-          ) {
-            reject(
-              new Error(
-                "Body trop volumineux"
-              )
-            );
-
-            req.destroy();
-          }
-        }
-      );
-
-      req.on(
-        "end",
-        () => {
-          try {
-            resolve(
-              body
-                ? JSON.parse(body)
-                : {}
-            );
-          } catch (error) {
-            reject(
-              new Error(
-                "JSON invalide"
-              )
-            );
-          }
-        }
-      );
-
-      req.on(
-        "error",
-        reject
-      );
-    }
-  );
-}
-
-const server =
-  http.createServer(
-    async (req, res) => {
-      try {
-        // ------------------------------------------------------
-        // HEALTH
-        // ------------------------------------------------------
-
-        if (
-          req.method === "GET" &&
-          req.url === "/health"
-        ) {
-          return sendJson(
-            res,
-            200,
-            {
-              ok: true,
-
-              armed:
-                state.armed,
-
-              level:
-                state.level,
-
-              mint:
-                state.currentMint,
-
-              pool:
-                state.currentPool,
-            }
-          );
-        }
-
-        // ------------------------------------------------------
-        // STATE
-        // ------------------------------------------------------
-
-        if (
-          req.method === "GET" &&
-          req.url === "/state"
-        ) {
-          if (
-            !authorized(req)
-          ) {
-            return sendJson(
-              res,
-              401,
-              {
-                ok: false,
-                error:
-                  "Unauthorized",
-              }
-            );
-          }
-
-          return sendJson(
-            res,
-            200,
-            {
-              ok: true,
-
-              armed:
-                state.armed,
-
-              mint:
-                state.currentMint,
-
-              pool:
-                state.currentPool,
-
-              level:
-                state.level,
-
-              criticalLatched:
-                state.criticalLatched,
-
-              dangerUntil:
-                state.dangerUntil,
-
-              lastSignal:
-                state.lastSignal,
-
-              dex:
-                state.dex,
-
-              historyLength:
-                state.history.length,
-            }
-          );
-        }
-
-        // ------------------------------------------------------
-        // DISARM
-        // ------------------------------------------------------
-
-        if (
-          req.method === "POST" &&
-          req.url === "/disarm"
-        ) {
-          if (
-            !authorized(req)
-          ) {
-            return sendJson(
-              res,
-              401,
-              {
-                ok: false,
-                error:
-                  "Unauthorized",
-              }
-            );
-          }
-
-          await disarm();
-
-          return sendJson(
-            res,
-            200,
-            {
-              ok: true,
-            }
-          );
-        }
-
-        // ------------------------------------------------------
-        // ARM
-        // ------------------------------------------------------
-
-        if (
-          req.method === "POST" &&
-          req.url === "/arm"
-        ) {
-          if (
-            !authorized(req)
-          ) {
-            return sendJson(
-              res,
-              401,
-              {
-                ok: false,
-                error:
-                  "Unauthorized",
-              }
-            );
-          }
-
-          const body =
-            await readBody(req);
-
-          if (
-            !body.mint
-          ) {
-            return sendJson(
-              res,
-              400,
-              {
-                ok: false,
-                error:
-                  "mint manquant",
-              }
-            );
-          }
-
-          try {
-            const result =
-              await arm(
-                body.mint
-              );
-
-            return sendJson(
-              res,
-              200,
-              result
-            );
-          } catch (error) {
-            logEvent(
-              "arm_failed",
-              {
-                mint:
-                  body.mint,
-
-                error:
-                  error.message,
-              }
-            );
-
-            return sendJson(
-              res,
-              500,
-              {
-                ok: false,
-                error:
-                  error.message,
-              }
-            );
-          }
-        }
-
-        // ------------------------------------------------------
-        // 404
-        // ------------------------------------------------------
-
-        return sendJson(
-          res,
-          404,
-          {
-            ok: false,
-            error:
-              "Not found",
-          }
-        );
-      } catch (error) {
-        logEvent(
-          "http_error",
-          {
-            error:
-              error.message,
-          }
-        );
-
-        return sendJson(
-          res,
-          500,
-          {
-            ok: false,
-            error:
-              error.message,
-          }
-        );
-      }
-    }
-  );
-
-// ============================================================
-// START
-// ============================================================
-
-server.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-    console.log(
-      `🛡️ Crash Guard démarré sur le port ${PORT}`
-    );
-
-    console.log(
-      `RPC HTTP: ${RPC_HTTP}`
-    );
-
-    console.log(
-      `RPC WS: ${RPC_WS}`
-    );
-
-    console.log(
-      `PumpSwap: ${PUMPSWAP_PROGRAM_ID}`
-    );
-  }
-);
-
-// ============================================================
-// SHUTDOWN
-// ============================================================
-
-async function shutdown(
-  signal
-) {
-  logEvent(
-    "shutdown",
-    {
-      signal,
-    }
-  );
+  starting = true;
 
   try {
     await disarm();
-  } catch (_) {}
 
-  server.close(
-    () => {
-      process.exit(0);
+    log("Armement du Crash Guard pour", mint);
+
+    // La découverte DEX est facultative.
+    // Si DexScreener renvoie 429, la découverte RPC prend le relais.
+    const discovered = await discoverPool(mint);
+
+    if (!discovered?.poolAddress) {
+      throw new Error("Aucun pool PumpSwap SOL utilisable trouvé.");
     }
-  );
 
-  setTimeout(
-    () => {
-      process.exit(0);
-    },
-    3000
+    const initialized = await initializePool(
+      mint,
+      discovered.poolAddress
+    );
+
+    currentMint = mint;
+    currentPool = initialized.poolAddress;
+
+    baseMint = initialized.baseMint;
+    quoteMint = initialized.quoteMint;
+    baseVault = initialized.baseVault;
+    quoteVault = initialized.quoteVault;
+    tokenVault = initialized.tokenVault;
+    solVault = initialized.solVault;
+    tokenDecimals = initialized.tokenDecimals;
+    tokenIsBase = initialized.tokenIsBase;
+
+    vaultAmounts.token = initialized.initialTokenRaw;
+    vaultAmounts.sol = initialized.initialSolRaw;
+
+    history = [];
+    dexData = discovered.dexPair || null;
+    dexUnavailable = false;
+    dexLastError = null;
+    dexBlockedUntil = 0;
+    dexCacheAt = dexData ? Date.now() : 0;
+    dexLastRequestAt = 0;
+    dexErrorLogged = false;
+
+    level = "NORMAL";
+    dangerUntil = 0;
+    criticalLatched = false;
+    lastSignal = null;
+    eventId = 0;
+
+    armed = true;
+
+    log("Crash Guard armé.", {
+      mint: currentMint,
+      pool: currentPool,
+      baseMint,
+      quoteMint,
+      tokenVault,
+      solVault,
+      tokenDecimals,
+      tokenIsBase,
+    });
+
+    connectWebSocket();
+
+    sampleTimer = setInterval(
+      sampleOnChain,
+      SAMPLE_INTERVAL_MS
+    );
+
+    dexTimer = setInterval(
+      updateDexData,
+      DEX_INTERVAL_MS
+    );
+
+    // Mise à jour DEX non bloquante : une limitation 429 ne désarme pas.
+    updateDexData().catch((error) => {
+      log("Mise à jour DEX initiale ignorée:", error.message);
+    });
+
+    return {
+      ok: true,
+      armed: true,
+      mint: currentMint,
+      pool: currentPool,
+      quoteMint,
+      tokenDecimals,
+      dexAvailable: Boolean(dexData),
+    };
+  } catch (error) {
+    await disarm();
+    throw error;
+  } finally {
+    starting = false;
+  }
+}
+
+async function disarm() {
+  armed = false;
+
+  if (sampleTimer) {
+    clearInterval(sampleTimer);
+    sampleTimer = null;
+  }
+
+  if (dexTimer) {
+    clearInterval(dexTimer);
+    dexTimer = null;
+  }
+
+  closeWebSocket();
+
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
+  currentMint = null;
+  currentPool = null;
+
+  baseMint = null;
+  quoteMint = null;
+  baseVault = null;
+  quoteVault = null;
+  tokenVault = null;
+  solVault = null;
+  tokenDecimals = 0;
+  tokenIsBase = true;
+
+  vaultAmounts = {
+    token: null,
+    sol: null,
+  };
+
+  history = [];
+  dexData = null;
+  dexUnavailable = false;
+  dexLastError = null;
+  dexBlockedUntil = 0;
+  dexCacheAt = 0;
+  dexLastRequestAt = 0;
+  dexErrorLogged = false;
+
+  level = "NORMAL";
+  dangerUntil = 0;
+  criticalLatched = false;
+  lastSignal = null;
+
+  return { ok: true, armed: false };
+}
+
+// ============================================================
+// HTTP API
+// ============================================================
+
+function readRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+
+    req.on("data", (chunk) => {
+      body += chunk;
+
+      if (body.length > 1024 * 1024) {
+        reject(new Error("Corps de requête trop volumineux."));
+        req.destroy();
+      }
+    });
+
+    req.on("end", () => {
+      if (!body) {
+        resolve({});
+        return;
+      }
+
+      try {
+        resolve(JSON.parse(body));
+      } catch {
+        reject(new Error("JSON de requête invalide."));
+      }
+    });
+
+    req.on("error", reject);
+  });
+}
+
+function authorized(req) {
+  if (!CRASH_GUARD_SECRET) return false;
+
+  return (
+    req.headers["x-crash-guard-secret"] === CRASH_GUARD_SECRET
   );
 }
 
-process.on(
-  "SIGTERM",
-  () =>
-    shutdown("SIGTERM")
-);
+function sendJson(res, statusCode, body) {
+  res.writeHead(statusCode, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+  });
 
-process.on(
-  "SIGINT",
-  () =>
-    shutdown("SIGINT")
-);
+  res.end(JSON.stringify(body));
+}
+
+async function handleRequest(req, res) {
+  const url = new URL(
+    req.url,
+    `http://${req.headers.host || "localhost"}`
+  );
+
+  if (req.method === "GET" && url.pathname === "/health") {
+    return sendJson(res, 200, {
+      ok: true,
+      service: "crash-guard",
+      armed,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  if (!authorized(req)) {
+    return sendJson(res, 401, {
+      ok: false,
+      error: "Non autorisé.",
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/state") {
+    return sendJson(res, 200, {
+      ok: true,
+      armed,
+      mint: currentMint,
+      pool: currentPool,
+      baseMint,
+      quoteMint,
+      tokenVault,
+      solVault,
+      tokenDecimals,
+      level,
+      criticalLatched,
+      dangerUntil,
+      dexUnavailable,
+      dexLastError,
+      dexBlockedUntil:
+        dexBlockedUntil > Date.now()
+          ? new Date(dexBlockedUntil).toISOString()
+          : null,
+      dexData,
+      lastSignal,
+      historySamples: history.length,
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/disarm") {
+    await disarm();
+
+    return sendJson(res, 200, {
+      ok: true,
+      armed: false,
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/arm") {
+    if (starting) {
+      return sendJson(res, 409, {
+        ok: false,
+        error: "Un démarrage est déjà en cours.",
+      });
+    }
+
+    const body = await readRequestBody(req);
+    const mint = String(body.mint || "").trim();
+
+    if (!mint) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: "Le champ mint est obligatoire.",
+      });
+    }
+
+    try {
+      const result = await arm(mint);
+      return sendJson(res, 200, result);
+    } catch (error) {
+      log("Armement impossible:", error.message);
+
+      return sendJson(res, 500, {
+        ok: false,
+        error: error.message,
+      });
+    }
+  }
+
+  return sendJson(res, 404, {
+    ok: false,
+    error: "Route introuvable.",
+  });
+}
+
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch((error) => {
+    log("Erreur HTTP:", error.message);
+
+    if (!res.headersSent) {
+      sendJson(res, 500, {
+        ok: false,
+        error: error.message || "Erreur interne.",
+      });
+    } else {
+      res.end();
+    }
+  });
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  log(`Crash Guard démarré sur le port ${PORT}.`);
+});
+
+async function shutdown(signal) {
+  if (stopping) return;
+
+  stopping = true;
+  log(`Arrêt demandé (${signal}).`);
+
+  await disarm();
+
+  server.close(() => {
+    process.exit(0);
+  });
+
+  setTimeout(() => process.exit(1), 5000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
