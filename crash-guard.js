@@ -1,48 +1,20 @@
 "use strict";
 
-/*
-===========================================================
-CRASH GUARD
-===========================================================
-
-Rôle :
-- Surveille le pool PumpSwap du token actuellement armé.
-- Observe directement les réserves on-chain des vaults.
-- Détecte :
-    WATCH
-    DANGER
-    CRITICAL
-- CRITICAL = verrouillage immédiat du trading.
-- DANGER = blocage des nouveaux achats.
-- Expose une API HTTP pour que V5.1 puisse :
-    /arm
-    /disarm
-    /state
-    /health
-- Peut envoyer le signal directement à V5.1.
-
-IMPORTANT :
-Ce module ne fait AUCUNE transaction réelle.
-Il ne vend aucun token réellement.
-Il transmet uniquement des signaux au bot de simulation V5.1.
-===========================================================
-*/
-
 const http = require("http");
-const WebSocket = require("ws");
+const ws = require("ws");
 
-/* =========================================================
-   CONFIGURATION
-========================================================= */
+// ============================================================
+// CONFIGURATION
+// ============================================================
 
 const PORT = Number(process.env.PORT || 3000);
 
 const RPC_HTTP =
-  process.env.SOLANA_RPC_HTTP ||
+  process.env.RPC_HTTP ||
   "https://api.mainnet-beta.solana.com";
 
 const RPC_WS =
-  process.env.SOLANA_RPC_WS ||
+  process.env.RPC_WS ||
   "wss://api.mainnet-beta.solana.com";
 
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
@@ -54,132 +26,172 @@ const CRASH_GUARD_SECRET =
 const CRASH_GUARD_TARGET_URL =
   process.env.CRASH_GUARD_TARGET_URL || "";
 
-const PUMPSWAP_PROGRAM =
+// PumpSwap / Pump AMM
+const PUMPSWAP_PROGRAM_ID =
   "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
+// Native SOL / WSOL mint
 const SOL_MINT =
   "So11111111111111111111111111111111111111112";
 
-/* =========================================================
-   SEUILS
-========================================================= */
-
-/*
-WATCH
------
-Premier signal.
-Aucune action sur V5.1.
-*/
+// ============================================================
+// SEUILS CRASH GUARD
+// ============================================================
 
 const WATCH_DROP_5S = -5;
 const WATCH_DROP_10S = -8;
 
-/*
-DANGER
-------
-Bloque les nouveaux achats.
-*/
-
 const DANGER_DROP_5S = -10;
 const DANGER_DROP_10S = -15;
-
-/*
-CRITICAL
---------
-Verrouillage total + demande d'urgence à V5.1.
-*/
 
 const CRITICAL_DROP_5S = -20;
 const CRITICAL_DROP_10S = -30;
 
-/*
-Retenue d'un DANGER après disparition du signal.
-Cela évite un clignotement DANGER/NORMAL.
-*/
-
 const DANGER_HOLD_MS = 15000;
 
-/*
-Fréquence de prise des snapshots on-chain.
-*/
+// ============================================================
+// TIMING
+// ============================================================
 
 const SAMPLE_INTERVAL_MS = 1000;
-
-/*
-Fréquence des données DexScreener.
-*/
-
-const DEX_INTERVAL_MS = 5000;
-
-/*
-Taille maximale de l'historique.
-*/
+const DEX_REFRESH_INTERVAL_MS = 5000;
 
 const HISTORY_MAX = 120;
 
-/*
-Timeout HTTP.
-*/
-
 const HTTP_TIMEOUT_MS = 5000;
 
-/* =========================================================
-   ÉTAT GLOBAL
-========================================================= */
+const DEX_RETRY_COUNT = 3;
+const DEX_RETRY_BASE_DELAY_MS = 1200;
 
-let armed = false;
+// ============================================================
+// PERSISTENCE
+// ============================================================
 
-let currentMint = null;
-let currentPool = null;
+const DATA_DIR = "/data";
 
-let baseMint = null;
-let quoteMint = null;
+const LOG_FILE =
+  `${DATA_DIR}/crash_guard.jsonl`;
 
-let tokenVault = null;
-let solVault = null;
-
-let tokenDecimals = 6;
-
-let ws = null;
-
-let tokenVaultSubId = null;
-let solVaultSubId = null;
-
-let tokenVaultLamports = null;
-let solVaultLamports = null;
-
-let lastSnapshotAt = 0;
-
-let history = [];
-
-let lastDexLiquidityUsd = null;
-let lastDexPriceUsd = null;
-let lastDexUpdateAt = 0;
-
-let currentLevel = "NORMAL";
-let lastLevelChangeAt = 0;
-let dangerUntil = 0;
-
-let criticalLatched = false;
-
-let lastSignal = null;
-
-let reconnectTimer = null;
-let sampleTimer = null;
-let dexTimer = null;
-
-let eventId = 0;
-
-/* =========================================================
-   OUTILS
-========================================================= */
-
-function now() {
-  return Date.now();
+function ensureDataDir() {
+  try {
+    require("fs").mkdirSync(DATA_DIR, {
+      recursive: true,
+    });
+  } catch (_) {}
 }
 
+ensureDataDir();
+
+function logEvent(type, data = {}) {
+  const row = {
+    timestamp: new Date().toISOString(),
+    type,
+    ...data,
+  };
+
+  console.log(JSON.stringify(row));
+
+  try {
+    require("fs").appendFileSync(
+      LOG_FILE,
+      JSON.stringify(row) + "\n"
+    );
+  } catch (_) {}
+}
+
+// ============================================================
+// ETAT
+// ============================================================
+
+const state = {
+  armed: false,
+
+  currentMint: null,
+  currentPool: null,
+
+  baseMint: null,
+  quoteMint: null,
+
+  baseVault: null,
+  quoteVault: null,
+
+  baseDecimals: 6,
+  quoteDecimals: 9,
+
+  ws: null,
+
+  subscriptions: {},
+
+  vaultAmounts: {
+    base: null,
+    quote: null,
+  },
+
+  history: [],
+
+  dex: {
+    priceUsd: null,
+    liquidityUsd: null,
+    pairAddress: null,
+    updatedAt: 0,
+  },
+
+  level: "WATCH",
+
+  dangerUntil: 0,
+
+  criticalLatched: false,
+
+  lastSignal: null,
+
+  timers: {
+    sample: null,
+    dex: null,
+  },
+
+  eventId: 0,
+
+  // Cache DexScreener
+  dexCache: {
+    pool: null,
+    market: null,
+    lastSuccessAt: 0,
+  },
+
+  // Empêche les rafales de requêtes DexScreener
+  dexNextAllowedAt: 0,
+};
+
+// ============================================================
+// UTILITAIRES
+// ============================================================
+
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) =>
+    setTimeout(resolve, ms)
+  );
+}
+
+function pctChange(oldValue, newValue) {
+  if (
+    oldValue === null ||
+    oldValue === undefined ||
+    newValue === null ||
+    newValue === undefined
+  ) {
+    return null;
+  }
+
+  if (!Number.isFinite(oldValue) ||
+      !Number.isFinite(newValue)) {
+    return null;
+  }
+
+  if (oldValue === 0) {
+    return null;
+  }
+
+  return ((newValue - oldValue) / oldValue) * 100;
 }
 
 function safeNumber(value) {
@@ -187,803 +199,1320 @@ function safeNumber(value) {
   return Number.isFinite(n) ? n : null;
 }
 
-function pctChange(oldValue, newValue) {
-  if (
-    oldValue === null ||
-    newValue === null ||
-    !Number.isFinite(oldValue) ||
-    !Number.isFinite(newValue) ||
-    oldValue <= 0
-  ) {
-    return null;
+function pubkeyFromBytes(buffer, offset) {
+  return buffer.subarray(offset, offset + 32)
+    .toString("base64");
+}
+
+function base58Encode(buffer) {
+  const ALPHABET =
+    "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+  let digits = [0];
+
+  for (const byte of buffer) {
+    let carry = byte;
+
+    for (let i = 0; i < digits.length; i++) {
+      const value = digits[i] * 256 + carry;
+
+      digits[i] = value % 58;
+      carry = Math.floor(value / 58);
+    }
+
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = Math.floor(carry / 58);
+    }
   }
 
-  return ((newValue - oldValue) / oldValue) * 100;
+  let result = "";
+
+  for (let i = 0; i < buffer.length && buffer[i] === 0; i++) {
+    result += "1";
+  }
+
+  for (let i = digits.length - 1; i >= 0; i--) {
+    result += ALPHABET[digits[i]];
+  }
+
+  return result;
 }
 
-function json(res, statusCode, payload) {
-  const body = JSON.stringify(payload);
-
-  res.writeHead(statusCode, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Content-Length": Buffer.byteLength(body)
-  });
-
-  res.end(body);
-}
-
-function log(message) {
-  console.log(
-    `[${new Date().toISOString()}] ${message}`
+function pubkeyFromAccountData(buffer, offset) {
+  return base58Encode(
+    buffer.subarray(offset, offset + 32)
   );
 }
 
-/* =========================================================
-   AUTHENTIFICATION API
-========================================================= */
-
-function authorized(req) {
-  if (!CRASH_GUARD_SECRET) {
-    return true;
-  }
-
-  const received =
-    req.headers["x-crash-guard-secret"];
-
-  return received === CRASH_GUARD_SECRET;
-}
-
-/* =========================================================
-   RPC HTTP
-========================================================= */
+// ============================================================
+// HTTP / RPC
+// ============================================================
 
 async function rpc(method, params = []) {
   const controller = new AbortController();
 
-  const timer = setTimeout(
-    () => controller.abort(),
-    HTTP_TIMEOUT_MS
-  );
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, HTTP_TIMEOUT_MS);
 
   try {
     const response = await fetch(RPC_HTTP, {
       method: "POST",
+
       headers: {
-        "Content-Type": "application/json"
+        "content-type": "application/json",
       },
+
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: Date.now(),
         method,
-        params
+        params,
       }),
-      signal: controller.signal
+
+      signal: controller.signal,
     });
+
+    const text = await response.text();
 
     if (!response.ok) {
       throw new Error(
-        `RPC HTTP ${response.status}`
+        `RPC HTTP ${response.status}: ${text.slice(0, 500)}`
       );
     }
 
-    const data = await response.json();
+    let json;
 
-    if (data.error) {
+    try {
+      json = JSON.parse(text);
+    } catch (_) {
       throw new Error(
-        data.error.message ||
-        "RPC error"
+        `RPC réponse JSON invalide: ${text.slice(0, 500)}`
       );
     }
 
-    return data.result;
+    if (json.error) {
+      throw new Error(
+        `RPC ${json.error.code}: ${json.error.message}`
+      );
+    }
+
+    return json.result;
   } finally {
     clearTimeout(timer);
   }
 }
 
-/* =========================================================
-   DEXSCREENER
-========================================================= */
+// ============================================================
+// DEXSCREENER
+// ============================================================
 
 async function dexFetch(url) {
-  const controller = new AbortController();
+  const now = Date.now();
 
-  const timer = setTimeout(
-    () => controller.abort(),
-    HTTP_TIMEOUT_MS
-  );
+  if (now < state.dexNextAllowedAt) {
+    throw new Error(
+      "DexScreener temporisation active"
+    );
+  }
 
-  try {
-    const response = await fetch(url, {
-      headers: {
-        "Accept": "application/json"
-      },
-      signal: controller.signal
-    });
+  let lastError = null;
 
-    if (!response.ok) {
-      throw new Error(
-        `DexScreener HTTP ${response.status}`
-      );
+  for (
+    let attempt = 0;
+    attempt < DEX_RETRY_COUNT;
+    attempt++
+  ) {
+    try {
+      const response = await fetch(url, {
+        headers: {
+          accept: "application/json",
+          "user-agent":
+            "pump-crash-guard/1.0",
+        },
+      });
+
+      const text = await response.text();
+
+      if (response.status === 429) {
+        const retryAfterHeader =
+          response.headers.get("retry-after");
+
+        const retryAfterSeconds =
+          Number(retryAfterHeader);
+
+        const delay =
+          Number.isFinite(retryAfterSeconds) &&
+          retryAfterSeconds > 0
+            ? Math.min(
+                retryAfterSeconds * 1000,
+                15000
+              )
+            : DEX_RETRY_BASE_DELAY_MS *
+              Math.pow(2, attempt);
+
+        state.dexNextAllowedAt =
+          Date.now() + delay;
+
+        lastError = new Error(
+          "DexScreener HTTP 429"
+        );
+
+        logEvent("dex_429", {
+          attempt: attempt + 1,
+          delay,
+          url,
+        });
+
+        if (attempt < DEX_RETRY_COUNT - 1) {
+          await sleep(delay);
+          continue;
+        }
+
+        throw lastError;
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          `DexScreener HTTP ${response.status}`
+        );
+      }
+
+      let json;
+
+      try {
+        json = JSON.parse(text);
+      } catch (_) {
+        throw new Error(
+          "DexScreener réponse JSON invalide"
+        );
+      }
+
+      state.dexNextAllowedAt =
+        Date.now() + 250;
+
+      return json;
+    } catch (error) {
+      lastError = error;
+
+      if (
+        attempt < DEX_RETRY_COUNT - 1 &&
+        !String(error.message).includes(
+          "temporisation active"
+        )
+      ) {
+        const delay =
+          DEX_RETRY_BASE_DELAY_MS *
+          Math.pow(2, attempt);
+
+        await sleep(delay);
+      }
     }
-
-    return await response.json();
-  } finally {
-    clearTimeout(timer);
   }
+
+  throw lastError ||
+    new Error("DexScreener indisponible");
 }
 
-/* =========================================================
-   RECHERCHE DU POOL PUMPSWAP
-========================================================= */
+// ============================================================
+// RECHERCHE ON-CHAIN DU POOL PUMPSWAP
+// ============================================================
 
-async function findPumpSwapPool(mint) {
-  const url =
-    `https://api.dexscreener.com/token-pairs/v1/solana/${mint}`;
+function decodePoolAccount(buffer) {
+  if (!Buffer.isBuffer(buffer)) {
+    buffer = Buffer.from(buffer);
+  }
 
-  const data = await dexFetch(url);
+  // Ancien / nouveau layout PumpSwap.
+  // Le layout utilisé ici correspond au compte Pool
+  // documenté par PumpSwap.
 
-  const pairs = Array.isArray(data)
-    ? data
-    : [];
-
-  const pumpswapPairs = pairs.filter(pair => {
-    return (
-      pair &&
-      pair.dexId === "pumpswap" &&
-      pair.pairAddress
-    );
-  });
-
-  if (!pumpswapPairs.length) {
+  if (buffer.length < 301) {
     throw new Error(
-      "Aucun pool PumpSwap trouvé"
+      `Compte Pool trop petit: ${buffer.length} octets`
     );
   }
 
-  /*
-  On choisit le pool PumpSwap ayant la plus
-  grande liquidité disponible au démarrage.
-  Puis on le verrouille.
-  */
+  const baseMint =
+    pubkeyFromAccountData(buffer, 43);
 
-  pumpswapPairs.sort((a, b) => {
-    const la =
-      Number(a.liquidity?.usd) || 0;
+  const quoteMint =
+    pubkeyFromAccountData(buffer, 75);
 
-    const lb =
-      Number(b.liquidity?.usd) || 0;
+  const baseVault =
+    pubkeyFromAccountData(buffer, 139);
 
-    return lb - la;
-  });
-
-  const pair = pumpswapPairs[0];
-
-  return {
-    poolAddress: pair.pairAddress,
-    priceUsd:
-      safeNumber(pair.priceUsd),
-    liquidityUsd:
-      safeNumber(pair.liquidity?.usd),
-    baseMint:
-      pair.baseToken?.address || null,
-    quoteMint:
-      pair.quoteToken?.address || null
-  };
-}
-
-/* =========================================================
-   LECTURE DU COMPTE POOL
-========================================================= */
-
-function decodePoolAccount(base64Data) {
-  const buffer = Buffer.from(
-    base64Data,
-    "base64"
-  );
-
-  if (buffer.length !== 301) {
-    throw new Error(
-      `Taille compte pool inattendue : ${buffer.length}`
-    );
-  }
-
-  const baseMint = new (require("@solana/web3.js").PublicKey)(
-    buffer.subarray(43, 75)
-  ).toBase58();
-
-  const quoteMint = new (require("@solana/web3.js").PublicKey)(
-    buffer.subarray(75, 107)
-  ).toBase58();
-
-  const baseVault = new (require("@solana/web3.js").PublicKey)(
-    buffer.subarray(139, 171)
-  ).toBase58();
-
-  const quoteVault = new (require("@solana/web3.js").PublicKey)(
-    buffer.subarray(171, 203)
-  ).toBase58();
+  const quoteVault =
+    pubkeyFromAccountData(buffer, 171);
 
   return {
     baseMint,
     quoteMint,
     baseVault,
     quoteVault,
-    size: buffer.length
   };
 }
 
-/* =========================================================
-   DÉCIMALES TOKEN
-========================================================= */
+async function getProgramPoolCandidates(mint) {
+  const filters = [
+    {
+      dataSize: 301,
+    },
+  ];
 
-async function getTokenDecimals(mint) {
-  const result = await rpc(
-    "getAccountInfo",
-    [
-      mint,
+  const results = [];
+
+  // ----------------------------------------------------------
+  // Le mint peut être le BASE mint
+  // ----------------------------------------------------------
+
+  try {
+    const basePools =
+      await rpc("getProgramAccounts", [
+        PUMPSWAP_PROGRAM_ID,
+        {
+          encoding: "base64",
+
+          filters: [
+            ...filters,
+
+            {
+              memcmp: {
+                offset: 43,
+                bytes: mint,
+              },
+            },
+          ],
+        },
+      ]);
+
+    for (const item of basePools || []) {
+      try {
+        const raw =
+          Buffer.from(
+            item.account.data[0],
+            "base64"
+          );
+
+        const decoded =
+          decodePoolAccount(raw);
+
+        if (
+          decoded.baseMint === mint &&
+          decoded.quoteMint === SOL_MINT
+        ) {
+          results.push({
+            pool: item.pubkey,
+            ...decoded,
+          });
+        }
+      } catch (_) {}
+    }
+  } catch (error) {
+    logEvent(
+      "onchain_pool_search_base_error",
       {
-        encoding: "jsonParsed"
+        mint,
+        error: error.message,
       }
-    ]
-  );
-
-  const decimals =
-    result?.value?.data?.parsed?.info?.decimals;
-
-  const number = Number(decimals);
-
-  if (!Number.isInteger(number)) {
-    throw new Error(
-      "Impossible de lire les décimales du token"
     );
   }
 
-  return number;
+  // ----------------------------------------------------------
+  // Le mint peut être le QUOTE mint
+  // ----------------------------------------------------------
+
+  try {
+    const quotePools =
+      await rpc("getProgramAccounts", [
+        PUMPSWAP_PROGRAM_ID,
+        {
+          encoding: "base64",
+
+          filters: [
+            ...filters,
+
+            {
+              memcmp: {
+                offset: 75,
+                bytes: mint,
+              },
+            },
+          ],
+        },
+      ]);
+
+    for (const item of quotePools || []) {
+      try {
+        const raw =
+          Buffer.from(
+            item.account.data[0],
+            "base64"
+          );
+
+        const decoded =
+          decodePoolAccount(raw);
+
+        if (
+          decoded.quoteMint === mint &&
+          decoded.baseMint === SOL_MINT
+        ) {
+          results.push({
+            pool: item.pubkey,
+            ...decoded,
+          });
+        }
+      } catch (_) {}
+    }
+  } catch (error) {
+    logEvent(
+      "onchain_pool_search_quote_error",
+      {
+        mint,
+        error: error.message,
+      }
+    );
+  }
+
+  return results;
 }
 
-/* =========================================================
-   PRIX / LIQUIDITÉ DEX
-========================================================= */
+async function getTokenAccountRawAmount(address) {
+  const result =
+    await rpc("getTokenAccountBalance", [
+      address,
+      {
+        commitment: "confirmed",
+      },
+    ]);
+
+  return {
+    raw: BigInt(result.value.amount),
+    ui: Number(result.value.uiAmount || 0),
+  };
+}
+
+async function findBestOnChainPumpSwapPool(mint) {
+  const candidates =
+    await getProgramPoolCandidates(mint);
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  const scored = [];
+
+  for (const candidate of candidates) {
+    try {
+      const quote =
+        await getTokenAccountRawAmount(
+          candidate.quoteVault
+        );
+
+      const base =
+        await getTokenAccountRawAmount(
+          candidate.baseVault
+        );
+
+      scored.push({
+        ...candidate,
+
+        quoteReserveRaw:
+          quote.raw.toString(),
+
+        quoteReserveUi:
+          quote.ui,
+
+        baseReserveRaw:
+          base.raw.toString(),
+
+        baseReserveUi:
+          base.ui,
+      });
+    } catch (error) {
+      logEvent(
+        "onchain_pool_reserve_error",
+        {
+          pool: candidate.pool,
+          error: error.message,
+        }
+      );
+    }
+  }
+
+  if (!scored.length) {
+    return null;
+  }
+
+  // Pour un pool SOL-quoted, la réserve SOL
+  // est un bon critère de sélection.
+  scored.sort(
+    (a, b) =>
+      b.quoteReserveUi -
+      a.quoteReserveUi
+  );
+
+  return scored[0];
+}
+
+// ============================================================
+// RECHERCHE DU POOL
+// ============================================================
+
+async function findPumpSwapPool(mint) {
+  // ----------------------------------------------------------
+  // 1. Si le cache est encore utilisable, on le garde
+  // ----------------------------------------------------------
+
+  if (
+    state.dexCache.pool &&
+    state.dexCache.pool.mint === mint
+  ) {
+    return state.dexCache.pool;
+  }
+
+  // ----------------------------------------------------------
+  // 2. Première source = ON-CHAIN
+  // ----------------------------------------------------------
+
+  try {
+    const onChain =
+      await findBestOnChainPumpSwapPool(mint);
+
+    if (onChain) {
+      const result = {
+        pool: onChain.pool,
+        mint,
+
+        baseMint: onChain.baseMint,
+        quoteMint: onChain.quoteMint,
+
+        baseVault: onChain.baseVault,
+        quoteVault: onChain.quoteVault,
+
+        priceUsd: null,
+        liquidityUsd: null,
+
+        source: "onchain",
+      };
+
+      state.dexCache.pool = result;
+
+      logEvent(
+        "pool_found_onchain",
+        result
+      );
+
+      return result;
+    }
+  } catch (error) {
+    logEvent(
+      "pool_onchain_failed",
+      {
+        mint,
+        error: error.message,
+      }
+    );
+  }
+
+  // ----------------------------------------------------------
+  // 3. Fallback DexScreener
+  // ----------------------------------------------------------
+
+  try {
+    const data =
+      await dexFetch(
+        `https://api.dexscreener.com/token-pairs/v1/solana/${mint}`
+      );
+
+    const pairs =
+      Array.isArray(data)
+        ? data
+        : Array.isArray(data?.pairs)
+          ? data.pairs
+          : [];
+
+    const pumpPairs =
+      pairs
+        .filter(
+          (pair) =>
+            pair &&
+            pair.dexId === "pumpswap" &&
+            pair.pairAddress
+        )
+        .sort(
+          (a, b) =>
+            Number(
+              b?.liquidity?.usd || 0
+            ) -
+            Number(
+              a?.liquidity?.usd || 0
+            )
+        );
+
+    if (!pumpPairs.length) {
+      throw new Error(
+        "Aucun pool PumpSwap trouvé"
+      );
+    }
+
+    const pair =
+      pumpPairs[0];
+
+    const result = {
+      pool: pair.pairAddress,
+      mint,
+
+      baseMint:
+        pair.baseToken?.address || null,
+
+      quoteMint:
+        pair.quoteToken?.address || null,
+
+      baseVault: null,
+      quoteVault: null,
+
+      priceUsd:
+        safeNumber(pair.priceUsd),
+
+      liquidityUsd:
+        safeNumber(
+          pair.liquidity?.usd
+        ),
+
+      source: "dexscreener",
+    };
+
+    state.dexCache.pool = result;
+
+    state.dexCache.lastSuccessAt =
+      Date.now();
+
+    logEvent(
+      "pool_found_dex",
+      result
+    );
+
+    return result;
+  } catch (error) {
+    throw new Error(
+      `Impossible de trouver le pool PumpSwap: ${error.message}`
+    );
+  }
+}
+
+// ============================================================
+// DECODAGE DECIMALES
+// ============================================================
+
+async function getTokenDecimals(mint) {
+  try {
+    const result =
+      await rpc("getTokenSupply", [
+        mint,
+      ]);
+
+    return Number(
+      result.value.decimals
+    );
+  } catch (error) {
+    logEvent(
+      "token_decimals_error",
+      {
+        mint,
+        error: error.message,
+      }
+    );
+
+    return 6;
+  }
+}
+
+// ============================================================
+// DEX DATA
+// ============================================================
 
 async function updateDexData() {
-  if (!armed || !currentPool) {
+  if (
+    !state.currentPool
+  ) {
     return;
   }
 
   try {
-    const url =
-      `https://api.dexscreener.com/latest/dex/pairs/solana/${currentPool}`;
-
-    const data = await dexFetch(url);
-
-    const pairs = Array.isArray(data?.pairs)
-      ? data.pairs
-      : [];
+    const data =
+      await dexFetch(
+        `https://api.dexscreener.com/latest/dex/pairs/solana/${state.currentPool}`
+      );
 
     const pair =
-      pairs.find(
-        p =>
-          p &&
-          p.dexId === "pumpswap" &&
-          p.pairAddress === currentPool
-      ) ||
-      pairs[0];
+      data?.pair || null;
 
     if (!pair) {
       return;
     }
 
-    const liquidity =
-      safeNumber(pair.liquidity?.usd);
-
-    const price =
+    state.dex.priceUsd =
       safeNumber(pair.priceUsd);
 
-    if (
-      liquidity !== null &&
-      liquidity > 0
-    ) {
-      lastDexLiquidityUsd = liquidity;
-    }
+    state.dex.liquidityUsd =
+      safeNumber(
+        pair.liquidity?.usd
+      );
 
-    if (
-      price !== null &&
-      price > 0
-    ) {
-      lastDexPriceUsd = price;
-    }
+    state.dex.pairAddress =
+      pair.pairAddress ||
+      state.currentPool;
 
-    lastDexUpdateAt = now();
+    state.dex.updatedAt =
+      Date.now();
 
+    state.dexCache.market = {
+      priceUsd: state.dex.priceUsd,
+      liquidityUsd:
+        state.dex.liquidityUsd,
+      pairAddress:
+        state.dex.pairAddress,
+    };
+
+    state.dexCache.lastSuccessAt =
+      Date.now();
+
+    logEvent(
+      "dex_update",
+      {
+        pool: state.currentPool,
+        priceUsd:
+          state.dex.priceUsd,
+        liquidityUsd:
+          state.dex.liquidityUsd,
+      }
+    );
   } catch (error) {
-    log(
-      `⚠️ DexScreener : ${error.message}`
+    // --------------------------------------------------------
+    // IMPORTANT :
+    // Un 429 DexScreener ne doit PAS arrêter Crash Guard.
+    // On conserve simplement la dernière valeur valide.
+    // --------------------------------------------------------
+
+    logEvent(
+      "dex_update_failed",
+      {
+        pool: state.currentPool,
+        error: error.message,
+        cachedPriceUsd:
+          state.dex.priceUsd,
+        cachedLiquidityUsd:
+          state.dex.liquidityUsd,
+      }
     );
   }
 }
 
-/* =========================================================
-   WEBSOCKET SOLANA
-========================================================= */
-
-function closeWebSocket() {
-  if (ws) {
-    try {
-      ws.close();
-    } catch {}
-  }
-
-  ws = null;
-
-  tokenVaultSubId = null;
-  solVaultSubId = null;
-}
+// ============================================================
+// WEBSOCKET SOLANA
+// ============================================================
 
 function connectWebSocket() {
-  if (!armed) {
+  if (!state.armed) {
     return;
   }
 
-  closeWebSocket();
+  if (state.ws) {
+    try {
+      state.ws.close();
+    } catch (_) {}
+  }
 
-  log("🔌 Connexion WebSocket Solana...");
+  const socket =
+    new ws(RPC_WS);
 
-  ws = new WebSocket(RPC_WS);
+  state.ws = socket;
 
-  ws.on("open", () => {
-    log("🟢 WebSocket Solana connecté");
+  socket.on("open", () => {
+    logEvent(
+      "websocket_connected",
+      {
+        mint: state.currentMint,
+        pool: state.currentPool,
+      }
+    );
 
-    subscribeVaults();
+    subscribeVault(
+      socket,
+      "base",
+      state.baseVault
+    );
+
+    subscribeVault(
+      socket,
+      "quote",
+      state.quoteVault
+    );
   });
 
-  ws.on("message", message => {
+  socket.on("message", (message) => {
     try {
-      const data =
-        JSON.parse(message.toString());
+      const parsed =
+        JSON.parse(
+          message.toString()
+        );
 
-      handleWebSocketMessage(data);
-
+      handleWebSocketMessage(parsed);
     } catch (error) {
-      log(
-        `⚠️ WS message invalide : ${error.message}`
+      logEvent(
+        "websocket_message_error",
+        {
+          error: error.message,
+        }
       );
     }
   });
 
-  ws.on("close", () => {
-    log("🟡 WebSocket Solana fermé");
+  socket.on("close", () => {
+    logEvent(
+      "websocket_closed"
+    );
 
-    if (armed) {
-      scheduleReconnect();
+    if (state.armed) {
+      setTimeout(() => {
+        if (state.armed) {
+          connectWebSocket();
+        }
+      }, 3000);
     }
   });
 
-  ws.on("error", error => {
-    log(
-      `⚠️ WebSocket Solana : ${error.message}`
+  socket.on("error", (error) => {
+    logEvent(
+      "websocket_error",
+      {
+        error:
+          error.message,
+      }
     );
   });
 }
 
-function scheduleReconnect() {
-  if (!armed) {
+function subscribeVault(
+  socket,
+  type,
+  address
+) {
+  if (!address) {
     return;
   }
 
-  if (reconnectTimer) {
-    return;
-  }
+  const id =
+    Date.now() +
+    Math.floor(
+      Math.random() * 1000
+    );
 
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
+  state.subscriptions[id] =
+    type;
 
-    if (armed) {
-      connectWebSocket();
-    }
-  }, 3000);
-}
-
-/* =========================================================
-   ABONNEMENTS VAULTS
-========================================================= */
-
-function subscribeVaults() {
-  if (
-    !ws ||
-    ws.readyState !== WebSocket.OPEN ||
-    !tokenVault ||
-    !solVault
-  ) {
-    return;
-  }
-
-  tokenVaultSubId = null;
-  solVaultSubId = null;
-
-  ws.send(
+  socket.send(
     JSON.stringify({
       jsonrpc: "2.0",
-      id: 1,
-      method: "accountSubscribe",
+      id,
+
+      method:
+        "accountSubscribe",
+
       params: [
-        tokenVault,
+        address,
+
         {
           encoding: "base64",
-          commitment: "processed"
-        }
-      ]
+          commitment:
+            "confirmed",
+        },
+      ],
     })
-  );
-
-  ws.send(
-    JSON.stringify({
-      jsonrpc: "2.0",
-      id: 2,
-      method: "accountSubscribe",
-      params: [
-        solVault,
-        {
-          encoding: "base64",
-          commitment: "processed"
-        }
-      ]
-    })
-  );
-
-  log(
-    `👁️ Surveillance vault token : ${tokenVault}`
-  );
-
-  log(
-    `👁️ Surveillance vault SOL   : ${solVault}`
   );
 }
 
-/* =========================================================
-   LECTURE VAULT TOKEN
-========================================================= */
+// ============================================================
+// VAULT DECODING
+// ============================================================
 
-function decodeTokenVault(base64Data) {
-  const buffer = Buffer.from(
-    base64Data,
-    "base64"
-  );
+function decodeTokenVault(
+  base64
+) {
+  const buffer =
+    Buffer.from(
+      base64,
+      "base64"
+    );
 
+  // SPL Token account:
+  // amount = uint64 à l'offset 64
   if (buffer.length < 72) {
     return null;
   }
 
-  /*
-  SPL Token Account :
-  amount = offset 64
-  */
-
-  const rawAmount =
-    buffer.readBigUInt64LE(64);
-
-  return (
-    Number(rawAmount) /
-    Math.pow(10, tokenDecimals)
-  );
+  return buffer.readBigUInt64LE(64);
 }
 
-/* =========================================================
-   TRAITEMENT WS
-========================================================= */
-
-function handleWebSocketMessage(data) {
+function handleWebSocketMessage(message) {
   if (
-    data.method === "accountNotification"
+    message.method ===
+    "accountNotification"
   ) {
     const subscription =
-      data.params?.subscription;
+      message.params?.subscription;
 
-    const value =
-      data.params?.result?.value;
+    const result =
+      message.params?.result;
 
-    if (!value?.data) {
+    if (!subscription || !result) {
       return;
     }
 
+    const type =
+      state.subscriptions[
+        subscription
+      ];
+
+    if (!type) {
+      return;
+    }
+
+    const value =
+      result.value;
+
+    const encoded =
+      value?.data?.[0];
+
     if (
-      Array.isArray(value.data) &&
-      value.data[0]
+      !encoded ||
+      value?.data?.[1] !==
+        "base64"
     ) {
-      const base64Data =
-        value.data[0];
+      return;
+    }
 
-      /*
-      On identifie la vault grâce
-      aux subscriptions retournées.
-      */
+    const amount =
+      decodeTokenVault(
+        encoded
+      );
 
-      if (
-        subscription === tokenVaultSubId
-      ) {
-        const tokenAmount =
-          decodeTokenVault(base64Data);
+    if (amount === null) {
+      return;
+    }
 
-        if (tokenAmount !== null) {
-          tokenVaultLamports =
-            tokenAmount;
-        }
-      }
+    if (type === "base") {
+      state.vaultAmounts.base =
+        amount;
+    }
 
-      if (
-        subscription === solVaultSubId
-      ) {
-        const buffer =
-          Buffer.from(
-            base64Data,
-            "base64"
-          );
-
-        if (buffer.length >= 8) {
-          solVaultLamports =
-            Number(
-              buffer.readBigUInt64LE(0)
-            );
-        }
-      }
+    if (type === "quote") {
+      state.vaultAmounts.quote =
+        amount;
     }
   }
 
-  /*
-  Réponse aux accountSubscribe.
-  */
-
   if (
-    data.id === 1 &&
-    typeof data.result === "number"
+    message.result &&
+    typeof message.id ===
+      "number"
   ) {
-    tokenVaultSubId = data.result;
-  }
+    const type =
+      state.subscriptions[
+        message.id
+      ];
 
-  if (
-    data.id === 2 &&
-    typeof data.result === "number"
-  ) {
-    solVaultSubId = data.result;
+    if (
+      type &&
+      typeof message.result ===
+        "number"
+    ) {
+      state.subscriptions[
+        message.result
+      ] = type;
+
+      delete state.subscriptions[
+        message.id
+      ];
+    }
   }
 }
 
-/* =========================================================
-   SNAPSHOT ON-CHAIN
-========================================================= */
+// ============================================================
+// SNAPSHOT
+// ============================================================
 
 function createSnapshot() {
   if (
-    tokenVaultLamports === null ||
-    solVaultLamports === null
+    state.vaultAmounts.base ===
+      null ||
+    state.vaultAmounts.quote ===
+      null
   ) {
     return null;
   }
 
-  const tokenReserve =
-    Number(tokenVaultLamports);
+  const baseRaw =
+    state.vaultAmounts.base;
 
-  const solLamports =
-    Number(solVaultLamports);
+  const quoteRaw =
+    state.vaultAmounts.quote;
 
-  const solReserve =
-    solLamports / 1e9;
+  const base =
+    Number(baseRaw) /
+    Math.pow(
+      10,
+      state.baseDecimals
+    );
+
+  const quote =
+    Number(quoteRaw) /
+    Math.pow(
+      10,
+      state.quoteDecimals
+    );
 
   if (
-    !Number.isFinite(tokenReserve) ||
-    !Number.isFinite(solReserve) ||
-    tokenReserve <= 0 ||
-    solReserve <= 0
+    !Number.isFinite(base) ||
+    !Number.isFinite(quote) ||
+    base <= 0 ||
+    quote <= 0
   ) {
     return null;
   }
 
+  const timestamp =
+    Date.now();
+
+  const price =
+    quote / base;
+
   return {
-    timestamp: now(),
-    tokenReserve,
-    solReserve
+    timestamp,
+
+    baseReserve: base,
+    quoteReserve: quote,
+
+    price,
+
+    dexPriceUsd:
+      state.dex.priceUsd,
+
+    dexLiquidityUsd:
+      state.dex.liquidityUsd,
   };
 }
 
-/* =========================================================
-   HISTORIQUE
-========================================================= */
+// ============================================================
+// ANALYSE
+// ============================================================
 
-function addSnapshot(snapshot) {
-  history.push(snapshot);
-
-  while (
-    history.length > HISTORY_MAX
-  ) {
-    history.shift();
+function getSnapshotAgo(
+  milliseconds
+) {
+  if (!state.history.length) {
+    return null;
   }
-}
 
-function findSnapshotAgo(ms) {
   const target =
-    now() - ms;
+    Date.now() -
+    milliseconds;
 
-  let best = null;
+  let closest = null;
 
-  for (let i = history.length - 1; i >= 0; i--) {
-    const item = history[i];
+  for (
+    let i =
+      state.history.length - 1;
+    i >= 0;
+    i--
+  ) {
+    const item =
+      state.history[i];
 
-    if (item.timestamp <= target) {
-      best = item;
+    if (
+      item.timestamp <=
+      target
+    ) {
+      closest = item;
       break;
     }
   }
 
-  return best;
+  return closest;
 }
 
-/* =========================================================
-   ANALYSE
-========================================================= */
+function analyzeSnapshot(
+  current
+) {
+  const fiveSec =
+    getSnapshotAgo(5000);
 
-function analyzeSnapshot(snapshot) {
-  const old5 =
-    findSnapshotAgo(5000);
+  const tenSec =
+    getSnapshotAgo(10000);
 
-  const old10 =
-    findSnapshotAgo(10000);
+  if (!fiveSec || !tenSec) {
+    return null;
+  }
 
-  const token5 =
-    old5
-      ? pctChange(
-          old5.tokenReserve,
-          snapshot.tokenReserve
-        )
-      : null;
+  const price5s =
+    pctChange(
+      fiveSec.price,
+      current.price
+    );
 
-  const sol5 =
-    old5
-      ? pctChange(
-          old5.solReserve,
-          snapshot.solReserve
-        )
-      : null;
+  const price10s =
+    pctChange(
+      tenSec.price,
+      current.price
+    );
 
-  const token10 =
-    old10
-      ? pctChange(
-          old10.tokenReserve,
-          snapshot.tokenReserve
-        )
-      : null;
+  const quote5s =
+    pctChange(
+      fiveSec.quoteReserve,
+      current.quoteReserve
+    );
 
-  const sol10 =
-    old10
-      ? pctChange(
-          old10.solReserve,
-          snapshot.solReserve
-        )
-      : null;
+  const quote10s =
+    pctChange(
+      tenSec.quoteReserve,
+      current.quoteReserve
+    );
+
+  const base5s =
+    pctChange(
+      fiveSec.baseReserve,
+      current.baseReserve
+    );
+
+  const base10s =
+    pctChange(
+      tenSec.baseReserve,
+      current.baseReserve
+    );
 
   return {
-    token5,
-    sol5,
-    token10,
-    sol10
+    price5s,
+    price10s,
+
+    quote5s,
+    quote10s,
+
+    base5s,
+    base10s,
+
+    dexPriceUsd:
+      current.dexPriceUsd,
+
+    dexLiquidityUsd:
+      current.dexLiquidityUsd,
   };
 }
 
-/* =========================================================
-   CLASSIFICATION
-========================================================= */
+// ============================================================
+// CLASSIFICATION
+// ============================================================
 
 function classify(metrics) {
-  const values = [
-    metrics.token5,
-    metrics.sol5,
-    metrics.token10,
-    metrics.sol10
-  ].filter(
-    value =>
-      value !== null &&
-      Number.isFinite(value)
-  );
-
-  if (!values.length) {
-    return "NORMAL";
+  if (!metrics) {
+    return "WATCH";
   }
 
-  const min5 = Math.min(
-    ...[
-      metrics.token5,
-      metrics.sol5
-    ].filter(
-      value =>
-        value !== null &&
-        Number.isFinite(value)
-    )
-  );
-
-  const min10 = Math.min(
-    ...[
-      metrics.token10,
-      metrics.sol10
-    ].filter(
-      value =>
-        value !== null &&
-        Number.isFinite(value)
-    )
-  );
-
-  /*
-  CRITICAL est sticky.
-  */
-
-  if (
-    criticalLatched
-  ) {
+  // CRITICAL sticky
+  if (state.criticalLatched) {
     return "CRITICAL";
   }
 
-  if (
-    min5 <= CRITICAL_DROP_5S ||
-    min10 <= CRITICAL_DROP_10S
-  ) {
+  const critical =
+    (
+      metrics.price5s !== null &&
+      metrics.price5s <=
+        CRITICAL_DROP_5S
+    ) ||
+    (
+      metrics.price10s !== null &&
+      metrics.price10s <=
+        CRITICAL_DROP_10S
+    ) ||
+    (
+      metrics.quote5s !== null &&
+      metrics.quote5s <=
+        CRITICAL_DROP_5S
+    ) ||
+    (
+      metrics.quote10s !== null &&
+      metrics.quote10s <=
+        CRITICAL_DROP_10S
+    ) ||
+    (
+      metrics.base5s !== null &&
+      metrics.base5s <=
+        CRITICAL_DROP_5S
+    ) ||
+    (
+      metrics.base10s !== null &&
+      metrics.base10s <=
+        CRITICAL_DROP_10S
+    );
+
+  if (critical) {
+    state.criticalLatched = true;
+
     return "CRITICAL";
   }
 
-  if (
-    min5 <= DANGER_DROP_5S ||
-    min10 <= DANGER_DROP_10S
-  ) {
+  const danger =
+    (
+      metrics.price5s !== null &&
+      metrics.price5s <=
+        DANGER_DROP_5S
+    ) ||
+    (
+      metrics.price10s !== null &&
+      metrics.price10s <=
+        DANGER_DROP_10S
+    ) ||
+    (
+      metrics.quote5s !== null &&
+      metrics.quote5s <=
+        DANGER_DROP_5S
+    ) ||
+    (
+      metrics.quote10s !== null &&
+      metrics.quote10s <=
+        DANGER_DROP_10S
+    ) ||
+    (
+      metrics.base5s !== null &&
+      metrics.base5s <=
+        DANGER_DROP_5S
+    ) ||
+    (
+      metrics.base10s !== null &&
+      metrics.base10s <=
+        DANGER_DROP_10S
+    );
+
+  if (danger) {
+    state.dangerUntil =
+      Date.now() +
+      DANGER_HOLD_MS;
+
     return "DANGER";
   }
 
   if (
-    min5 <= WATCH_DROP_5S ||
-    min10 <= WATCH_DROP_10S
+    Date.now() <
+    state.dangerUntil
   ) {
+    return "DANGER";
+  }
+
+  const watch =
+    (
+      metrics.price5s !== null &&
+      metrics.price5s <=
+        WATCH_DROP_5S
+    ) ||
+    (
+      metrics.price10s !== null &&
+      metrics.price10s <=
+        WATCH_DROP_10S
+    ) ||
+    (
+      metrics.quote5s !== null &&
+      metrics.quote5s <=
+        WATCH_DROP_5S
+    ) ||
+    (
+      metrics.quote10s !== null &&
+      metrics.quote10s <=
+        WATCH_DROP_10S
+    ) ||
+    (
+      metrics.base5s !== null &&
+      metrics.base5s <=
+        WATCH_DROP_5S
+    ) ||
+    (
+      metrics.base10s !== null &&
+      metrics.base10s <=
+        WATCH_DROP_10S
+    );
+
+  if (watch) {
     return "WATCH";
   }
 
-  return "NORMAL";
+  return "WATCH";
 }
 
-/* =========================================================
-   SIGNAL
-========================================================= */
+// ============================================================
+// SIGNAL
+// ============================================================
 
-function buildSignal(level, metrics) {
-  const id =
-    ++eventId;
+function buildSignal(
+  level,
+  metrics
+) {
+  state.eventId += 1;
 
   return {
-    id,
+    id:
+      state.eventId,
+
+    timestamp:
+      new Date().toISOString(),
+
     level,
-    mint: currentMint,
-    pool: currentPool,
-    timestamp: new Date().toISOString(),
+
+    mint:
+      state.currentMint,
+
+    pool:
+      state.currentPool,
 
     onchain: {
-      token5s: metrics.token5,
-      sol5s: metrics.sol5,
-      token10s: metrics.token10,
-      sol10s: metrics.sol10
+      price5s:
+        metrics?.price5s ?? null,
+
+      price10s:
+        metrics?.price10s ?? null,
+
+      quote5s:
+        metrics?.quote5s ?? null,
+
+      quote10s:
+        metrics?.quote10s ?? null,
+
+      base5s:
+        metrics?.base5s ?? null,
+
+      base10s:
+        metrics?.base10s ?? null,
     },
 
     dex: {
-      priceUsd: lastDexPriceUsd,
-      liquidityUsd: lastDexLiquidityUsd,
-      lastUpdate:
-        lastDexUpdateAt
-          ? new Date(
-              lastDexUpdateAt
-            ).toISOString()
-          : null
-    }
+      priceUsd:
+        state.dex.priceUsd,
+
+      liquidityUsd:
+        state.dex.liquidityUsd,
+
+      updatedAt:
+        state.dex.updatedAt,
+    },
   };
 }
 
-/* =========================================================
-   NOTIFICATION TELEGRAM
-========================================================= */
+// ============================================================
+// TELEGRAM
+// ============================================================
 
-async function sendTelegram(message) {
+async function sendTelegram(
+  text
+) {
   if (
     !BOT_TOKEN ||
     !CHAT_ID
@@ -992,228 +1521,50 @@ async function sendTelegram(message) {
   }
 
   try {
-    await fetch(
-      `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type":
-            "application/json"
-        },
-        body: JSON.stringify({
-          chat_id: CHAT_ID,
-          text: message
-        })
-      }
-    );
-  } catch (error) {
-    log(
-      `⚠️ Telegram : ${error.message}`
-    );
-  }
-}
-
-/* =========================================================
-   ENVOI À V5.1
-========================================================= */
-
-async function sendSignalToV51(signal) {
-  if (!CRASH_GUARD_TARGET_URL) {
-    return;
-  }
-
-  try {
-    const controller =
-      new AbortController();
-
-    const timer =
-      setTimeout(
-        () => controller.abort(),
-        HTTP_TIMEOUT_MS
-      );
-
     const response =
       await fetch(
-        `${CRASH_GUARD_TARGET_URL.replace(/\/$/, "")}/crash-guard/event`,
+        `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
         {
           method: "POST",
-          headers: {
-            "Content-Type":
-              "application/json",
 
-            "x-crash-guard-secret":
-              CRASH_GUARD_SECRET
+          headers: {
+            "content-type":
+              "application/json",
           },
-          body: JSON.stringify(signal),
-          signal: controller.signal
+
+          body: JSON.stringify({
+            chat_id: CHAT_ID,
+            text,
+            disable_web_page_preview:
+              true,
+          }),
         }
       );
 
-    clearTimeout(timer);
-
     if (!response.ok) {
-      throw new Error(
-        `V5.1 HTTP ${response.status}`
+      logEvent(
+        "telegram_error",
+        {
+          status:
+            response.status,
+        }
       );
     }
-
-    log(
-      `📡 Signal ${signal.level} envoyé à V5.1`
-    );
-
   } catch (error) {
-    log(
-      `⚠️ Envoi V5.1 : ${error.message}`
+    logEvent(
+      "telegram_exception",
+      {
+        error:
+          error.message,
+      }
     );
   }
 }
 
-/* =========================================================
-   CHANGEMENT DE NIVEAU
-========================================================= */
-
-async function applyLevel(level, metrics) {
-  const previous =
-    currentLevel;
-
-  /*
-  CRITICAL reste définitivement verrouillé
-  jusqu'au DISARM.
-  */
-
-  if (
-    level === "CRITICAL"
-  ) {
-    criticalLatched = true;
-  }
-
-  /*
-  DANGER possède une retenue temporaire.
-  */
-
-  if (
-    level === "DANGER"
-  ) {
-    dangerUntil =
-      now() + DANGER_HOLD_MS;
-  }
-
-  /*
-  Si CRITICAL est déjà actif,
-  on ne redescend jamais.
-  */
-
-  if (
-    criticalLatched
-  ) {
-    level = "CRITICAL";
-  }
-
-  /*
-  DANGER maintenu pendant la fenêtre.
-  */
-
-  if (
-    level === "NORMAL" &&
-    dangerUntil > now() &&
-    !criticalLatched
-  ) {
-    level = "DANGER";
-  }
-
-  if (
-    level === previous
-  ) {
-    return;
-  }
-
-  currentLevel =
-    level;
-
-  lastLevelChangeAt =
-    now();
-
-  lastSignal =
-    buildSignal(
-      level,
-      metrics
-    );
-
-  log(
-    `🚨 CRASH GUARD : ${previous} → ${level}`
-  );
-
-  if (
-    level === "WATCH"
-  ) {
-    await sendTelegram(
-      [
-        "🟡 CRASH GUARD WATCH",
-        "",
-        `Token : ${currentMint}`,
-        `Pool : ${currentPool}`,
-        "",
-        `Token 5s : ${formatPct(metrics.token5)}`,
-        `SOL 5s : ${formatPct(metrics.sol5)}`,
-        `Token 10s : ${formatPct(metrics.token10)}`,
-        `SOL 10s : ${formatPct(metrics.sol10)}`
-      ].join("\n")
-    );
-  }
-
-  if (
-    level === "DANGER"
-  ) {
-    await sendTelegram(
-      [
-        "🟠 CRASH GUARD DANGER",
-        "",
-        `Token : ${currentMint}`,
-        "",
-        "⛔ Nouveaux achats à bloquer.",
-        "",
-        `Token 5s : ${formatPct(metrics.token5)}`,
-        `SOL 5s : ${formatPct(metrics.sol5)}`,
-        `Token 10s : ${formatPct(metrics.token10)}`,
-        `SOL 10s : ${formatPct(metrics.sol10)}`
-      ].join("\n")
-    );
-
-    await sendSignalToV51(
-      lastSignal
-    );
-  }
-
-  if (
-    level === "CRITICAL"
-  ) {
-    await sendTelegram(
-      [
-        "🔴 CRASH GUARD CRITICAL",
-        "",
-        `Token : ${currentMint}`,
-        "",
-        "🚨 VERROUILLAGE TOTAL",
-        "⛔ Achats bloqués",
-        "⛔ Ventes normales bloquées",
-        "🚨 Sortie d'urgence demandée à V5.1",
-        "",
-        `Token 5s : ${formatPct(metrics.token5)}`,
-        `SOL 5s : ${formatPct(metrics.sol5)}`,
-        `Token 10s : ${formatPct(metrics.token10)}`,
-        `SOL 10s : ${formatPct(metrics.sol10)}`
-      ].join("\n")
-    );
-
-    await sendSignalToV51(
-      lastSignal
-    );
-  }
-}
-
-function formatPct(value) {
+function formatPercent(value) {
   if (
     value === null ||
+    value === undefined ||
     !Number.isFinite(value)
   ) {
     return "N/A";
@@ -1222,12 +1573,221 @@ function formatPct(value) {
   return `${value.toFixed(2)}%`;
 }
 
-/* =========================================================
-   BOUCLE DE SURVEILLANCE ON-CHAIN
-========================================================= */
+async function notifyLevel(
+  signal
+) {
+  let emoji = "👀";
+
+  if (signal.level === "DANGER") {
+    emoji = "⚠️";
+  }
+
+  if (signal.level === "CRITICAL") {
+    emoji = "🚨";
+  }
+
+  const text =
+`${emoji} CRASH GUARD ${signal.level}
+
+Token:
+${signal.mint}
+
+Pool:
+${signal.pool}
+
+On-chain 5s:
+Prix ${formatPercent(signal.onchain.price5s)}
+Quote ${formatPercent(signal.onchain.quote5s)}
+
+On-chain 10s:
+Prix ${formatPercent(signal.onchain.price10s)}
+Quote ${formatPercent(signal.onchain.quote10s)}
+
+DEX:
+Prix ${signal.dex.priceUsd ?? "N/A"}
+Liquidité ${signal.dex.liquidityUsd ?? "N/A"}
+
+ID:
+${signal.id}`;
+
+  await sendTelegram(text);
+}
+
+// ============================================================
+// COMMUNICATION V5.1
+// ============================================================
+
+async function sendSignalToV51(
+  signal
+) {
+  if (
+    !CRASH_GUARD_TARGET_URL ||
+    !CRASH_GUARD_SECRET
+  ) {
+    logEvent(
+      "v51_signal_skipped",
+      {
+        reason:
+          "CRASH_GUARD_TARGET_URL ou CRASH_GUARD_SECRET absent",
+      }
+    );
+
+    return;
+  }
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      HTTP_TIMEOUT_MS
+    );
+
+  try {
+    const response =
+      await fetch(
+        `${CRASH_GUARD_TARGET_URL}/crash-guard/event`,
+        {
+          method: "POST",
+
+          headers: {
+            "content-type":
+              "application/json",
+
+            "x-crash-guard-secret":
+              CRASH_GUARD_SECRET,
+          },
+
+          body:
+            JSON.stringify(signal),
+
+          signal:
+            controller.signal,
+        }
+      );
+
+    const text =
+      await response.text();
+
+    logEvent(
+      "v51_signal_sent",
+      {
+        level:
+          signal.level,
+
+        status:
+          response.status,
+
+        response:
+          text.slice(0, 500),
+      }
+    );
+  } catch (error) {
+    logEvent(
+      "v51_signal_failed",
+      {
+        level:
+          signal.level,
+
+        error:
+          error.message,
+      }
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ============================================================
+// APPLICATION DU NIVEAU
+// ============================================================
+
+async function applyLevel(
+  level,
+  metrics
+) {
+  const previous =
+    state.level;
+
+  state.level =
+    level;
+
+  // Aucun changement
+  if (
+    previous === level &&
+    level !== "CRITICAL"
+  ) {
+    return;
+  }
+
+  const signal =
+    buildSignal(
+      level,
+      metrics
+    );
+
+  state.lastSignal =
+    signal;
+
+  logEvent(
+    "crash_guard_level",
+    {
+      previous,
+      level,
+      signal,
+    }
+  );
+
+  // WATCH = information seulement
+  if (
+    level === "WATCH"
+  ) {
+    await notifyLevel(
+      signal
+    );
+
+    return;
+  }
+
+  // DANGER = bloque les nouveaux achats
+  if (
+    level === "DANGER"
+  ) {
+    await notifyLevel(
+      signal
+    );
+
+    await sendSignalToV51(
+      signal
+    );
+
+    return;
+  }
+
+  // CRITICAL = bloque + sortie d'urgence
+  if (
+    level === "CRITICAL"
+  ) {
+    await notifyLevel(
+      signal
+    );
+
+    await sendSignalToV51(
+      signal
+    );
+
+    return;
+  }
+}
+
+// ============================================================
+// SAMPLE ON-CHAIN
+// ============================================================
 
 async function sampleOnChain() {
-  if (!armed) {
+  if (!state.armed) {
     return;
   }
 
@@ -1238,40 +1798,25 @@ async function sampleOnChain() {
     return;
   }
 
-  /*
-  Évite de mettre plusieurs snapshots
-  dans la même milliseconde.
-  */
-
-  if (
-    snapshot.timestamp ===
-    lastSnapshotAt
-  ) {
-    return;
-  }
-
-  lastSnapshotAt =
-    snapshot.timestamp;
-
-  addSnapshot(
+  state.history.push(
     snapshot
   );
 
-  /*
-  Il faut suffisamment d'historique
-  avant de déclencher un signal.
-  */
-
-  if (
-    history.length < 6
+  while (
+    state.history.length >
+    HISTORY_MAX
   ) {
-    return;
+    state.history.shift();
   }
 
   const metrics =
     analyzeSnapshot(
       snapshot
     );
+
+  if (!metrics) {
+    return;
+  }
 
   const level =
     classify(metrics);
@@ -1282,564 +1827,779 @@ async function sampleOnChain() {
   );
 }
 
-/* =========================================================
-   ARM
-========================================================= */
+// ============================================================
+// ARM
+// ============================================================
 
 async function arm(mint) {
-  if (
-    !mint ||
-    typeof mint !== "string"
-  ) {
+  if (!mint) {
     throw new Error(
-      "Mint invalide"
+      "Mint manquant"
     );
   }
 
-  await disarm(false);
+  // Désarme proprement avant de réarmer
+  if (state.armed) {
+    await disarm();
+  }
 
-  log(
-    `🎯 ARM Crash Guard : ${mint}`
+  logEvent(
+    "arm_start",
+    {
+      mint,
+    }
   );
 
-  const poolInfo =
+  // ----------------------------------------------------------
+  // Recherche du pool
+  // ----------------------------------------------------------
+
+  const pool =
     await findPumpSwapPool(
       mint
     );
 
-  currentMint =
+  if (!pool) {
+    throw new Error(
+      "Aucun pool PumpSwap trouvé"
+    );
+  }
+
+  // Crash Guard surveille actuellement
+  // les pools SOL-quoted.
+  if (
+    pool.quoteMint &&
+    pool.quoteMint !== SOL_MINT
+  ) {
+    throw new Error(
+      `Pool trouvé mais quoteMint non-SOL: ${pool.quoteMint}`
+    );
+  }
+
+  state.currentMint =
     mint;
 
-  currentPool =
-    poolInfo.poolAddress;
+  state.currentPool =
+    pool.pool;
 
-  const poolAccount =
+  // ----------------------------------------------------------
+  // On récupère les données Pool directement on-chain
+  // ----------------------------------------------------------
+
+  const accountInfo =
     await rpc(
       "getAccountInfo",
       [
-        currentPool,
+        state.currentPool,
         {
-          encoding: "base64"
-        }
+          encoding: "base64",
+        },
       ]
     );
 
-  const encoded =
-    poolAccount?.value?.data?.[0];
-
-  if (!encoded) {
+  if (
+    !accountInfo ||
+    !accountInfo.value
+  ) {
     throw new Error(
-      "Compte pool introuvable"
+      "Compte Pool introuvable on-chain"
     );
   }
+
+  const poolData =
+    Buffer.from(
+      accountInfo.value.data[0],
+      "base64"
+    );
 
   const decoded =
     decodePoolAccount(
-      encoded
+      poolData
     );
 
-  baseMint =
+  state.baseMint =
     decoded.baseMint;
 
-  quoteMint =
+  state.quoteMint =
     decoded.quoteMint;
 
+  state.baseVault =
+    decoded.baseVault;
+
+  state.quoteVault =
+    decoded.quoteVault;
+
+  // ----------------------------------------------------------
+  // Vérification orientation
+  // ----------------------------------------------------------
+
   if (
-    baseMint === SOL_MINT
+    state.baseMint !==
+      mint &&
+    state.quoteMint !==
+      mint
   ) {
-    solVault =
-      decoded.baseVault;
-
-    tokenVault =
-      decoded.quoteVault;
-  } else if (
-    quoteMint === SOL_MINT
-  ) {
-    tokenVault =
-      decoded.baseVault;
-
-    solVault =
-      decoded.quoteVault;
-  } else {
     throw new Error(
-      "Le pool PumpSwap ne contient pas SOL"
+      "Le pool trouvé ne correspond pas au mint demandé"
     );
   }
 
-  /*
-  Décimales du token.
-  */
+  if (
+    state.quoteMint !==
+    SOL_MINT
+  ) {
+    throw new Error(
+      `Le pool n'est pas SOL-quoted. quoteMint=${state.quoteMint}`
+    );
+  }
 
-  tokenDecimals =
+  // ----------------------------------------------------------
+  // Décimales
+  // ----------------------------------------------------------
+
+  state.baseDecimals =
     await getTokenDecimals(
-      currentMint
+      state.baseMint
     );
 
-  /*
-  État initial.
-  */
+  state.quoteDecimals = 9;
 
-  armed = true;
+  // ----------------------------------------------------------
+  // RESET
+  // ----------------------------------------------------------
 
-  currentLevel =
-    "NORMAL";
+  state.vaultAmounts = {
+    base: null,
+    quote: null,
+  };
 
-  criticalLatched =
+  state.history = [];
+
+  state.level =
+    "WATCH";
+
+  state.dangerUntil =
+    0;
+
+  state.criticalLatched =
     false;
 
-  dangerUntil = 0;
-
-  lastSignal =
+  state.lastSignal =
     null;
 
-  history = [];
+  state.subscriptions =
+    {};
 
-  tokenVaultLamports =
-    null;
+  state.dex = {
+    priceUsd:
+      pool.priceUsd ?? null,
 
-  solVaultLamports =
-    null;
+    liquidityUsd:
+      pool.liquidityUsd ?? null,
 
-  lastDexLiquidityUsd =
-    poolInfo.liquidityUsd;
+    pairAddress:
+      pool.pool,
 
-  lastDexPriceUsd =
-    poolInfo.priceUsd;
+    updatedAt:
+      pool.priceUsd ||
+      pool.liquidityUsd
+        ? Date.now()
+        : 0,
+  };
 
-  lastDexUpdateAt =
-    now();
+  state.armed =
+    true;
 
-  log("");
-  log("========================================");
-  log("🛡️ CRASH GUARD ARMÉ");
-  log("========================================");
-  log(`Token       : ${currentMint}`);
-  log(`Pool        : ${currentPool}`);
-  log(`Base mint   : ${baseMint}`);
-  log(`Quote mint  : ${quoteMint}`);
-  log(`Token vault : ${tokenVault}`);
-  log(`SOL vault   : ${solVault}`);
-  log(`Décimales   : ${tokenDecimals}`);
-  log(
-    `Liquidité DEX initiale : ${
-      lastDexLiquidityUsd !== null
-        ? `$${lastDexLiquidityUsd.toFixed(2)}`
-        : "N/A"
-    }`
+  // ----------------------------------------------------------
+  // LOG
+  // ----------------------------------------------------------
+
+  logEvent(
+    "armed",
+    {
+      mint:
+        state.currentMint,
+
+      pool:
+        state.currentPool,
+
+      baseMint:
+        state.baseMint,
+
+      quoteMint:
+        state.quoteMint,
+
+      baseVault:
+        state.baseVault,
+
+      quoteVault:
+        state.quoteVault,
+
+      baseDecimals:
+        state.baseDecimals,
+
+      quoteDecimals:
+        state.quoteDecimals,
+
+      poolSource:
+        pool.source,
+    }
   );
-  log("========================================");
-  log("");
+
+  // ----------------------------------------------------------
+  // WEBSOCKET
+  // ----------------------------------------------------------
 
   connectWebSocket();
 
-  sampleTimer =
+  // ----------------------------------------------------------
+  // DEX initial
+  //
+  // IMPORTANT :
+  // cette opération est NON BLOQUANTE.
+  // Un 429 ne bloque donc plus /starttrade.
+  // ----------------------------------------------------------
+
+  await updateDexData();
+
+  // ----------------------------------------------------------
+  // TIMERS
+  // ----------------------------------------------------------
+
+  state.timers.sample =
     setInterval(
       () => {
         sampleOnChain()
-          .catch(error => {
-            log(
-              `⚠️ Sample : ${error.message}`
+          .catch((error) => {
+            logEvent(
+              "sample_error",
+              {
+                error:
+                  error.message,
+              }
             );
           });
       },
       SAMPLE_INTERVAL_MS
     );
 
-  dexTimer =
+  state.timers.dex =
     setInterval(
       () => {
         updateDexData()
-          .catch(error => {
-            log(
-              `⚠️ DEX : ${error.message}`
+          .catch((error) => {
+            logEvent(
+              "dex_timer_error",
+              {
+                error:
+                  error.message,
+              }
             );
           });
       },
-      DEX_INTERVAL_MS
+      DEX_REFRESH_INTERVAL_MS
     );
 
-  /*
-  Première récupération immédiate.
-  */
-
-  await updateDexData();
-
-  return getState();
-}
-
-/* =========================================================
-   DISARM
-========================================================= */
-
-async function disarm(logIt = true) {
-  armed = false;
-
-  currentMint = null;
-  currentPool = null;
-
-  baseMint = null;
-  quoteMint = null;
-
-  tokenVault = null;
-  solVault = null;
-
-  tokenDecimals = 6;
-
-  tokenVaultLamports = null;
-  solVaultLamports = null;
-
-  history = [];
-
-  currentLevel = "NORMAL";
-
-  criticalLatched = false;
-
-  dangerUntil = 0;
-
-  lastSignal = null;
-
-  lastDexLiquidityUsd = null;
-  lastDexPriceUsd = null;
-  lastDexUpdateAt = 0;
-
-  lastSnapshotAt = 0;
-
-  closeWebSocket();
-
-  if (reconnectTimer) {
-    clearTimeout(
-      reconnectTimer
-    );
-
-    reconnectTimer = null;
-  }
-
-  if (sampleTimer) {
-    clearInterval(
-      sampleTimer
-    );
-
-    sampleTimer = null;
-  }
-
-  if (dexTimer) {
-    clearInterval(
-      dexTimer
-    );
-
-    dexTimer = null;
-  }
-
-  if (logIt) {
-    log(
-      "🛑 Crash Guard désarmé"
-    );
-  }
-}
-
-/* =========================================================
-   ÉTAT PUBLIC
-========================================================= */
-
-function getState() {
   return {
-    armed,
-
-    level:
-      currentLevel,
-
-    criticalLatched,
-
-    dangerUntil,
+    ok: true,
 
     mint:
-      currentMint,
+      state.currentMint,
 
     pool:
-      currentPool,
+      state.currentPool,
 
-    tokenVault,
-    solVault,
+    poolSource:
+      pool.source,
 
-    tokenDecimals,
+    baseMint:
+      state.baseMint,
 
-    websocket:
-      ws?.readyState === WebSocket.OPEN
-        ? "LIVE"
-        : armed
-          ? "WAITING"
-          : "OFFLINE",
-
-    historySamples:
-      history.length,
-
-    dex: {
-      priceUsd:
-        lastDexPriceUsd,
-
-      liquidityUsd:
-        lastDexLiquidityUsd,
-
-      lastUpdate:
-        lastDexUpdateAt
-          ? new Date(
-              lastDexUpdateAt
-            ).toISOString()
-          : null
-    },
-
-    lastSignal,
-
-    timestamp:
-      new Date().toISOString()
+    quoteMint:
+      state.quoteMint,
   };
 }
 
-/* =========================================================
-   SERVEUR HTTP
-========================================================= */
+// ============================================================
+// DISARM
+// ============================================================
+
+async function disarm() {
+  state.armed =
+    false;
+
+  if (
+    state.timers.sample
+  ) {
+    clearInterval(
+      state.timers.sample
+    );
+
+    state.timers.sample =
+      null;
+  }
+
+  if (
+    state.timers.dex
+  ) {
+    clearInterval(
+      state.timers.dex
+    );
+
+    state.timers.dex =
+      null;
+  }
+
+  if (state.ws) {
+    try {
+      state.ws.close();
+    } catch (_) {}
+  }
+
+  state.ws =
+    null;
+
+  state.subscriptions =
+    {};
+
+  state.history =
+    [];
+
+  state.vaultAmounts = {
+    base: null,
+    quote: null,
+  };
+
+  state.currentMint =
+    null;
+
+  state.currentPool =
+    null;
+
+  state.baseMint =
+    null;
+
+  state.quoteMint =
+    null;
+
+  state.baseVault =
+    null;
+
+  state.quoteVault =
+    null;
+
+  state.level =
+    "WATCH";
+
+  state.dangerUntil =
+    0;
+
+  state.criticalLatched =
+    false;
+
+  state.lastSignal =
+    null;
+
+  logEvent(
+    "disarmed"
+  );
+
+  return {
+    ok: true,
+  };
+}
+
+// ============================================================
+// HTTP SERVER
+// ============================================================
+
+function authorized(req) {
+  if (!CRASH_GUARD_SECRET) {
+    return false;
+  }
+
+  const provided =
+    req.headers[
+      "x-crash-guard-secret"
+    ];
+
+  return (
+    typeof provided ===
+      "string" &&
+    provided ===
+      CRASH_GUARD_SECRET
+  );
+}
+
+function sendJson(
+  res,
+  status,
+  body
+) {
+  res.writeHead(
+    status,
+    {
+      "content-type":
+        "application/json; charset=utf-8",
+    }
+  );
+
+  res.end(
+    JSON.stringify(body)
+  );
+}
+
+function readBody(req) {
+  return new Promise(
+    (resolve, reject) => {
+      let body = "";
+
+      req.on(
+        "data",
+        (chunk) => {
+          body += chunk;
+
+          if (
+            body.length >
+            100000
+          ) {
+            reject(
+              new Error(
+                "Body trop volumineux"
+              )
+            );
+
+            req.destroy();
+          }
+        }
+      );
+
+      req.on(
+        "end",
+        () => {
+          try {
+            resolve(
+              body
+                ? JSON.parse(body)
+                : {}
+            );
+          } catch (error) {
+            reject(
+              new Error(
+                "JSON invalide"
+              )
+            );
+          }
+        }
+      );
+
+      req.on(
+        "error",
+        reject
+      );
+    }
+  );
+}
 
 const server =
   http.createServer(
     async (req, res) => {
+      try {
+        // ------------------------------------------------------
+        // HEALTH
+        // ------------------------------------------------------
 
-      /*
-      HEALTH
-      */
+        if (
+          req.method === "GET" &&
+          req.url === "/health"
+        ) {
+          return sendJson(
+            res,
+            200,
+            {
+              ok: true,
 
-      if (
-        req.method === "GET" &&
-        req.url === "/health"
-      ) {
-        return json(
+              armed:
+                state.armed,
+
+              level:
+                state.level,
+
+              mint:
+                state.currentMint,
+
+              pool:
+                state.currentPool,
+            }
+          );
+        }
+
+        // ------------------------------------------------------
+        // STATE
+        // ------------------------------------------------------
+
+        if (
+          req.method === "GET" &&
+          req.url === "/state"
+        ) {
+          if (
+            !authorized(req)
+          ) {
+            return sendJson(
+              res,
+              401,
+              {
+                ok: false,
+                error:
+                  "Unauthorized",
+              }
+            );
+          }
+
+          return sendJson(
+            res,
+            200,
+            {
+              ok: true,
+
+              armed:
+                state.armed,
+
+              mint:
+                state.currentMint,
+
+              pool:
+                state.currentPool,
+
+              level:
+                state.level,
+
+              criticalLatched:
+                state.criticalLatched,
+
+              dangerUntil:
+                state.dangerUntil,
+
+              lastSignal:
+                state.lastSignal,
+
+              dex:
+                state.dex,
+
+              historyLength:
+                state.history.length,
+            }
+          );
+        }
+
+        // ------------------------------------------------------
+        // DISARM
+        // ------------------------------------------------------
+
+        if (
+          req.method === "POST" &&
+          req.url === "/disarm"
+        ) {
+          if (
+            !authorized(req)
+          ) {
+            return sendJson(
+              res,
+              401,
+              {
+                ok: false,
+                error:
+                  "Unauthorized",
+              }
+            );
+          }
+
+          await disarm();
+
+          return sendJson(
+            res,
+            200,
+            {
+              ok: true,
+            }
+          );
+        }
+
+        // ------------------------------------------------------
+        // ARM
+        // ------------------------------------------------------
+
+        if (
+          req.method === "POST" &&
+          req.url === "/arm"
+        ) {
+          if (
+            !authorized(req)
+          ) {
+            return sendJson(
+              res,
+              401,
+              {
+                ok: false,
+                error:
+                  "Unauthorized",
+              }
+            );
+          }
+
+          const body =
+            await readBody(req);
+
+          if (
+            !body.mint
+          ) {
+            return sendJson(
+              res,
+              400,
+              {
+                ok: false,
+                error:
+                  "mint manquant",
+              }
+            );
+          }
+
+          try {
+            const result =
+              await arm(
+                body.mint
+              );
+
+            return sendJson(
+              res,
+              200,
+              result
+            );
+          } catch (error) {
+            logEvent(
+              "arm_failed",
+              {
+                mint:
+                  body.mint,
+
+                error:
+                  error.message,
+              }
+            );
+
+            return sendJson(
+              res,
+              500,
+              {
+                ok: false,
+                error:
+                  error.message,
+              }
+            );
+          }
+        }
+
+        // ------------------------------------------------------
+        // 404
+        // ------------------------------------------------------
+
+        return sendJson(
           res,
-          200,
+          404,
           {
-            ok: true,
-            service:
-              "crash-guard",
-            timestamp:
-              new Date().toISOString()
+            ok: false,
+            error:
+              "Not found",
           }
         );
-      }
-
-      /*
-      STATE
-      */
-
-      if (
-        req.method === "GET" &&
-        req.url === "/state"
-      ) {
-        if (!authorized(req)) {
-          return json(
-            res,
-            401,
-            {
-              ok: false,
-              error:
-                "Unauthorized"
-            }
-          );
-        }
-
-        return json(
-          res,
-          200,
-          getState()
-        );
-      }
-
-      /*
-      DISARM
-      */
-
-      if (
-        req.method === "POST" &&
-        req.url === "/disarm"
-      ) {
-        if (!authorized(req)) {
-          return json(
-            res,
-            401,
-            {
-              ok: false,
-              error:
-                "Unauthorized"
-            }
-          );
-        }
-
-        await disarm();
-
-        return json(
-          res,
-          200,
+      } catch (error) {
+        logEvent(
+          "http_error",
           {
-            ok: true,
-            state:
-              getState()
+            error:
+              error.message,
+          }
+        );
+
+        return sendJson(
+          res,
+          500,
+          {
+            ok: false,
+            error:
+              error.message,
           }
         );
       }
-
-      /*
-      ARM
-      */
-
-      if (
-        req.method === "POST" &&
-        req.url === "/arm"
-      ) {
-        if (!authorized(req)) {
-          return json(
-            res,
-            401,
-            {
-              ok: false,
-              error:
-                "Unauthorized"
-            }
-          );
-        }
-
-        let body = "";
-
-        req.on(
-          "data",
-          chunk => {
-            body += chunk.toString();
-
-            /*
-            Petite protection contre
-            les requêtes anormalement grandes.
-            */
-
-            if (
-              body.length > 10000
-            ) {
-              req.destroy();
-            }
-          }
-        );
-
-        req.on(
-          "end",
-          async () => {
-            try {
-              const payload =
-                JSON.parse(
-                  body || "{}"
-                );
-
-              const state =
-                await arm(
-                  payload.mint
-                );
-
-              return json(
-                res,
-                200,
-                {
-                  ok: true,
-                  state
-                }
-              );
-
-            } catch (error) {
-              log(
-                `❌ ARM : ${error.message}`
-              );
-
-              return json(
-                res,
-                500,
-                {
-                  ok: false,
-                  error:
-                    error.message
-                }
-              );
-            }
-          }
-        );
-
-        return;
-      }
-
-      /*
-      404
-      */
-
-      return json(
-        res,
-        404,
-        {
-          ok: false,
-          error:
-            "Not found"
-        }
-      );
     }
   );
 
-/* =========================================================
-   START
-========================================================= */
+// ============================================================
+// START
+// ============================================================
 
 server.listen(
   PORT,
   "0.0.0.0",
   () => {
-    log("");
-    log("========================================");
-    log("🛡️ CRASH GUARD DÉMARRÉ");
-    log("========================================");
-    log(`Port : ${PORT}`);
-    log(
-      `RPC  : ${RPC_HTTP}`
+    console.log(
+      `🛡️ Crash Guard démarré sur le port ${PORT}`
     );
-    log(
-      `Target V5.1 : ${
-        CRASH_GUARD_TARGET_URL
-          ? "CONFIGURÉ"
-          : "NON CONFIGURÉ"
-      }`
+
+    console.log(
+      `RPC HTTP: ${RPC_HTTP}`
     );
-    log("");
-    log(
-      "En attente de /arm depuis V5.1..."
+
+    console.log(
+      `RPC WS: ${RPC_WS}`
     );
-    log("========================================");
-    log("");
+
+    console.log(
+      `PumpSwap: ${PUMPSWAP_PROGRAM_ID}`
+    );
   }
 );
 
-/* =========================================================
-   ARRÊT PROPRE
-========================================================= */
+// ============================================================
+// SHUTDOWN
+// ============================================================
 
-async function shutdown() {
-  log(
-    "🛑 Arrêt Crash Guard..."
+async function shutdown(
+  signal
+) {
+  logEvent(
+    "shutdown",
+    {
+      signal,
+    }
   );
 
-  await disarm(false);
+  try {
+    await disarm();
+  } catch (_) {}
 
   server.close(
     () => {
       process.exit(0);
     }
   );
+
+  setTimeout(
+    () => {
+      process.exit(0);
+    },
+    3000
+  );
 }
 
 process.on(
   "SIGTERM",
-  shutdown
+  () =>
+    shutdown("SIGTERM")
 );
 
 process.on(
   "SIGINT",
-  shutdown
+  () =>
+    shutdown("SIGINT")
 );
